@@ -1,0 +1,10 @@
+Package: com.linsars.minisfix
+Name: MinisFix
+Version: 2.50.1
+Architecture: iphoneos-arm64
+Depends: ellekit (>= 1.0), preferenceloader, firmware(>=15.0), com.ichitaso.iconorder, com.opa334.altlist
+Conflicts: dev.mineek.appstoretroller, com.lizynz.folderx.rootless, com.ichitaso.fiveicondock13
+Description: MinisFix - FolderX(文件夹/充电限制/Wi-Fi永连) + IAPtools(IAP工具箱) + AppHooks(版本伪装/TF增强) + UnseenHooks(反检测/隐私)
+Maintainer: Linsars
+Author: Linsars
+Section: Tweaks

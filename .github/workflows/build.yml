@@ -1,0 +1,52 @@
+name: build
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS: /opt/theos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Theos
+        run: |
+          sudo mkdir -p "$THEOS"
+          sudo chown $(id -u):$(id -g) "$THEOS"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+      - name: Install SDK
+        run: |
+          curl -L -o /tmp/sdk.tar.xz https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+          mkdir -p "$THEOS/sdks"
+          tar xJf /tmp/sdk.tar.xz -C "$THEOS/sdks/"
+          mv "$THEOS/sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/iPhoneOS14.5.sdk"
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build minisfixd daemon (privileged charge writer)
+        run: |
+          mkdir -p layout-rootless/usr/bin
+          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e \
+            -isysroot "$THEOS/sdks/iPhoneOS14.5.sdk" \
+            -miphoneos-version-min=14.5 \
+            -framework CoreFoundation -O2 -Wall \
+            -o layout-rootless/usr/bin/minisfixd minisfixd.c
+          ldid -Sminisfixd.entitlements layout-rootless/usr/bin/minisfixd
+          ls -la layout-rootless/usr/bin/
+          echo "=== minisfixd built and entitled ==="
+
+      - name: Build package
+        run: make package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-packages
+          path: packages/*.deb
+          if-no-files-found: ignore

@@ -1,0 +1,15 @@
+#!/bin/bash
+# v2.46.1: 清理退役死文件(升级也会触发 postrm)
+rm -f /var/jb/usr/local/lib/ReflixStub.dylib
+rm -f /var/jb/usr/local/lib/ReflixStub.plist
+rm -f /var/jb/usr/lib/mfpatcher
+# v2.5.8: 只清理已废弃的旧 dylib 名,不碰当前版本的文件
+rm -f /var/jb/usr/lib/TweakInject/MinisFix.dylib
+rm -f /var/jb/usr/lib/TweakInject/AppStoreSpoof.dylib
+# v2.6.31: 真正卸载时停掉 minisfixd(升级时 $1=upgrade 不触发)
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+  PLIST="/var/jb/Library/LaunchDaemons/com.linsars.minisfixd.plist"
+  /var/jb/bin/launchctl bootout system "$PLIST" >/dev/null 2>&1
+  rm -f "$PLIST" /var/jb/usr/bin/minisfixd
+fi
+exit 0

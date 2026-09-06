@@ -1,0 +1,11 @@
+#!/bin/bash
+TWEAK_INJECT="/var/jb/usr/lib/TweakInject"
+mkdir -p "$TWEAK_INJECT"
+rm -f "$TWEAK_INJECT/MinisFix.dylib" "$TWEAK_INJECT/AppStoreSpoof.dylib"
+PLIST="/var/jb/Library/LaunchDaemons/com.linsars.minisfixd.plist"
+if [ -f "$PLIST" ]; then
+  /var/jb/bin/launchctl bootout system "$PLIST" >/dev/null 2>&1
+  /var/jb/bin/launchctl bootstrap system "$PLIST" >/dev/null 2>&1
+fi
+killall -9 SpringBoard 2>/dev/null
+exit 0

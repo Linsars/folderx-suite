@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>开启后对所有 App 生效。关闭后仅对下方「应用程序」白名单内的 App 生效。</string>
+			<key>label</key>
+			<string>IAP工具箱</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.linsars.minisfix/ReloadPrefs</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.linsars.minisfix</string>
+			<key>key</key>
+			<string>mfIAPEnabled</string>
+			<key>label</key>
+			<string>启用 IAP工具箱</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>footerText</key>
+			<string>「自动添加」关闭时，仅在此处勾选的 App 内启用 IAP工具箱。</string>
+			<key>label</key>
+			<string>作用范围</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.linsars.minisfix/ReloadPrefs</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.linsars.minisfix</string>
+			<key>key</key>
+			<string>mfIAPAutoApply</string>
+			<key>label</key>
+			<string>自动添加新安装 App</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.linsars.minisfix/ReloadPrefs</string>
+			<key>cell</key>
+			<string>PSLinkListCell</string>
+			<key>defaultApplicationSwitchValue</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.linsars.minisfix</string>
+			<key>detail</key>
+			<string>ATLApplicationListMultiSelectionController</string>
+			<key>hideSearchBarWhileScrolling</key>
+			<true/>
+			<key>includeIdentifiersInSearch</key>
+			<true/>
+			<key>key</key>
+			<string>mfIAPAppList</string>
+			<key>label</key>
+			<string>应用程序</string>
+			<key>sections</key>
+			<array>
+				<dict>
+					<key>sectionType</key>
+					<string>User</string>
+				</dict>
+				<dict>
+					<key>sectionType</key>
+					<string>System</string>
+				</dict>
+			</array>
+			<key>showIdentifiersAsSubtitle</key>
+			<true/>
+			<key>useSearchBar</key>
+			<true/>
+		</dict>
+	</array>
+	<key>title</key>
+	<string>IAP工具箱</string>
+</dict>
+</plist>
