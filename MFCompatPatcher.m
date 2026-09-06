@@ -340,7 +340,7 @@ static void mfCompatPatchMainBinary(void) {
 typedef id (*mfGetClassT)(const char *);
 typedef SEL (*mfSelRegT)(const char *);
 typedef BOOL (*mfAddMethodT)(id, SEL, IMP, const char *);
-typedef id (*mfGetInstMethodT)(id, SEL);
+typedef void *(*mfGetInstMethodT)(void *, void *);   // Method 返回值绝不声明 id: ARC 会插入 objc_retain 打死非对象指针
 typedef IMP (*mfSetImpT)(Method, IMP);
 
 static mfGetClassT o_getClass;
@@ -371,7 +371,7 @@ static const char *mfImpWhere(uintptr_t imp) {
         uint32_t off = sizeof(struct mach_header_64), nc = h->ncmds;
         for (uint32_t k = 0; k < nc && off + 80 < 0x8000; k++) {
             uint32_t cmd = *(uint32_t *)(b + off), cs = *(uint32_t *)(b + off + 4);
-            if (cmd == LC_SEGMENT_64) {
+            if (cmd == LC_SEGMENT_64 && strncmp((const char *)(b + off + 8), "__PAGEZERO", 10) != 0) {
                 uint64_t vm = *(uint64_t *)(b + off + 24), vs = *(uint64_t *)(b + off + 32);
                 if (base + vm + vs > hi) hi = base + vm + vs;
             }
@@ -410,12 +410,12 @@ static BOOL t_addMethod(id cls, SEL sel, IMP imp, const char *types) {
                     mfImpWhere((uintptr_t)imp), types ?: "?", r);
     return r;
 }
-static id t_getInstMethod(id cls, SEL sel) {
-    id r = o_getInstMethod(cls, sel);
+static void *t_getInstMethod(void *cls, void *sel) {
+    void *r = o_getInstMethod(cls, sel);
     if (g_fcCnt[3]++ < XRAY_MAX_LOG)
         mfCompatLog("[xray] getInstanceMethod(%s, %s) -> %s",
-                    cls ? object_getClassName(cls) : "nil",
-                    sel ? sel_getName(sel) : "nil",
+                    cls ? object_getClassName((__bridge id)cls) : "nil",
+                    sel ? sel_getName((SEL)sel) : "nil",
                     r ? "HIT" : "miss");
     return r;
 }
@@ -437,7 +437,7 @@ static void mfFcRange(void) {
     uint32_t off = sizeof(struct mach_header_64);
     for (uint32_t k = 0; k < g_fcMH->ncmds && off + 80 < 0x80000; k++) {
         uint32_t cmd = *(uint32_t *)(b + off), cs = *(uint32_t *)(b + off + 4);
-        if (cmd == LC_SEGMENT_64) {
+        if (cmd == LC_SEGMENT_64 && strncmp((const char *)(b + off + 8), "__PAGEZERO", 10) != 0) {
             uint64_t vm = *(uint64_t *)(b + off + 24), vs = *(uint64_t *)(b + off + 32);
             if (g_fcSlide + vm + vs > g_fcHi) g_fcHi = g_fcSlide + vm + vs;
         }
