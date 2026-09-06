@@ -163,10 +163,28 @@ NSDictionary *mfReconFingerprint(void) {
 
     // ---- 判定(动态拼接, 可叠加: Reflix = 云+mach 双面) ----
     BOOL cloud = cloudBrands.count > 0;
+    // F7 服务器权益型(2026-09-06 mailnow 案定案): 无云 SDK + 纯 SK + WebView 权益标志(FlexCall/loadSuccess
+    // /premium/no_ad/vip 类 JS 桥字段) → 权益本体在服务端会话, 本地解锁无意义
+    BOOL serverSide = NO;
+    {
+        static NSArray *kSrvPats;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            kSrvPats = @[@"flexcall", @"loadsuccess", @"buyappitem", @"getappitemprice",
+                         @"requestbuyappitem", @"user_number", @"usernumber"];
+        });
+        int srvHits = 0;
+        for (NSString *pat in kSrvPats)
+            if (mfRecFind(p, n, pat.UTF8String)) srvHits++;
+        // SK 本地形态 + 无云验证 + JS 桥权益字段 → 服务器权益型
+        BOOL skLocal = (BOOL)strstr(skType.UTF8String ?: "", "SK");
+        if (srvHits >= 2 && !cloud && !mach && skLocal) serverSide = YES;
+    }
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, 先 mock 直试", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 可直达", cloudBrands.allObjects.firstObject];
     else if (mach)          verdict = @"本地许可服务器(异常端口 MIG) — 需录制破译战役";
+    else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
     else                    verdict = @"未发现订阅验证 SDK";
     if (cloudBrands.count > 1) {
         NSString *names = [[cloudBrands.allObjects sortedArrayUsingSelector:@selector(compare)] componentsJoinedByString:@"/"];
@@ -175,7 +193,7 @@ NSDictionary *mfReconFingerprint(void) {
     }
 
     return @{@"verdict": verdict, @"lines": lines,
-             @"cloud": @(cloud), @"mach": @(mach),
+             @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide),
              @"sktype": skType, @"validator": validator};
 }
 
