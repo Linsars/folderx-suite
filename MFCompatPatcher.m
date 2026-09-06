@@ -16,6 +16,10 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <sys/mman.h>
+#import <sys/stat.h>
+#import <objc/runtime.h>
+#import <objc/message.h>
+#import <dispatch/dispatch.h>
 #import <dlfcn.h>
 #import <unistd.h>
 #include <string.h>
@@ -320,6 +324,265 @@ static void mfCompatPatchMainBinary(void) {
     mfCompatDiag(@"fwdone", [NSString stringWithFormat:@"fwdPatched=%d/%d", fwPatched, nfwd]);
 }
 
+// ==================== v2.51 XRAY: 第三方修复样本观察机 ====================
+// 标本: /var/jb/usr/lib/MinisFix/FixCrash.dylib (第三方混淆 dylib, ctor 驱动, 24 imports)
+// 诊断模式(mfXray, probe 构建缺省 ON):
+//   1. add_image 回调(dlopen 内部, bind 完成/initializer 未跑)布 GOT 蹦床 ×5
+//      -> 其 ctor 全程在钩下, 解密后类名/selector/IMP 落 mfcompat.log
+//   2. +3s 扫其 __DATA/__DATA_CONST 摘解密遗留 ASCII
+//   3. +6s 全类方法表 diff: IMP∈标本镜像区间 = 它装的钩子
+// 生产模式: 纯 dlopen, 标本自行工作
+// 铁律: objc_msgSend 不钩(变参 ABI); 蹦床全部 passthrough; 标本缺席 = 全 no-op
+
+#define MF_FC_PATH "/var/jb/usr/lib/MinisFix/FixCrash.dylib"
+#define XRAY_MAX_LOG 300
+
+typedef id (*mfGetClassT)(const char *);
+typedef SEL (*mfSelRegT)(const char *);
+typedef BOOL (*mfAddMethodT)(id, SEL, IMP, const char *);
+typedef id (*mfGetInstMethodT)(id, SEL);
+typedef IMP (*mfSetImpT)(Method, IMP);
+
+static mfGetClassT o_getClass;
+static mfSelRegT o_selReg;
+static mfAddMethodT o_addMethod;
+static mfGetInstMethodT o_getInstMethod;
+static mfSetImpT o_setImp;
+
+static const struct mach_header_64 *g_fcMH;
+static intptr_t g_fcSlide;
+static uintptr_t g_fcLo, g_fcHi;   // 标本镜像 slid 区间
+static int g_xrayOn;
+static int g_fcCnt[5];
+
+// IMP 归属: 返回静态环缓冲描述(防单行双参别名)
+static const char *mfImpWhere(uintptr_t imp) {
+    static char ring[4][80];
+    static int ri;
+    char *buf = ring[ri++ & 3];
+    if (!imp) { snprintf(buf, 80, "NULL"); return buf; }
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+        if (!h || h->magic != MH_MAGIC_64) continue;
+        // 该镜像 slid 覆盖区间
+        uintptr_t base = (uintptr_t)h, hi = base;
+        const uint8_t *b = (const uint8_t *)h;
+        uint32_t off = sizeof(struct mach_header_64), nc = h->ncmds;
+        for (uint32_t k = 0; k < nc && off + 80 < 0x8000; k++) {
+            uint32_t cmd = *(uint32_t *)(b + off), cs = *(uint32_t *)(b + off + 4);
+            if (cmd == LC_SEGMENT_64) {
+                uint64_t vm = *(uint64_t *)(b + off + 24), vs = *(uint64_t *)(b + off + 32);
+                if (base + vm + vs > hi) hi = base + vm + vs;
+            }
+            off += cs;
+        }
+        if (imp >= base && imp < hi) {
+            const char *p = _dyld_get_image_name(i);
+            const char *leaf = p ? strrchr(p, '/') : NULL;
+            if (g_fcMH && h == g_fcMH) snprintf(buf, 80, "FixCrash+%#lx", (unsigned long)(imp - base));
+            else snprintf(buf, 80, "%s+%#lx", leaf ? leaf + 1 : "?", (unsigned long)(imp - base));
+            return buf;
+        }
+    }
+    snprintf(buf, 80, "heap/%#lx", (unsigned long)imp);
+    return buf;
+}
+
+static id t_getClass(const char *name) {
+    id r = o_getClass(name);
+    if (g_fcCnt[0]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] getClass(%s) -> %s", name ?: "?", r ? object_getClassName(r) : "nil");
+    return r;
+}
+static SEL t_selReg(const char *name) {
+    SEL r = o_selReg(name);
+    if (g_fcCnt[1]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] sel(%s)", name ?: "?");
+    return r;
+}
+static BOOL t_addMethod(id cls, SEL sel, IMP imp, const char *types) {
+    BOOL r = o_addMethod(cls, sel, imp, types);
+    if (g_fcCnt[2]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] addMethod(%s, %s, imp=%s, enc=%s) -> %d",
+                    cls ? object_getClassName(cls) : "nil",
+                    sel ? sel_getName(sel) : "nil",
+                    mfImpWhere((uintptr_t)imp), types ?: "?", r);
+    return r;
+}
+static id t_getInstMethod(id cls, SEL sel) {
+    id r = o_getInstMethod(cls, sel);
+    if (g_fcCnt[3]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] getInstanceMethod(%s, %s) -> %s",
+                    cls ? object_getClassName(cls) : "nil",
+                    sel ? sel_getName(sel) : "nil",
+                    r ? "HIT" : "miss");
+    return r;
+}
+static IMP t_setImp(Method m, IMP imp) {
+    IMP old = o_setImp(m, imp);
+    SEL s = m ? method_getName(m) : NULL;
+    if (g_fcCnt[4]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] *** SETIMP(%s, old=%s new=%s)",
+                    s ? sel_getName(s) : "nil",
+                    mfImpWhere((uintptr_t)old), mfImpWhere((uintptr_t)imp));
+    return old;   // 必须原样返回旧 IMP
+}
+
+// 标本镜像区间(遍历 LC_SEGMENT_64)
+static void mfFcRange(void) {
+    g_fcLo = (uintptr_t)g_fcMH;
+    g_fcHi = g_fcLo;
+    const uint8_t *b = (const uint8_t *)g_fcMH;
+    uint32_t off = sizeof(struct mach_header_64);
+    for (uint32_t k = 0; k < g_fcMH->ncmds && off + 80 < 0x80000; k++) {
+        uint32_t cmd = *(uint32_t *)(b + off), cs = *(uint32_t *)(b + off + 4);
+        if (cmd == LC_SEGMENT_64) {
+            uint64_t vm = *(uint64_t *)(b + off + 24), vs = *(uint64_t *)(b + off + 32);
+            if (g_fcSlide + vm + vs > g_fcHi) g_fcHi = g_fcSlide + vm + vs;
+        }
+        off += cs;
+    }
+    mfCompatLog("[xray] range %#lx..%#lx", (unsigned long)g_fcLo, (unsigned long)g_fcHi);
+}
+
+// add_image 回调: 名字核对 -> 换全局镜像状态 -> 布蹦床 -> 记区间
+static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
+    if (g_fcMH || !g_xrayOn) return;
+    const struct mach_header_64 *m64 = (const struct mach_header_64 *)mh;
+    if (!m64 || m64->magic != MH_MAGIC_64 || m64->filetype != MH_DYLIB) return;
+    BOOL ours = NO;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        if ((const struct mach_header_64 *)_dyld_get_image_header(i) != m64) continue;
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, "FixCrash.dylib")) ours = YES;
+        break;
+    }
+    if (!ours) return;
+
+    g_fcMH = m64; g_fcSlide = slide;
+    mfCompatLog("[xray] sample mapped mh=%p slide=%p", m64, (void *)slide);
+
+    const struct mach_header_64 *saveMH = g_mh; intptr_t saveSlide = g_slide;
+    g_mh = m64; g_slide = slide;
+    mfParseLcs();   // 全局查找状态指向标本
+
+    struct { const char *name; void **orig; void *trap; } hooks[] = {
+        {"_objc_getClass",             (void **)&o_getClass,       (void *)t_getClass},
+        {"_sel_registerName",          (void **)&o_selReg,         (void *)t_selReg},
+        {"_class_addMethod",           (void **)&o_addMethod,      (void *)t_addMethod},
+        {"_class_getInstanceMethod",   (void **)&o_getInstMethod,  (void *)t_getInstMethod},
+        {"_method_setImplementation",  (void **)&o_setImp,         (void *)t_setImp},
+    };
+    int ok = 0;
+    for (int i = 0; i < 5; i++) {
+        void *slot = mfFindSlotForSymbol(hooks[i].name);
+        if (!slot) slot = mfFindGotSlotForSymbol(hooks[i].name);
+        if (!slot) { mfCompatLog("[xray] MISS %s", hooks[i].name); continue; }
+        *hooks[i].orig = *(void **)slot;    // bind 已完成, 槽内即原函数
+        mfPatchSlotNamed(slot, hooks[i].trap, hooks[i].name);
+        ok++;
+    }
+    mfCompatLog("[xray] hooks=%d/5", ok);
+    mfFcRange();
+    g_mh = saveMH; g_slide = saveSlide;   // 恢复主镜像状态
+}
+
+// L2: 标本 __DATA 区解密遗留 ASCII 摘果
+static void mfXrayDumpData(void) {
+    if (!g_fcMH) return;
+    const uint8_t *b = (const uint8_t *)g_fcMH;
+    uint32_t off = sizeof(struct mach_header_64);
+    int emitted = 0;
+    for (uint32_t k = 0; k < g_fcMH->ncmds && off + 80 < 0x80000 && emitted < 400; k++) {
+        uint32_t cmd = *(uint32_t *)(b + off), cs = *(uint32_t *)(b + off + 4);
+        if (cmd == LC_SEGMENT_64) {
+            const char *sn = (const char *)(b + off + 8);
+            uint64_t vm = *(uint64_t *)(b + off + 24), vs = *(uint64_t *)(b + off + 32);
+            if (vs && vs <= 0x20000 && (strncmp(sn, "__DATA", 6) == 0)) {
+                const uint8_t *p = (const uint8_t *)(g_fcSlide + vm);
+                uint64_t run = 0;
+                for (uint64_t i = 0; i <= vs && emitted < 400; i++) {
+                    uint8_t c = i < vs ? p[i] : 0;
+                    if (c >= 0x20 && c < 0x7f) { if (!run) run = i + 1; }
+                    else {
+                        if (run && i - (run - 1) >= 6) {
+                            char tmp[120];
+                            uint64_t len = i - (run - 1);
+                            if (len > 110) len = 110;
+                            memcpy(tmp, p + run - 1, len); tmp[len] = 0;
+                            mfCompatLog("[xray] d %s+0x%llx '%s'", sn,
+                                        (unsigned long long)(vm + run - 1), tmp);
+                            emitted++;
+                        }
+                        run = 0;
+                    }
+                }
+            }
+        }
+        off += cs;
+    }
+    mfCompatLog("[xray] dump done emitted=%d", emitted);
+}
+
+// L3: 全类方法表 diff, IMP∈标本区间 = 它装的钩子
+static int mfXraySweepOne(Class c, BOOL meta) {
+    unsigned cnt = 0;
+    Method *ms = class_copyMethodList(c, &cnt);
+    int hits = 0;
+    for (unsigned j = 0; j < cnt; j++) {
+        IMP imp = method_getImplementation(ms[j]);
+        if ((uintptr_t)imp >= g_fcLo && (uintptr_t)imp < g_fcHi) {
+            SEL s = method_getName(ms[j]);
+            mfCompatLog("[xray] ** HOOK %c[%s %s] enc=%s imp=FixCrash+%#lx",
+                        meta ? '+' : '-', object_getClassName(c),
+                        s ? sel_getName(s) : "nil",
+                        method_getTypeEncoding(ms[j]) ?: "?",
+                        (unsigned long)((uintptr_t)imp - (g_fcSlide ? g_fcLo - g_fcSlide : 0)));
+            hits++;
+        }
+    }
+    if (ms) free(ms);
+    return hits;
+}
+static void mfXraySweepMethods(void) {
+    if (!g_fcMH || !g_fcLo) return;
+    unsigned n = 0;
+    Class *cl = objc_copyClassList(&n);
+    int hits = 0;
+    for (unsigned i = 0; i < n; i++) {
+        hits += mfXraySweepOne(cl[i], NO);
+        Class meta = object_getClass(cl[i]);
+        if (meta && meta != cl[i]) hits += mfXraySweepOne(meta, YES);
+    }
+    if (cl) free(cl);
+    mfCompatLog("[xray] sweep classes=%u hooks=%d", n, hits);
+}
+
+// 标本装载(dlopen 由我们掌控: 诊断模式先布钩再让 ctor 跑)
+static void mfFixcrashStage(BOOL xray) {
+    struct stat st;
+    if (stat(MF_FC_PATH, &st) != 0) {
+        mfCompatLog("[xray] sample absent %s", MF_FC_PATH);
+        return;
+    }
+    g_xrayOn = xray;
+    if (xray) _dyld_register_func_for_add_image(mfXrayAddImage);
+    void *h = dlopen(MF_FC_PATH, RTLD_NOW);
+    if (!h) {
+        mfCompatLog("[xray] dlopen FAIL: %s", dlerror() ?: "?");
+        return;
+    }
+    mfCompatLog("[xray] dlopen ok xray=%d", xray);
+    if (xray) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC),
+                       dispatch_get_global_queue(0, 0), ^{ @autoreleasepool { mfXrayDumpData(); } });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6LL * NSEC_PER_SEC),
+                       dispatch_get_global_queue(0, 0), ^{ @autoreleasepool { mfXraySweepMethods(); } });
+    }
+}
+
 // ---- 偏好: 是否需要修 ----
 static BOOL mfCompatNeeded(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
@@ -341,5 +604,9 @@ __attribute__((constructor)) static void CompatPatcherCtor(void) {
         mfCompatDiag(@"ctor", [NSString stringWithFormat:@"pid=%d bid=%@", getpid(), bid ?: @"NIL"]);
         mfCompatDiag(@"needed", @"YES");
         mfCompatPatchMainBinary();
+        // v2.51 probe: 标本装载 + 观察机(mfXray 缺省 ON, 显式 NO 关闭)
+        NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
+        BOOL xray = pf[@"mfXray"] ? [pf[@"mfXray"] boolValue] : YES;
+        mfFixcrashStage(xray);
     }
 }
