@@ -471,7 +471,7 @@ void mfClassDumpStartAction(UIProgressView *pv, UILabel *lb, UIButton *btn, UIVi
             if (names) free(names);
         }
         total = (unsigned)all.count;
-        Class *classes = malloc(sizeof(Class) * (total ?: 1));
+        Class *classes = (Class *)malloc(sizeof(Class) * (total ?: 1));
         for (unsigned i = 0; i < total; i++) classes[i] = all[i];
         mfLog(@"CLASSDUMP start: %u classes", total);
         if (!total || !classes) {
