@@ -2191,32 +2191,38 @@ static id new_SKProductsReq_init(id self, SEL _cmd, NSSet *identifiers) {
 
 // ====== StoreKit 2 侦察(v2.1.2):全量枚举 AppStoreKit 镜像类+方法表并落盘 ======
 static void mfProbeStoreKit2(void) {
-    unsigned n = 0;
-    Class *cs = objc_copyClassList(&n);
     NSMutableString *out = [NSMutableString stringWithCapacity:1 << 16];
     int clsCount = 0, methodCount = 0;
-    for (unsigned i = 0; i < n; i++) {
-        const char *nm = class_getName(cs[i]);
-        const char *img = class_getImageName(cs[i]);
-        BOOL inASK = (strstr(nm, "ASK") == nm)
-                  || (img && (strstr(img, "AppStoreKit") || strstr(img, "StoreKit")));
-        if (!inASK) continue;
-        if (img && strstr(img, "StoreKitUI")) continue; // 排除商店 UI 框架降噪
-        clsCount++;
-        [out appendFormat:@"== %s  [%s]\n", nm, img ? [@(img) lastPathComponent].UTF8String : "?"];
-        for (int meta = 0; meta < 2; meta++) {
-            Class c = meta ? object_getClass(cs[i]) : cs[i];
-            unsigned mc = 0;
-            Method *ms = class_copyMethodList(c, &mc);
-            for (unsigned j = 0; j < mc; j++) {
-                [out appendFormat:@"  %c %s\n", meta ? '+' : '-', sel_getName(method_getName(ms[j]))];
-                methodCount++;
+    // v2.52.2: 逐镜像枚举, 只 realize AppStoreKit/StoreKit 框架类
+    // 旧版 objc_copyClassList 会 realize 全进程类, iOS26-SDK Swift app 的
+    // 泛型 conformance 带外 realize 会 _getWitnessTable 空指针崩(Real Crash 2026-09-06 Scripting)
+    uint32_t ic = _dyld_image_count();
+    for (uint32_t i = 0; i < ic; i++) {
+        const char *img = _dyld_get_image_name(i);
+        if (!img) continue;
+        if (!strstr(img, "AppStoreKit") && !strstr(img, "/StoreKit.framework")) continue;
+        if (strstr(img, "StoreKitUI")) continue; // 排除商店 UI 框架降噪
+        unsigned cn = 0;
+        char **names = objc_copyClassNamesForImage(img, &cn);
+        for (unsigned j = 0; j < cn; j++) {
+            Class c = objc_getClass(names[j]);
+            if (!c) continue;
+            clsCount++;
+            [out appendFormat:@"== %s  [%s]\n", names[j], [@(img) lastPathComponent].UTF8String];
+            for (int meta = 0; meta < 2; meta++) {
+                Class cc = meta ? object_getClass(c) : c;
+                unsigned mc = 0;
+                Method *ms = class_copyMethodList(cc, &mc);
+                for (unsigned k = 0; k < mc; k++) {
+                    [out appendFormat:@"  %c %s\n", meta ? '+' : '-', sel_getName(method_getName(ms[k]))];
+                    methodCount++;
+                }
+                free(ms);
             }
-            free(ms);
+            [out appendString:@"\n"];
         }
-        [out appendString:@"\n"];
+        if (names) free(names);
     }
-    free(cs);
     if (!clsCount) {
         mfLog(@"[iap] SK2 枚举: 进程内无 AppStoreKit 类——先打开一次购买页再扫描");
         return;

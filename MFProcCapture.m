@@ -1021,33 +1021,35 @@ static void mfCapRecordSwizzle(NSString *cls, NSString *sel, uintptr_t imp) {
 static void mfCapObjcSweep(void) {
     if (!g_capDylibBase) return;
     NSString *mainPath = [[NSBundle mainBundle] executablePath] ?: @"";
-    unsigned int ncls = 0;
-    Class *classes = objc_copyClassList(&ncls);
-    if (!classes) return;
-    for (unsigned int i = 0; i < ncls; i++) {
-        NSString *cn = NSStringFromClass(classes[i]);
-        const char *img = class_getImageName(classes[i]);
-        BOOL isMain = img && mainPath.length && strstr(img, mainPath.fileSystemRepresentation) != NULL;
-        for (int pass = 0; pass < 2; pass++) {
-            Class target = pass == 0 ? classes[i] : object_getClass(classes[i]); // 实例方法/类方法
-            unsigned int nm = 0;
-            Method *ms = class_copyMethodList(target, &nm);
-            for (unsigned int j = 0; j < nm; j++) {
-                uintptr_t v = (uintptr_t)method_getImplementation(ms[j]);
-                if (v >= (uintptr_t)g_capDylibBase && v < (uintptr_t)g_capDylibBase + g_capDylibSize) {
-                    mfCapRecordSwizzle(cn, NSStringFromSelector(method_getName(ms[j])), v);
+    // v2.52.2: 逐镜像枚举(跳主二进制)——objc_copyClassList 会 force-realize 全进程类,
+    // iOS26-SDK Swift app 泛型 conformance 带外 realize 会 _getWitnessTable 崩(Real Crash 2026-09-06)
+    uint32_t ic = _dyld_image_count();
+    for (uint32_t i = 0; i < ic; i++) {
+        const char *imgPath = _dyld_get_image_name(i);
+        if (!imgPath) continue;
+        if (mainPath.length && strstr(imgPath, mainPath.fileSystemRepresentation)) continue;
+        unsigned cn = 0;
+        char **names = objc_copyClassNamesForImage(imgPath, &cn);
+        for (unsigned j = 0; j < cn; j++) {
+            Class c = objc_getClass(names[j]);
+            if (!c) continue;
+            NSString *cn2 = [NSString stringWithUTF8String:names[j]];
+            for (int pass = 0; pass < 2; pass++) {
+                Class target = pass == 0 ? c : object_getClass(c);
+                unsigned int nm = 0;
+                Method *ms = class_copyMethodList(target, &nm);
+                for (unsigned int k = 0; k < nm; k++) {
+                    uintptr_t v = (uintptr_t)method_getImplementation(ms[k]);
+                    if (v >= (uintptr_t)g_capDylibBase && v < (uintptr_t)g_capDylibBase + g_capDylibSize) {
+                        mfCapRecordSwizzle(cn2, NSStringFromSelector(method_getName(ms[k])), v);
+                    }
                 }
-                // v2.27.1 imp diff: 主二进制类的 imp 任意变化都报(瞬时 swizzle 的 0.5s 窗口捕获)
-                if (isMain && g_impSnap) {
-                    NSString *key = [NSString stringWithFormat:@"%@|%@|%@", cn,
-                                     NSStringFromSelector(method_getName(ms[j])), pass ? @"+" : @"-"];
-                    NSNumber *old = g_impSnap[key];
-                    if (old && old.unsignedLongLongValue != v) {
-                        Dl_info info; const char *zone = "unknown";
-                        if (dladdr((void *)v, &info) && info.dli_fname) {
-                            const char *b = strrchr(info.dli_fname, '/');
-                            zone = b ? b + 1 : info.dli_fname;
-                        }
+                free(ms);
+            }
+        }
+        if (names) free(names);
+    }
+    mfLog(@"[capture] objc sweep done (per-image, main skipped)");
                         mfLog(@"[capture] IMPCHG %s[%@%@] 0x%llx→0x%llx zone=%s",
                               pass ? "+" : "-", cn, NSStringFromSelector(method_getName(ms[j])),
                               (unsigned long long)old.unsignedLongLongValue, (unsigned long long)v, zone);
@@ -1068,29 +1070,34 @@ static void mfCapObjcSweep(void) {
 static void mfCapBuildImpBaseline(void) {
     if (g_impSnap) return;
     g_impSnap = [NSMutableDictionary dictionary];
+    // v2.52.2: 逐镜像枚举主二进制——不再 objc_copyClassList 全进程 realize(Real Crash 2026-09-06)
     NSString *mainPath = [[NSBundle mainBundle] executablePath] ?: @"";
-    unsigned int ncls = 0;
-    Class *classes = objc_copyClassList(&ncls);
-    if (!classes) return;
     unsigned long cnt = 0;
-    for (unsigned int i = 0; i < ncls; i++) {
-        const char *img = class_getImageName(classes[i]);
-        if (!img || !mainPath.length || !strstr(img, mainPath.fileSystemRepresentation)) continue;
-        NSString *cn = NSStringFromClass(classes[i]);
-        for (int pass = 0; pass < 2; pass++) {
-            Class target = pass == 0 ? classes[i] : object_getClass(classes[i]);
-            unsigned int nm = 0;
-            Method *ms = class_copyMethodList(target, &nm);
-            for (unsigned int j = 0; j < nm; j++) {
-                NSString *key = [NSString stringWithFormat:@"%@|%@|%@", cn,
-                                 NSStringFromSelector(method_getName(ms[j])), pass ? @"+" : @"-"];
-                g_impSnap[key] = @((unsigned long long)method_getImplementation(ms[j]));
-                cnt++;
+    uint32_t ic = _dyld_image_count();
+    for (uint32_t i = 0; i < ic; i++) {
+        const char *imgPath = _dyld_get_image_name(i);
+        if (!imgPath || !mainPath.length || !strstr(imgPath, mainPath.fileSystemRepresentation)) continue;
+        unsigned cn = 0;
+        char **names = objc_copyClassNamesForImage(imgPath, &cn);
+        for (unsigned j = 0; j < cn; j++) {
+            Class c = objc_getClass(names[j]);
+            if (!c) continue;
+            NSString *cn2 = [NSString stringWithUTF8String:names[j]];
+            for (int pass = 0; pass < 2; pass++) {
+                Class target = pass == 0 ? c : object_getClass(c);
+                unsigned int nm = 0;
+                Method *ms = class_copyMethodList(target, &nm);
+                for (unsigned int k = 0; k < nm; k++) {
+                    NSString *key = [NSString stringWithFormat:@"%@|%@|%@", cn2,
+                                     NSStringFromSelector(method_getName(ms[k])), pass ? @"+" : @"-"];
+                    g_impSnap[key] = @((unsigned long long)method_getImplementation(ms[k]));
+                    cnt++;
+                }
+                free(ms);
             }
-            free(ms);
         }
+        if (names) free(names);
     }
-    free(classes);
     mfLog(@"[capture] imp baseline: %lu methods of main-binary classes", cnt);
 }
 

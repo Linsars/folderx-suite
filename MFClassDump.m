@@ -454,10 +454,28 @@ static void mfDumpAllSwift(NSFileHandle *fh, NSMutableArray *cds, NSMutableData 
 // ====== 主流程（流式落盘：内存峰值 = 单类头文件，防 jetsam） ======
 void mfClassDumpStartAction(UIProgressView *pv, UILabel *lb, UIButton *btn, UIView *actionRow) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        // v2.52.2: 逐镜像枚举——objc_copyClassList 会 force-realize 全进程类,
+        // iOS26-SDK Swift app 泛型 conformance 带外 realize 会 _getWitnessTable 崩(Real Crash 2026-09-06)
+        uint32_t ic = _dyld_image_count();
         unsigned total = 0;
-        Class *classes = objc_copyClassList(&total);
+        NSMutableArray<Class> *all = [NSMutableArray array];
+        for (uint32_t i = 0; i < ic; i++) {
+            const char *img = _dyld_get_image_name(i);
+            if (!img) continue;
+            unsigned cn = 0;
+            char **names = objc_copyClassNamesForImage(img, &cn);
+            for (unsigned j = 0; j < cn; j++) {
+                Class c = objc_getClass(names[j]);
+                if (c) [all addObject:c];
+            }
+            if (names) free(names);
+        }
+        total = (unsigned)all.count;
+        Class *classes = malloc(sizeof(Class) * (total ?: 1));
+        for (unsigned i = 0; i < total; i++) classes[i] = all[i];
         mfLog(@"CLASSDUMP start: %u classes", total);
         if (!total || !classes) {
+            free(classes);
             dispatch_async(dispatch_get_main_queue(), ^{ lb.text = @"⚠️ 无类可枚举"; btn.enabled = YES; });
             return;
         }

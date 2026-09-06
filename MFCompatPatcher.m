@@ -548,16 +548,29 @@ static int mfXraySweepOne(Class c, BOOL meta) {
 }
 static void mfXraySweepMethods(void) {
     if (!g_fcMH || !g_fcLo) return;
-    unsigned n = 0;
-    Class *cl = objc_copyClassList(&n);
-    int hits = 0;
-    for (unsigned i = 0; i < n; i++) {
-        hits += mfXraySweepOne(cl[i], NO);
-        Class meta = object_getClass(cl[i]);
-        if (meta && meta != cl[i]) hits += mfXraySweepOne(meta, YES);
+    // v2.52.2: 逐镜像枚举, 跳过主二进制——objc_copyClassList 会 force-realize 全进程类,
+    // iOS26-SDK Swift app 的泛型 conformance 带外 realize 会 _getWitnessTable 空指针崩
+    // (Real Crash 2026-09-06 Scripting)。标本只 hook 系统类, 跳主二进制零损失。
+    NSString *exe = [[NSBundle mainBundle] executablePath] ?: @"";
+    int hits = 0, clsTotal = 0;
+    uint32_t ic = _dyld_image_count();
+    for (uint32_t i = 0; i < ic; i++) {
+        const char *img = _dyld_get_image_name(i);
+        if (!img) continue;
+        if (exe.length && strcmp(img, exe.fileSystemRepresentation) == 0) continue;
+        unsigned cn = 0;
+        char **names = objc_copyClassNamesForImage(img, &cn);
+        for (unsigned j = 0; j < cn; j++) {
+            Class c = objc_getClass(names[j]);
+            if (!c) continue;
+            clsTotal++;
+            hits += mfXraySweepOne(c, NO);
+            Class meta = object_getClass(c);
+            if (meta && meta != c) hits += mfXraySweepOne(meta, YES);
+        }
+        if (names) free(names);
     }
-    if (cl) free(cl);
-    mfCompatLog("[xray] sweep classes=%u hooks=%d", n, hits);
+    mfCompatLog("[xray] sweep classes=%d hooks=%d (app-binary skipped)", clsTotal, hits);
 }
 
 // 标本装载(dlopen 由我们掌控: 诊断模式先布钩再让 ctor 跑)
