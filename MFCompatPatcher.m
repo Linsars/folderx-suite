@@ -583,6 +583,79 @@ static void mfFixcrashStage(BOOL xray) {
     }
 }
 
+// ==================== v2.52 CK-SANITIZER: iOS17×新SDK CloudKit 兼容引擎 ====================
+// 语义源: 2.51 Xray 全量还原第三方样本(见 [xray] 流), 干净复刻且通用化(不嵌 app 名):
+//   1. setCloudKitContainerOptions: 非 nil 一律拦(容器退化纯本地), nil 放行走原 IMP
+//   2. loadPersistentStores 包装: 载入前清扫各 description 云选项;
+//      options 已含 NSPersistentStoreMirroring* 键 = 容器自管镜像 -> 不动(保守门)
+//   3. 不碰 NSManagedObjectModel
+// 门控: mfCompatAppList 含 bid; iOS>=18 自动跳过(云端路径无断言)
+// 机理: iOS17.0 + iOS18+SDK 的 CloudKit store 加载断言(brk1)类崩溃, 云选项清空即活
+
+static IMP g_ckOrigSetCK;
+static IMP g_ckOrigLoad;
+
+static void mfCKClearDesc(id desc) {
+    @try {
+        id opts = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("cloudKitContainerOptions"));
+        if (opts) {
+            ((void (*)(id, SEL, id))g_ckOrigSetCK)(desc, sel_registerName("setCloudKitContainerOptions:"), nil);
+            mfCompatLog("[mfck] cleared pre-load url=%@",
+                        ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("URL")));
+        }
+    } @catch (NSException *e) {
+        mfCompatLog("[mfck] clear desc exc: %@", e.name);
+    }
+}
+
+static void mfCKInstall(void) {
+    if (g_ckOrigSetCK) return;   // 幂等
+    // iOS>=18 无此断言, 引擎静止
+    NSOperatingSystemVersion v = [[NSProcessInfo processInfo] operatingSystemVersion];
+    if (v.majorVersion >= 18) { mfCompatLog("[mfck] skip iOS %lld", (long long)v.majorVersion); return; }
+
+    Class dc = objc_getClass("NSPersistentStoreDescription");
+    Class cc = objc_getClass("NSPersistentContainer");
+    if (!dc || !cc) { mfCompatLog("[mfck] classes absent"); return; }
+    Method mCK = class_getInstanceMethod(dc, sel_registerName("setCloudKitContainerOptions:"));
+    Method mL  = class_getInstanceMethod(cc, sel_registerName("loadPersistentStoresWithCompletionHandler:"));
+    if (!mCK || !mL) { mfCompatLog("[mfck] methods absent"); return; }
+    g_ckOrigSetCK = method_getImplementation(mCK);
+    g_ckOrigLoad  = method_getImplementation(mL);
+
+    // 1) setter: 非 nil 拦截
+    IMP impCK = imp_implementationWithBlock(^(id self, id options) {
+        if (options) {
+            mfCompatLog("[mfck] blocked CK options assignment");
+            return;
+        }
+        ((void (*)(id, SEL, id))g_ckOrigSetCK)(self, sel_registerName("setCloudKitContainerOptions:"), nil);
+    });
+    method_setImplementation(mCK, impCK);
+
+    // 2) load 包装: 载入前清扫 -> 调原
+    IMP impLoad = imp_implementationWithBlock(^(id self, id completion) {
+        @try {
+            id descs = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("persistentStoreDescriptions"));
+            for (id desc in descs) {
+                id o = ((id (*)(id, SEL))objc_msgSend)(desc, sel_registerName("options"));
+                id mir = o ? [o objectForKeyedSubscript:@"NSPersistentStoreMirroringOptionsKey"] : nil;
+                if (!mir) mir = o ? [o objectForKeyedSubscript:@"NSPersistentStoreMirroringDelegateOptionKey"] : nil;
+                if (mir) { mfCompatLog("[mfck] mirroring present, left unchanged"); continue; }
+                mfCKClearDesc(desc);
+            }
+        } @catch (NSException *e) {
+            mfCompatLog("[mfck] presweep exc: %@", e.name);
+        }
+        if (g_ckOrigLoad)
+            ((void (*)(id, SEL, id))g_ckOrigLoad)(self, sel_registerName("loadPersistentStoresWithCompletionHandler:"), completion);
+        else
+            ((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("loadPersistentStoresWithCompletionHandler:"), completion);
+    });
+    method_setImplementation(mL, impLoad);
+    mfCompatLog("[mfck] engine installed");
+}
+
 // ---- 偏好: 是否需要修 ----
 static BOOL mfCompatNeeded(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
@@ -608,5 +681,6 @@ __attribute__((constructor)) static void CompatPatcherCtor(void) {
         NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
         BOOL xray = pf[@"mfXray"] ? [pf[@"mfXray"] boolValue] : YES;
         mfFixcrashStage(xray);
+        mfCKInstall();   // v2.52: 通用 CK 兼容引擎(门控同 mfCompatAppList)
     }
 }
