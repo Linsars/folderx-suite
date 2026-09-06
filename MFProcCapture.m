@@ -1050,20 +1050,6 @@ static void mfCapObjcSweep(void) {
         if (names) free(names);
     }
     mfLog(@"[capture] objc sweep done (per-image, main skipped)");
-                        mfLog(@"[capture] IMPCHG %s[%@%@] 0x%llx→0x%llx zone=%s",
-                              pass ? "+" : "-", cn, NSStringFromSelector(method_getName(ms[j])),
-                              (unsigned long long)old.unsignedLongLongValue, (unsigned long long)v, zone);
-                        if (g_impSnap) g_impSnap[key] = @(v);
-                        g_capEvents++;
-                    } else if (!old) {
-                        g_impSnap[key] = @(v);
-                    }
-                }
-            }
-            free(ms);
-        }
-    }
-    free(classes);
 }
 
 // imp 基线: 主二进制类全方法表(ctor, 激活前) — 只建一次
