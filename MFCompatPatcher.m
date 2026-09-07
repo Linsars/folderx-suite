@@ -50,6 +50,21 @@ static void mfCompatDiag(NSString *step, NSString *detail) {
         [prefs writeToFile:@MF_PREF_PATH atomically:YES];
     }
 }
+static void mfXrayLog(const char *fmt, ...) {
+    // v2.53.4: 关键事件单独落盘(永不轮转)——sel 洪水不再冲掉装载/授权行
+    @autoreleasepool {
+        va_list ap; va_start(ap, fmt);
+        char buf[512]; vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+        NSString *home = NSHomeDirectory();
+        if (!home) { va_end(ap); return; }
+        uint64_t now = mach_absolute_time();
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        FILE *f = fopen([[home stringByAppendingPathComponent:@"Documents/mfcompat_xray.log"] UTF8String], "a");
+        if (f) { fprintf(f, "[%lluns] %s\n", (unsigned long long)(now * tb.numer / tb.denom / 1000), buf); fclose(f); }
+        va_end(ap);
+    }
+}
+
 static void mfCompatLog(const char *fmt, ...) {
     @autoreleasepool {
         va_list ap; va_start(ap, fmt);
@@ -421,41 +436,23 @@ static const char *mfImpWhere(uintptr_t imp) {
 
 static id t_getClass(const char *name) {
     id r = o_getClass(name);
-    // v2.53.2: 同名 getClass 限频(首/每 50 次/超限尾)——防解密循环刷屏掐掉后续符号日志
-    static char lastName[64]; static int lastRun = 0;
     int c = g_fcCnt[0]++;
-    BOOL log = NO;
-    if (c < XRAY_MAX_LOG) {
-        if (!name || strcmp(name, lastName) != 0 || lastRun >= 50) {
-            log = YES; lastRun = 0;
-        } else lastRun++;
-        if (c == XRAY_MAX_LOG - 1) log = YES;   // 尾标
-        if (log && name) { snprintf(lastName, sizeof(lastName), "%s", name); }
-        if (log)
-            mfCompatLog("[xray] getClass(%s) -> %s #%d", name ?: "?", r ? object_getClassName(r) : "nil", c);
-    }
+    if (c == 0 || (c > 0 && c % 250 == 0) || c == XRAY_MAX_LOG - 1)
+        mfCompatLog("[xray] getClass(%s) -> %s #%d", name ?: "?", r ? object_getClassName(r) : "nil", c);
     return r;
 }
 static SEL t_selReg(const char *name) {
     SEL r = o_selReg(name);
-    // v2.53.3: 同名限频(首/每 50 次/尾)——防解密循环刷屏冲掉装载头部
-    static char lastName[64]; static int lastRun = 0;
+    // v2.53.4: 固定节拍(首/每 250/尾)——按名限频在 5-sel 轮换循环下失效(每次调用都算换名)
     int c = g_fcCnt[1]++;
-    if (c < XRAY_MAX_LOG) {
-        BOOL log = (c == 0 || !name || strcmp(name, lastName) != 0 || c == XRAY_MAX_LOG - 1);
-        if (log) { if (name) snprintf(lastName, sizeof(lastName), "%s", name); lastRun = 0; }
-        else lastRun++;
-        if (log || lastRun == 50) {
-            mfCompatLog("[xray] sel(%s) #%d", name ?: "?", c);
-            if (lastRun == 50) lastRun = 0;
-        }
-    }
+    if (c == 0 || (c > 0 && c % 250 == 0) || c == XRAY_MAX_LOG - 1)
+        mfCompatLog("[xray] sel(%s) #%d", name ?: "?", c);
     return r;
 }
 static BOOL t_addMethod(id cls, SEL sel, IMP imp, const char *types) {
     BOOL r = o_addMethod(cls, sel, imp, types);
     if (g_fcCnt[2]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] addMethod(%s, %s, imp=%s, enc=%s) -> %d",
+        mfXrayLog("[xray] addMethod(%s, %s, imp=%s, enc=%s) -> %d",
                     cls ? object_getClassName(cls) : "nil",
                     sel ? sel_getName(sel) : "nil",
                     mfImpWhere((uintptr_t)imp), types ?: "?", r);
@@ -474,7 +471,7 @@ static IMP t_setImp(Method m, IMP imp) {
     IMP old = o_setImp(m, imp);
     SEL s = m ? method_getName(m) : NULL;
     if (g_fcCnt[4]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] *** SETIMP(%s, old=%s new=%s)",
+        mfXrayLog("[xray] *** SETIMP(%s, old=%s new=%s)",
                     s ? sel_getName(s) : "nil",
                     mfImpWhere((uintptr_t)old), mfImpWhere((uintptr_t)imp));
     return old;   // 必须原样返回旧 IMP
@@ -483,31 +480,31 @@ static IMP t_setImp(Method m, IMP imp) {
 static void *t_dlsym(void *h, const char *name) {
     void *r = o_dlsym(h, name);
     if (g_fcCnt[5]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] dlsym(handle=%p %s) -> %s", h, name ?: "?", mfImpWhere((uintptr_t)r));
+        mfXrayLog("[xray] dlsym(handle=%p %s) -> %s", h, name ?: "?", mfImpWhere((uintptr_t)r));
     return r;
 }
 static int t_vmProtect(void *t, unsigned long len, unsigned long maxp, int curp, int newp) {
     int r = o_vmProtect(t, len, maxp, curp, newp);
     if (g_fcCnt[6]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] *** VMPROTECT t=%p len=%#lx cur=%d new=%d kr=%d",
+        mfXrayLog("[xray] *** VMPROTECT t=%p len=%#lx cur=%d new=%d kr=%d",
                     t, len, curp, newp, r);
     return r;
 }
 static int t_sysctl(const char *name, void *oldp, unsigned long *oldlenp, void *newp, unsigned long newlen) {
     int r = o_sysctl(name, oldp, oldlenp, newp, newlen);
     if (g_fcCnt[7]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] sysctlbyname(%s) kr=%d", name ?: "?", r);
+        mfXrayLog("[xray] sysctlbyname(%s) kr=%d", name ?: "?", r);
     return r;
 }
 static int t_machServer(void *demux, unsigned int maxsz, unsigned int timeout, unsigned int subsys) {
     if (g_fcCnt[8]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] *** MACH_MSG_SERVER demux=%s maxsz=%u timeout=%u subsys=%u —— 许可服务器上线",
+        mfXrayLog("[xray] *** MACH_MSG_SERVER demux=%s maxsz=%u timeout=%u subsys=%u —— 许可服务器上线",
                     mfImpWhere((uintptr_t)demux), maxsz, timeout, subsys);
     return o_machServer(demux, maxsz, timeout, subsys);
 }
 static int t_pthreadCreate(void *t, const void *attr, void *(*fn)(void *), void *arg) {
     if (g_fcCnt[9]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] pthread_create fn=%s arg=%p", mfImpWhere((uintptr_t)fn), arg);
+        mfXrayLog("[xray] pthread_create fn=%s arg=%p", mfImpWhere((uintptr_t)fn), arg);
     return o_pthreadCreate(t, attr, fn, arg);
 }
 
@@ -525,7 +522,7 @@ static void mfFcRange(void) {
         }
         off += cs;
     }
-    mfCompatLog("[xray] range %#lx..%#lx", (unsigned long)g_fcLo, (unsigned long)g_fcHi);
+    mfXrayLog("[xray] range %#lx..%#lx", (unsigned long)g_fcLo, (unsigned long)g_fcHi);
 }
 
 // add_image 回调: 名字核对 -> 换全局镜像状态 -> 布蹦床 -> 记区间
@@ -544,7 +541,7 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
     if (!ours) return;
 
     g_fcMH = m64; g_fcSlide = slide;
-    mfCompatLog("[xray] sample mapped mh=%p slide=%p", m64, (void *)slide);
+    mfXrayLog("[xray] sample mapped mh=%p slide=%p", m64, (void *)slide);
 
     const struct mach_header_64 *saveMH = g_mh; intptr_t saveSlide = g_slide;
     g_mh = m64; g_slide = slide;
@@ -568,12 +565,12 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
     for (int i = 0; i < nh; i++) {
         void *slot = mfFindSlotForSymbol(hooks[i].name);
         if (!slot) slot = mfFindGotSlotForSymbol(hooks[i].name);
-        if (!slot) { mfCompatLog("[xray] MISS %s", hooks[i].name); continue; }
+        if (!slot) { mfXrayLog("[xray] MISS %s", hooks[i].name); continue; }
         *hooks[i].orig = *(void **)slot;    // bind 已完成, 槽内即原函数
         mfPatchSlotNamed(slot, hooks[i].trap, hooks[i].name);
         ok++;
     }
-    mfCompatLog("[xray] hooks=%d/%d", ok, nh);
+    mfXrayLog("[xray] hooks=%d/%d", ok, nh);
     mfFcRange();
     g_mh = saveMH; g_slide = saveSlide;   // 恢复主镜像状态
 }
@@ -612,7 +609,7 @@ static void mfXrayDumpData(void) {
         }
         off += cs;
     }
-    mfCompatLog("[xray] dump done emitted=%d", emitted);
+    mfXrayLog("[xray] dump done emitted=%d", emitted);
 }
 
 // L3: 全类方法表 diff, IMP∈标本区间 = 它装的钩子
@@ -646,7 +643,11 @@ static void mfXraySweepMethods(void) {
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     NSString *path = [dir stringByAppendingPathComponent:@"xray_classnames.txt"];
     [list writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    mfCompatLog("[xray] sweep names=%d -> %@ (no-realize mode)", clsTotal, path);
+    mfXrayLog("[xray] sweep names=%d -> %@ (no-realize mode)", clsTotal, path);
+    // v2.53.4: 会话总结(自证钩子状态, 防日志轮转丢证据)
+    mfXrayLog("[xray] SUMMARY cnt: getClass=%d sel=%d addM=%d getM=%d setI=%d dlsym=%d vmprot=%d sysctl=%d mach=%d pth=%d",
+              g_fcCnt[0], g_fcCnt[1], g_fcCnt[2], g_fcCnt[3], g_fcCnt[4],
+              g_fcCnt[5], g_fcCnt[6], g_fcCnt[7], g_fcCnt[8], g_fcCnt[9]);
 }
 
 // 标本装载(dlopen 由我们掌控: 诊断模式先布钩再让 ctor 跑)
@@ -663,8 +664,8 @@ static void mfFixcrashStage(BOOL xray) {
         g_xrayOn = xray;
         if (xray) _dyld_register_func_for_add_image(mfXrayAddImage);
         void *h = dlopen(full.fileSystemRepresentation, RTLD_NOW);
-        if (!h) { mfCompatLog("[xray] dlopen FAIL %s: %s", f.UTF8String, dlerror() ?: "?"); continue; }
-        mfCompatLog("[xray] dlopen ok %s xray=%d", f.UTF8String, xray);
+        if (!h) { mfXrayLog("[xray] dlopen FAIL %s: %s", f.UTF8String, dlerror() ?: "?"); continue; }
+        mfXrayLog("[xray] dlopen ok %s xray=%d", f.UTF8String, xray);
         if (xray) {
             const void *mh = (const void *)g_fcMH;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC),
@@ -674,7 +675,7 @@ static void mfFixcrashStage(BOOL xray) {
             (void)mh;
         }
     }
-    if (!any) mfCompatLog("[xray] sample dir empty %s", dir.UTF8String);
+    if (!any) mfXrayLog("[xray] sample dir empty %s", dir.UTF8String);
 }
 
 // ==================== v2.52 CK-SANITIZER: iOS17×新SDK CloudKit 兼容引擎 ====================
