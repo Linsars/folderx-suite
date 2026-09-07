@@ -70,6 +70,28 @@ NSDictionary *mfReconFingerprint(void) {
             @"RC 缓存 productEntitlementMapping 在场"];
     }
 
+    // ---- F1.5 Xray 采集残留(CompatPatcher 观察机若在本 app 采集过标本, 其授权形态可直接引用) ----
+    {
+        // v2.53.5: 侦查卡↔Xray 联动——读沙盒 mfcompat_xray.log 的 SUMMARY 行
+        // mach=1 说明有本地许可服务器在场(Reflix/ScriptingPass 型); vmprot=1 说明有内联补丁动作
+        NSString *home = NSHomeDirectory();
+        NSString *xp = [home stringByAppendingPathComponent:@"Documents/mfcompat_xray.log"];
+        NSString *xd = [NSString stringWithContentsOfFile:xp encoding:NSUTF8StringEncoding error:nil];
+        if (xd.length) {
+            NSRange sr = [xd rangeOfString:@"SUMMARY cnt:" options:NSBackwardsSearch];
+            if (sr.location != NSNotFound) {
+                NSString *summ = [xd substringFromIndex:sr.location];
+                [lines addObject:[NSString stringWithFormat:@"Xray 标本观察在场: %@", [[summ componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] firstObject] ?: summ]];
+                if ([summ containsString:@"mach=1"]) {
+                    mach = YES;   // 许可服务器已实测上线——mach 协议型直接实锤(比端口推断强)
+                    [lines addObject:@"Xray 实测: MACH_MSG_SERVER 已上线 → 本地许可服务器(mach 协议型)实锤"];
+                }
+                if ([summ containsString:@"vmprot="] && ![summ containsString:@"vmprot=0"])
+                    [lines addObject:@"Xray 实测: vm_protect 被调用 → 内联补丁动作在场"];
+            }
+        }
+    }
+
     // ---- F3 EXCPORTS 实况 — mach 类唯一判据(独立 BREAKPOINT 条目才算) ----
     {
         exception_mask_t masks[32]; mach_msg_type_number_t cnt = 32;
@@ -183,7 +205,7 @@ NSDictionary *mfReconFingerprint(void) {
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, 先 mock 直试", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 可直达", cloudBrands.allObjects.firstObject];
-    else if (mach)          verdict = @"本地许可服务器(异常端口 MIG) — 需录制破译战役";
+    else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, Reflix/ScriptingPass 同族) — EXCPROBE 应答器可复刻";
     else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
     else                    verdict = @"未发现订阅验证 SDK";
     if (cloudBrands.count > 1) {
