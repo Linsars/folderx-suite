@@ -20,6 +20,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dispatch/dispatch.h>
+#import <mach/mach_time.h>
 #import <dlfcn.h>
 #import <unistd.h>
 #include <string.h>
@@ -54,10 +55,28 @@ static void mfCompatLog(const char *fmt, ...) {
         va_list ap; va_start(ap, fmt);
         char buf[512]; vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
         NSString *home = NSHomeDirectory();
-        if (home) {
-            FILE *f = fopen([[home stringByAppendingPathComponent:@"Documents/mfcompat.log"] UTF8String], "a");
-            if (f) { fprintf(f, "%s\n", buf); fclose(f); }
+        if (!home) return;
+        NSString *path = [home stringByAppendingPathComponent:@"Documents/mfcompat.log"];
+        // v2.53.2: 轮转(>64KB 截掉前半保留尾部) + 每行带 us 时间戳(解密循环节奏分析)
+        NSDictionary *at = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+        if (at && [at fileSize] > 65536) {
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            if (data.length > 32768) {
+                NSData *tail = [data subdataWithRange:NSMakeRange(data.length - 32768, 32768)];
+                NSString *t = [[NSString alloc] initWithData:tail encoding:NSUTF8StringEncoding] ?: @"";
+                NSRange nl = [t rangeOfString:@"\n"];
+                if (nl.location != NSNotFound && nl.location + 1 < t.length)
+                    t = [t substringFromIndex:nl.location + 1];
+                [t writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
         }
+        static uint64_t base = 0;
+        uint64_t now = mach_absolute_time();
+        if (!base) base = now;
+        mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+        uint64_t us = (now - base) * tb.numer / tb.denom / 1000;
+        FILE *f = fopen(path.UTF8String, "a");
+        if (f) { fprintf(f, "[%lluus] %s\n", (unsigned long long)us, buf); fclose(f); }
     }
 }
 
@@ -335,7 +354,7 @@ static void mfCompatPatchMainBinary(void) {
 // 铁律: objc_msgSend 不钩(变参 ABI); 蹦床全部 passthrough; 标本缺席 = 全 no-op
 
 #define MF_FC_PATH "/var/jb/usr/lib/MinisFix/Sample.dylib"
-#define XRAY_MAX_LOG 300
+#define XRAY_MAX_LOG 2000
 
 typedef id (*mfGetClassT)(const char *);
 typedef SEL (*mfSelRegT)(const char *);
@@ -402,8 +421,19 @@ static const char *mfImpWhere(uintptr_t imp) {
 
 static id t_getClass(const char *name) {
     id r = o_getClass(name);
-    if (g_fcCnt[0]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] getClass(%s) -> %s", name ?: "?", r ? object_getClassName(r) : "nil");
+    // v2.53.2: 同名 getClass 限频(首/每 50 次/超限尾)——防解密循环刷屏掐掉后续符号日志
+    static char lastName[64]; static int lastRun = 0;
+    int c = g_fcCnt[0]++;
+    BOOL log = NO;
+    if (c < XRAY_MAX_LOG) {
+        if (!name || strcmp(name, lastName) != 0 || lastRun >= 50) {
+            log = YES; lastRun = 0;
+        } else lastRun++;
+        if (c == XRAY_MAX_LOG - 1) log = YES;   // 尾标
+        if (log && name) { snprintf(lastName, sizeof(lastName), "%s", name); }
+        if (log)
+            mfCompatLog("[xray] getClass(%s) -> %s #%d", name ?: "?", r ? object_getClassName(r) : "nil", c);
+    }
     return r;
 }
 static SEL t_selReg(const char *name) {
@@ -443,7 +473,7 @@ static IMP t_setImp(Method m, IMP imp) {
 static void *t_dlsym(void *h, const char *name) {
     void *r = o_dlsym(h, name);
     if (g_fcCnt[5]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] dlsym(%s) -> %s", name ?: "?", mfImpWhere((uintptr_t)r));
+        mfCompatLog("[xray] dlsym(handle=%p %s) -> %s", h, name ?: "?", mfImpWhere((uintptr_t)r));
     return r;
 }
 static int t_vmProtect(void *t, unsigned long len, unsigned long maxp, int curp, int newp) {
