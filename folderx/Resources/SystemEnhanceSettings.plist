@@ -51,7 +51,41 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>footerText</key>
-			<string>修改 appstored 请求版本与 installd 版本检查,更改后需注销或重启生效(守护进程启动时读取)</string>
+			<string>实验区:侦查与应答器武装开关(高危,仅按指引开启)</string>
+			<key>label</key>
+			<string>Lab</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.linsars.minisfix/ReloadPrefs</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.linsars.minisfix</string>
+			<key>key</key>
+			<string>mfXrayRecon</string>
+			<key>label</key>
+			<string>侦查会话(任何 App 装载标本观察)</string>
+		</dict>
+		<dict>
+			<key>PostNotification</key>
+			<string>com.linsars.minisfix/ReloadPrefs</string>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<false/>
+			<key>defaults</key>
+			<string>com.linsars.minisfix</string>
+			<key>key</key>
+			<string>mfExcArmed</string>
+			<key>label</key>
+			<string>EXCPROBE 应答器(武装任何 App)</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
 			<key>label</key>
 			<string>AppStore 版本伪装</string>
 		</dict>
