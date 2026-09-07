@@ -2193,13 +2193,18 @@ static id new_SKProductsReq_init(id self, SEL _cmd, NSSet *identifiers) {
 static void mfProbeStoreKit2(void) {
     NSMutableString *out = [NSMutableString stringWithCapacity:1 << 16];
     int clsCount = 0, methodCount = 0;
-    // v2.52.2: 逐镜像枚举, 只 realize AppStoreKit/StoreKit 框架类
-    // 旧版 objc_copyClassList 会 realize 全进程类, iOS26-SDK Swift app 的
-    // 泛型 conformance 带外 realize 会 _getWitnessTable 空指针崩(Real Crash 2026-09-06 Scripting)
-    uint32_t ic = _dyld_image_count();
-    for (uint32_t i = 0; i < ic; i++) {
-        const char *img = _dyld_get_image_name(i);
-        if (!img) continue;
+    // v2.52.3: objc_copyImageNames 原子快照 + strdup 自持拷贝
+    // 2.52.2 用 _dyld_get_image_name(i) 逐索引取名——Scripting 这类动态 dlopen/dlclose
+    // 的 app 在扫描期间卸载镜像 → dyld 名字串被释放 → strstr 踩悬挂指针(Real Crash 2026-09-06 #2)
+    // 2.52.1 及以前是 objc_copyClassList 全进程 realize → Swift 泛型 conformance 空指针(Real Crash #1)
+    unsigned ic2 = 0;
+    const char **imgs = objc_copyImageNames(&ic2);
+    if (!imgs || !ic2) { mfLog(@"[iap] SK2 枚举: 无镜像可枚举"); return; }
+    char **safe = malloc(sizeof(char *) * ic2);
+    for (unsigned i = 0; i < ic2; i++) safe[i] = strdup(imgs[i] ?: "");
+    free(imgs);
+    for (unsigned i = 0; i < ic2; i++) {
+        const char *img = safe[i];
         if (!strstr(img, "AppStoreKit") && !strstr(img, "/StoreKit.framework")) continue;
         if (strstr(img, "StoreKitUI")) continue; // 排除商店 UI 框架降噪
         unsigned cn = 0;
@@ -2208,7 +2213,8 @@ static void mfProbeStoreKit2(void) {
             Class c = objc_getClass(names[j]);
             if (!c) continue;
             clsCount++;
-            [out appendFormat:@"== %s  [%s]\n", names[j], [@(img) lastPathComponent].UTF8String];
+            NSString *leaf = [NSString stringWithUTF8String:img].lastPathComponent;
+            [out appendFormat:@"== %s  [%@]\n", names[j], leaf];
             for (int meta = 0; meta < 2; meta++) {
                 Class cc = meta ? object_getClass(c) : c;
                 unsigned mc = 0;
@@ -2223,6 +2229,8 @@ static void mfProbeStoreKit2(void) {
         }
         if (names) free(names);
     }
+    for (unsigned i = 0; i < ic2; i++) free(safe[i]);
+    free(safe);
     if (!clsCount) {
         mfLog(@"[iap] SK2 枚举: 进程内无 AppStoreKit 类——先打开一次购买页再扫描");
         return;
