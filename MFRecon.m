@@ -78,10 +78,13 @@ NSDictionary *mfReconFingerprint(void) {
         NSString *xp = [home stringByAppendingPathComponent:@"Documents/mfcompat_xray.log"];
         NSString *xd = [NSString stringWithContentsOfFile:xp encoding:NSUTF8StringEncoding error:nil];
         if (xd.length) {
+            BOOL viaRecon = [xd containsString:@"recon session"];
             NSRange sr = [xd rangeOfString:@"SUMMARY cnt:" options:NSBackwardsSearch];
             if (sr.location != NSNotFound) {
                 NSString *summ = [xd substringFromIndex:sr.location];
-                [lines addObject:[NSString stringWithFormat:@"Xray 标本观察在场: %@", [[summ componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] firstObject] ?: summ]];
+                [lines addObject:[NSString stringWithFormat:@"Xray 标本观察在场(%@): %@",
+                    viaRecon ? @"侦查会话" : @"兼容列表会话",
+                    [[summ componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] firstObject] ?: summ]];
                 if ([summ containsString:@"mach=1"]) {
                     mach = YES;   // 许可服务器已实测上线——mach 协议型直接实锤(比端口推断强)
                     [lines addObject:@"Xray 实测: MACH_MSG_SERVER 已上线 → 本地许可服务器(mach 协议型)实锤"];
