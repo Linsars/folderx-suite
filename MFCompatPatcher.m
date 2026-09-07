@@ -575,25 +575,6 @@ static void mfXrayDumpData(void) {
 }
 
 // L3: 全类方法表 diff, IMP∈标本区间 = 它装的钩子
-static int mfXraySweepOne(Class c, BOOL meta) {
-    unsigned cnt = 0;
-    Method *ms = class_copyMethodList(c, &cnt);
-    int hits = 0;
-    for (unsigned j = 0; j < cnt; j++) {
-        IMP imp = method_getImplementation(ms[j]);
-        if ((uintptr_t)imp >= g_fcLo && (uintptr_t)imp < g_fcHi) {
-            SEL s = method_getName(ms[j]);
-            mfCompatLog("[xray] ** HOOK %c[%s %s] enc=%s imp=FixCrash+%#lx",
-                        meta ? '+' : '-', object_getClassName(c),
-                        s ? sel_getName(s) : "nil",
-                        method_getTypeEncoding(ms[j]) ?: "?",
-                        (unsigned long)((uintptr_t)imp - (g_fcSlide ? g_fcLo - g_fcSlide : 0)));
-            hits++;
-        }
-    }
-    if (ms) free(ms);
-    return hits;
-}
 static void mfXraySweepMethods(void) {
     if (!g_fcMH || !g_fcLo) return;
     // v2.53.1: 纯名字比对模式——objc_getClass(逐个 realize) 在 iOS26-SDK Swift app
