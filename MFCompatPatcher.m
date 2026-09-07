@@ -334,7 +334,7 @@ static void mfCompatPatchMainBinary(void) {
 // 生产模式: 纯 dlopen, 标本自行工作
 // 铁律: objc_msgSend 不钩(变参 ABI); 蹦床全部 passthrough; 标本缺席 = 全 no-op
 
-#define MF_FC_PATH "/var/jb/usr/lib/MinisFix/FixCrash.dylib"
+#define MF_FC_PATH "/var/jb/usr/lib/MinisFix/Sample.dylib"
 #define XRAY_MAX_LOG 300
 
 typedef id (*mfGetClassT)(const char *);
@@ -342,18 +342,29 @@ typedef SEL (*mfSelRegT)(const char *);
 typedef BOOL (*mfAddMethodT)(id, SEL, IMP, const char *);
 typedef void *(*mfGetInstMethodT)(void *, void *);   // Method 返回值绝不声明 id: ARC 会插入 objc_retain 打死非对象指针
 typedef IMP (*mfSetImpT)(Method, IMP);
+// v2.53: 标本通用化扩展(Reflix 授权体系同款符号)
+typedef void *(*mfDlsymT)(void *, const char *);
+typedef int (*mfVmProtectT)(void *, unsigned long, unsigned long, int, int);
+typedef int (*mfSysctlT)(const char *, void *, unsigned long *, void *, unsigned long);
+typedef int (*mfMachServerT)(void *, unsigned int, unsigned int, unsigned int);
+typedef int (*mfPthreadCreateT)(void *, const void *, void *(*)(void *), void *);
 
 static mfGetClassT o_getClass;
 static mfSelRegT o_selReg;
 static mfAddMethodT o_addMethod;
 static mfGetInstMethodT o_getInstMethod;
 static mfSetImpT o_setImp;
+static mfDlsymT o_dlsym;
+static mfVmProtectT o_vmProtect;
+static mfSysctlT o_sysctl;
+static mfMachServerT o_machServer;
+static mfPthreadCreateT o_pthreadCreate;
 
 static const struct mach_header_64 *g_fcMH;
 static intptr_t g_fcSlide;
 static uintptr_t g_fcLo, g_fcHi;   // 标本镜像 slid 区间
 static int g_xrayOn;
-static int g_fcCnt[5];
+static int g_fcCnt[10];
 
 // IMP 归属: 返回静态环缓冲描述(防单行双参别名)
 static const char *mfImpWhere(uintptr_t imp) {
@@ -428,6 +439,37 @@ static IMP t_setImp(Method m, IMP imp) {
                     mfImpWhere((uintptr_t)old), mfImpWhere((uintptr_t)imp));
     return old;   // 必须原样返回旧 IMP
 }
+// v2.53 授权体系蹦床: 只记参, 尾调原函数
+static void *t_dlsym(void *h, const char *name) {
+    void *r = o_dlsym(h, name);
+    if (g_fcCnt[5]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] dlsym(%s) -> %s", name ?: "?", mfImpWhere((uintptr_t)r));
+    return r;
+}
+static int t_vmProtect(void *t, unsigned long len, unsigned long maxp, int curp, int newp) {
+    int r = o_vmProtect(t, len, maxp, curp, newp);
+    if (g_fcCnt[6]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] *** VMPROTECT t=%p len=%#lx cur=%d new=%d kr=%d",
+                    t, len, curp, newp, r);
+    return r;
+}
+static int t_sysctl(const char *name, void *oldp, unsigned long *oldlenp, void *newp, unsigned long newlen) {
+    int r = o_sysctl(name, oldp, oldlenp, newp, newlen);
+    if (g_fcCnt[7]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] sysctlbyname(%s) kr=%d", name ?: "?", r);
+    return r;
+}
+static int t_machServer(void *demux, unsigned int maxsz, unsigned int timeout, unsigned int subsys) {
+    if (g_fcCnt[8]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] *** MACH_MSG_SERVER demux=%s maxsz=%u timeout=%u subsys=%u —— 许可服务器上线",
+                    mfImpWhere((uintptr_t)demux), maxsz, timeout, subsys);
+    return o_machServer(demux, maxsz, timeout, subsys);
+}
+static int t_pthreadCreate(void *t, const void *attr, void *(*fn)(void *), void *arg) {
+    if (g_fcCnt[9]++ < XRAY_MAX_LOG)
+        mfCompatLog("[xray] pthread_create fn=%s arg=%p", mfImpWhere((uintptr_t)fn), arg);
+    return o_pthreadCreate(t, attr, fn, arg);
+}
 
 // 标本镜像区间(遍历 LC_SEGMENT_64)
 static void mfFcRange(void) {
@@ -456,7 +498,7 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
     for (uint32_t i = 0; i < n; i++) {
         if ((const struct mach_header_64 *)_dyld_get_image_header(i) != m64) continue;
         const char *nm = _dyld_get_image_name(i);
-        if (nm && strstr(nm, "FixCrash.dylib")) ours = YES;
+        if (nm && (strstr(nm, "FixCrash.dylib") || strstr(nm, "ScriptingPass.dylib") || strstr(nm, "MinisFix/"))) ours = YES;
         break;
     }
     if (!ours) return;
@@ -474,6 +516,12 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
         {"_class_addMethod",           (void **)&o_addMethod,      (void *)t_addMethod},
         {"_class_getInstanceMethod",   (void **)&o_getInstMethod,  (void *)t_getInstMethod},
         {"_method_setImplementation",  (void **)&o_setImp,         (void *)t_setImp},
+        // v2.53: 授权体系观测(Reflix 同款架构——mach 服务器/补丁/指纹/拉件)
+        {"_dlsym",                     (void **)&o_dlsym,          (void *)t_dlsym},
+        {"_vm_protect",                (void **)&o_vmProtect,      (void *)t_vmProtect},
+        {"_sysctlbyname",              (void **)&o_sysctl,         (void *)t_sysctl},
+        {"_mach_msg_server",           (void **)&o_machServer,     (void *)t_machServer},
+        {"_pthread_create",            (void **)&o_pthreadCreate,  (void *)t_pthreadCreate},
     };
     int ok = 0;
     for (int i = 0; i < 5; i++) {
@@ -484,7 +532,7 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
         mfPatchSlotNamed(slot, hooks[i].trap, hooks[i].name);
         ok++;
     }
-    mfCompatLog("[xray] hooks=%d/5", ok);
+    mfCompatLog("[xray] hooks=%d/10", ok);
     mfFcRange();
     g_mh = saveMH; g_slide = saveSlide;   // 恢复主镜像状态
 }
@@ -575,25 +623,30 @@ static void mfXraySweepMethods(void) {
 
 // 标本装载(dlopen 由我们掌控: 诊断模式先布钩再让 ctor 跑)
 static void mfFixcrashStage(BOOL xray) {
-    struct stat st;
-    if (stat(MF_FC_PATH, &st) != 0) {
-        mfCompatLog("[xray] sample absent %s", MF_FC_PATH);
-        return;
+    // v2.53: 目录枚举——/var/jb/usr/lib/MinisFix/*.dylib 全部作为标本逐个装载
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = @"/var/jb/usr/lib/MinisFix";
+    NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil] ?: @[];
+    BOOL any = NO;
+    for (NSString *f in [files sortedArrayUsingSelector:@selector(compare)]) {
+        if (![f.pathExtension isEqualToString:@"dylib"]) continue;
+        any = YES;
+        NSString *full = [dir stringByAppendingPathComponent:f];
+        g_xrayOn = xray;
+        if (xray) _dyld_register_func_for_add_image(mfXrayAddImage);
+        void *h = dlopen(full.fileSystemRepresentation, RTLD_NOW);
+        if (!h) { mfCompatLog("[xray] dlopen FAIL %s: %s", f.UTF8String, dlerror() ?: "?"); continue; }
+        mfCompatLog("[xray] dlopen ok %s xray=%d", f.UTF8String, xray);
+        if (xray) {
+            const void *mh = (const void *)g_fcMH;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC),
+                           dispatch_get_global_queue(0, 0), ^{ @autoreleasepool { mfXrayDumpData(); } });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6LL * NSEC_PER_SEC),
+                           dispatch_get_global_queue(0, 0), ^{ @autoreleasepool { mfXraySweepMethods(); } });
+            (void)mh;
+        }
     }
-    g_xrayOn = xray;
-    if (xray) _dyld_register_func_for_add_image(mfXrayAddImage);
-    void *h = dlopen(MF_FC_PATH, RTLD_NOW);
-    if (!h) {
-        mfCompatLog("[xray] dlopen FAIL: %s", dlerror() ?: "?");
-        return;
-    }
-    mfCompatLog("[xray] dlopen ok xray=%d", xray);
-    if (xray) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC),
-                       dispatch_get_global_queue(0, 0), ^{ @autoreleasepool { mfXrayDumpData(); } });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 6LL * NSEC_PER_SEC),
-                       dispatch_get_global_queue(0, 0), ^{ @autoreleasepool { mfXraySweepMethods(); } });
-    }
+    if (!any) mfCompatLog("[xray] sample dir empty %s", dir.UTF8String);
 }
 
 // ==================== v2.52 CK-SANITIZER: iOS17×新SDK CloudKit 兼容引擎 ====================
