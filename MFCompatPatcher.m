@@ -438,8 +438,18 @@ static id t_getClass(const char *name) {
 }
 static SEL t_selReg(const char *name) {
     SEL r = o_selReg(name);
-    if (g_fcCnt[1]++ < XRAY_MAX_LOG)
-        mfCompatLog("[xray] sel(%s)", name ?: "?");
+    // v2.53.3: 同名限频(首/每 50 次/尾)——防解密循环刷屏冲掉装载头部
+    static char lastName[64]; static int lastRun = 0;
+    int c = g_fcCnt[1]++;
+    if (c < XRAY_MAX_LOG) {
+        BOOL log = (c == 0 || !name || strcmp(name, lastName) != 0 || c == XRAY_MAX_LOG - 1);
+        if (log) { if (name) snprintf(lastName, sizeof(lastName), "%s", name); lastRun = 0; }
+        else lastRun++;
+        if (log || lastRun == 50) {
+            mfCompatLog("[xray] sel(%s) #%d", name ?: "?", c);
+            if (lastRun == 50) lastRun = 0;
+        }
+    }
     return r;
 }
 static BOOL t_addMethod(id cls, SEL sel, IMP imp, const char *types) {
@@ -554,7 +564,8 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
         {"_pthread_create",            (void **)&o_pthreadCreate,  (void *)t_pthreadCreate},
     };
     int ok = 0;
-    for (int i = 0; i < 5; i++) {
+    int nh = (int)(sizeof(hooks) / sizeof(hooks[0]));   // v2.53.3: 全表遍历——修 2.53.0/2 的 i<5 截断(后 5 个蹦床从未安装, VMPROTECT/MACH 全零的真凶)
+    for (int i = 0; i < nh; i++) {
         void *slot = mfFindSlotForSymbol(hooks[i].name);
         if (!slot) slot = mfFindGotSlotForSymbol(hooks[i].name);
         if (!slot) { mfCompatLog("[xray] MISS %s", hooks[i].name); continue; }
@@ -562,7 +573,7 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
         mfPatchSlotNamed(slot, hooks[i].trap, hooks[i].name);
         ok++;
     }
-    mfCompatLog("[xray] hooks=%d/10", ok);
+    mfCompatLog("[xray] hooks=%d/%d", ok, nh);
     mfFcRange();
     g_mh = saveMH; g_slide = saveSlide;   // 恢复主镜像状态
 }
