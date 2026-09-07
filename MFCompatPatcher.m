@@ -596,11 +596,13 @@ static int mfXraySweepOne(Class c, BOOL meta) {
 }
 static void mfXraySweepMethods(void) {
     if (!g_fcMH || !g_fcLo) return;
-    // v2.52.2: 逐镜像枚举, 跳过主二进制——objc_copyClassList 会 force-realize 全进程类,
-    // iOS26-SDK Swift app 的泛型 conformance 带外 realize 会 _getWitnessTable 空指针崩
-    // (Real Crash 2026-09-06 Scripting)。标本只 hook 系统类, 跳主二进制零损失。
+    // v2.53.1: 纯名字比对模式——objc_getClass(逐个 realize) 在 iOS26-SDK Swift app
+    // 上会撞泛型 conformance 空指针(Real Crash 2026-09-06 #3)。L3 改为只枚举类名
+    // 不碰类对象: hook 目标靠标本 ctor 阶段的 addMethod/SETIMP 蹦床日志直接拿,
+    // L3 降级为"标本镜像内 IMP 扫描+类名清单"快照, 不再触发任何 realize。
     NSString *exe = [[NSBundle mainBundle] executablePath] ?: @"";
-    int hits = 0, clsTotal = 0;
+    int clsTotal = 0;
+    NSMutableString *list = [NSMutableString string];
     uint32_t ic = _dyld_image_count();
     for (uint32_t i = 0; i < ic; i++) {
         const char *img = _dyld_get_image_name(i);
@@ -608,17 +610,21 @@ static void mfXraySweepMethods(void) {
         if (exe.length && strcmp(img, exe.fileSystemRepresentation) == 0) continue;
         unsigned cn = 0;
         char **names = objc_copyClassNamesForImage(img, &cn);
-        for (unsigned j = 0; j < cn; j++) {
-            Class c = objc_getClass(names[j]);
-            if (!c) continue;
-            clsTotal++;
-            hits += mfXraySweepOne(c, NO);
-            Class meta = object_getClass(c);
-            if (meta && meta != c) hits += mfXraySweepOne(meta, YES);
+        clsTotal += cn;
+        if (cn && list.length < 60000) {
+            [list appendFormat:@"-- %s (%u)\n", [(@(img)) lastPathComponent].UTF8String ?: "?", cn];
+            for (unsigned j = 0; j < cn && list.length < 60000; j++)
+                [list appendFormat:@"%s\n", names[j]];
         }
         if (names) free(names);
     }
-    mfCompatLog("[xray] sweep classes=%d hooks=%d (app-binary skipped)", clsTotal, hits);
+    // 落盘类名清单(诊断用, 不 realize)
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0]
+                        stringByAppendingPathComponent:@"classdump"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *path = [dir stringByAppendingPathComponent:@"xray_classnames.txt"];
+    [list writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    mfCompatLog("[xray] sweep names=%d -> %@ (no-realize mode)", clsTotal, path);
 }
 
 // 标本装载(dlopen 由我们掌控: 诊断模式先布钩再让 ctor 跑)
