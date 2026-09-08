@@ -31,6 +31,7 @@ static mach_msg_return_t (*g_origMachMsg)(mach_msg_header_t *, mach_msg_option_t
 static os_unfair_lock g_machLock = OS_UNFAIR_LOCK_INIT;
 static int g_machCapCount = 0;
 static uint32_t g_excHitCount = 0;   // v2.54.0: EXCPROBE 应答命中计数
+void mfExcArm(void);   // v2.54.1: 前向声明(定义在下方), 开关变化时重触发武装
 
 // v2.54.0: EXCPROBE 应答器开关状态(mfExcEnabled)——实验模拟页 UISwitch
 BOOL mfExcIsOn(void) {
@@ -40,6 +41,7 @@ void mfExcSetOn(BOOL on) {
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"mfExcEnabled"];
     [[NSUserDefaults standardUserDefaults] synchronize];
     mfLog(@"[capture] EXCPROBE switch -> %@", on ? @"ON" : @"OFF");
+    if (on) mfExcArm();   // v2.54.1: 开关打开时立即武装(不等 ctor)——解决运行时开开关不生效的时机问题
 }
 long mfExcHits(void) { return (long)g_excHitCount; }
 // 应答命中时调用(在 mfExcProxy 应答逻辑处)
@@ -146,6 +148,53 @@ static thread_state_flavor_t g_mitmOldFlv = 0;
 static os_unfair_lock g_mitmLock = OS_UNFAIR_LOCK_INIT;
 static uint32_t g_mitmCount = 0;
 static void *mf_mitmServer(void *arg);
+
+// v2.54.1: EXCPROBE 武装(独立函数, 可在开关变化时重触发)——
+//   swap EXC_BREAKPOINT 异常端口到自己, 起应答线程。由 ctor(mfProcCaptureStart)和开关变化(mfExcSetOn)调用。
+void mfExcArm(void) {
+    if (g_mitmMyPort != MACH_PORT_NULL) return;   // 已武装
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfExcProbeOff"]) return;   // 默认 ON, mfExcProbeOff=1 关
+    // v2.39.4: 终局 MITM — swap EXC_BREAKPOINT 处理器到自己, 录 Q/A 后转发 vendor
+    {
+        mach_port_t self_ = mach_task_self();
+        mach_port_t myPort = MACH_PORT_NULL;
+        kern_return_t km = mach_port_allocate(self_, MACH_PORT_RIGHT_RECEIVE, &myPort);
+        if (km == KERN_SUCCESS) {
+            km = mach_port_insert_right(self_, myPort, myPort, MACH_MSG_TYPE_MAKE_SEND);
+            mach_port_t oldPorts[32];
+            exception_mask_t oldMasks[32];
+            exception_behavior_t oldBehs[32];
+            thread_state_flavor_t oldFlvs[32];
+            mach_msg_type_number_t oldCnt = 32;
+            kern_return_t ks = task_swap_exception_ports(self_, EXC_MASK_BREAKPOINT, myPort,
+                    MACH_EXCEPTION_CODES | EXCEPTION_STATE, ARM_THREAD_STATE64,
+                    oldMasks, &oldCnt, oldPorts, oldBehs, oldFlvs);
+            if (ks == KERN_SUCCESS) {
+                g_mitmVendorPort = MACH_PORT_NULL;
+                for (uint32_t j = 0; j < oldCnt && j < 32; j++) {
+                    if (oldMasks[j] & EXC_MASK_BREAKPOINT) {
+                        g_mitmVendorPort = oldPorts[j];
+                        g_mitmOldBeh = oldBehs[j];
+                        g_mitmOldFlv = oldFlvs[j];
+                        mfLog(@"[capture] MITM swap ok: old[%u] mask=0x%x vendor_port=0x%x beh=%d flv=%d",
+                              j, oldMasks[j], oldPorts[j], oldBehs[j], oldFlvs[j]);
+                    }
+                }
+                g_mitmMyPort = myPort;
+                mfLog(@"[capture] MITM armed: myPort=0x%x vendor=0x%x km=%d ks=%d",
+                      myPort, g_mitmVendorPort, km, ks);
+                pthread_t thr;
+                pthread_create(&thr, NULL, mf_mitmServer, (void *)(uintptr_t)myPort);
+                pthread_detach(thr);
+            } else {
+                mfLog(@"[capture] MITM swap FAIL ks=%d myPort=0x%x", ks, myPort);
+            }
+        } else {
+            mfLog(@"[capture] MITM alloc FAIL km=%d", km);
+        }
+    }
+}
+
 static void mfCapInstallTgsChain(struct mach_header_64 *mh, intptr_t slide) {
     if (g_origTgs) return;
     struct rebinding rb = {"thread_get_state", (void *)mf_tgsHook, (void **)&g_origTgs};
@@ -170,53 +219,8 @@ static void mfCapInstallTgsChain(struct mach_header_64 *mh, intptr_t slide) {
             mfLog(@"[capture] EXCPORTS none (kr=%d cnt=%u)", krx, mCnt);
         }
     }
-    // v2.40.0: 采样应答器(透明单发) — 守 BREAKPOINT 端口, 异常来了本地仿真原指令(基线快照有原字节),
-    //   PC+=4(★ 4 连崩真因: 此前应答从不推进 PC), 答完即还 vendor 端口。门控 mfExcProbe 默认 ON(透明+单发+即还=安全)
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfExcProbeOff"]) return;   // 默认 ON, mfExcProbeOff=1 关
-    // v2.39.4: 终局 MITM — swap EXC_BREAKPOINT 处理器到自己, 录 Q/A 后转发 vendor
-    //   ★ 2.39.3 翻案: mask=0x40 = 1<<6 = EXC_BREAKPOINT(不是 EXC_SYSCALL!)
-    //   ★ 2.39.7 终判: 手搓 MIG 转发 4 连崩(2406/2506/规范尺寸/穿透全试) — 协议录制路线 dead end
-    //   替代品转向客户端侧逆向: 主二进制 wrapper(0x11d527c→brk 0x14211bc) 反汇编出答案消费逻辑, 本地造答案
-    //   app 查询 = brk #0x965/0x966/0x967/0x9c9/0x9ca/0x9cb(立即数=请求码, v2.29.1 六个数=BRK imm)
-    //   → EXC_BREAKPOINT(6) → 内核 mach_exception_raise_state(code=EXC_ARM_BREAKPOINT|imm<<16) 直投 vendor
-    {
-        mach_port_t self_ = mach_task_self();
-        mach_port_t myPort = MACH_PORT_NULL;
-        kern_return_t km = mach_port_allocate(self_, MACH_PORT_RIGHT_RECEIVE, &myPort);
-        if (km == KERN_SUCCESS) {
-            km = mach_port_insert_right(self_, myPort, myPort, MACH_MSG_TYPE_MAKE_SEND);
-            mach_port_t oldPorts[32];
-            exception_mask_t oldMasks[32];
-            exception_behavior_t oldBehs[32];
-            thread_state_flavor_t oldFlvs[32];
-            mach_msg_type_number_t oldCnt = 32;
-            kern_return_t ks = task_swap_exception_ports(self_, EXC_MASK_BREAKPOINT, myPort,
-                    MACH_EXCEPTION_CODES | EXCEPTION_STATE, ARM_THREAD_STATE64,
-                    oldMasks, &oldCnt, oldPorts, oldBehs, oldFlvs);
-            if (ks == KERN_SUCCESS) {
-                g_mitmVendorPort = MACH_PORT_NULL;
-                for (uint32_t j = 0; j < oldCnt && j < 32; j++) {
-                    if (oldMasks[j] & EXC_MASK_BREAKPOINT) {
-                        g_mitmVendorPort = oldPorts[j];   // vendor 端口 send right 落到我们手里
-                        g_mitmOldBeh = oldBehs[j];        // ★ 原注册行为(restore 必须原样, 否则真实 brk 格式错位→vendor 拒答→悬空)
-                        g_mitmOldFlv = oldFlvs[j];
-                        mfLog(@"[capture] MITM swap ok: old[%u] mask=0x%x vendor_port=0x%x beh=%d flv=%d",
-                              j, oldMasks[j], oldPorts[j], oldBehs[j], oldFlvs[j]);
-                    }
-                }
-                g_mitmMyPort = myPort;
-                mfLog(@"[capture] MITM armed: myPort=0x%x vendor=0x%x km=%d ks=%d",
-                      myPort, g_mitmVendorPort, km, ks);
-                pthread_t thr;
-                pthread_create(&thr, NULL, mf_mitmServer, (void *)(uintptr_t)myPort);
-                pthread_detach(thr);   // v2.45.0: 无条件启动(真品退役后 vendor=0, 替代件独立守端口)
-            } else {
-                mfLog(@"[capture] MITM swap FAIL ks=%d myPort=0x%x", ks, myPort);
-            }
-        } else {
-            mfLog(@"[capture] MITM alloc FAIL km=%d", km);
-        }
-    }
+    // v2.54.1: EXCPROBE 武装已提取为独立 mfExcArm(), 这里仅调用(由 ctor 触发)
+    mfExcArm();
 }
 
 // v2.39.2: 手搓 64 位 MIG 异常交换(iOS SDK 无 mach_exc 头/导出, 布局照 xnu MIG, 4B pack)
@@ -1198,26 +1202,22 @@ void mfProcCaptureStart(void) {
     if (g_capOn) return;
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-    // v2.54.0: EXCPROBE 归 IAPtools 管, 门控=主开关(mfExcEnabled) + 强制白名单(mfIAPAppList)。
-    //   - mfExcEnabled(实验区开关)不开 → 不武装(即使 app 在白名单)
-    //   - 只认 mfIAPAppList 白名单, 不跟随 mfIAPAutoApply——EXCPROBE 是重型武器(swap 异常端口
-    //     + catcher 所有 brk), 绝不能自动对所有 app 生效。2.53.8 mfExcArmed 崩 Filza 教训即此。
-    //   现在: 开关开 + app 勾进「应用程序列表」→ 才武装; 两者缺一不武装(无关 app 安全)。
+    // v2.54.1: EXCPROBE 门控与云验证 mock 一致——由 mfIsEnabledForCurrentApp(当前 app 用不用 IAP工具箱)
+    //   决定, EXCPROBE 开关(mfExcEnabled)决定专用功能. 不叠 mfIAPAppList(那是工具箱注入范围, 已在
+    //   mfIsEnabledForCurrentApp 里). 实验模拟页开关是用户主动控制, 不涉及无关 app 启动。
+    extern BOOL mfIsEnabledForCurrentApp(void);
+    if (!mfIsEnabledForCurrentApp()) {
+        mfLog(@"[capture] EXCPROBE skip (IAPtools not enabled for bid=%@)", bid ?: @"?");
+        return;
+    }
     NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"] ?: @{};
     BOOL excEnabled = [pf[@"mfExcEnabled"] boolValue];
     if (!excEnabled) {
         mfLog(@"[capture] EXCPROBE skip (mfExcEnabled=NO)");
         return;
     }
-    NSArray *iapList = pf[@"mfIAPAppList"];
-    BOOL inIAPList = NO;
-    if ([iapList isKindOfClass:[NSArray class]] && iapList.count > 0 && bid.length > 0)
-        inIAPList = [iapList containsObject:bid];
-    if (!inIAPList) {
-        mfLog(@"[capture] EXCPROBE skip (bid=%@ not in mfIAPAppList)", bid ?: @"?");
-        return;
-    }
-    mfLog(@"[capture] EXCPROBE armed (mfExcEnabled + mfIAPAppList, bid=%@ ver=%@)", bid, ver);
+    mfLog(@"[capture] EXCPROBE armed (mfIsEnabledForCurrentApp + mfExcEnabled, bid=%@ ver=%@)", bid, ver);
+    mfExcArm();   // v2.54.1: 提取的武装函数——ctor 时也武装
 
     // v2.28.1: debug 通道已证伪(2.28.0 实测写入正确域仍不亮) — 默认关, 别污染采集对照
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfDebugOverride"]) {
