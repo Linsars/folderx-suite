@@ -784,10 +784,9 @@ __attribute__((constructor)) static void CompatPatcherCtor(void) {
         // v2.51 probe: 标本装载 + 观察机(mfXray 缺省 ON, 显式 NO 关闭)
         NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
         BOOL xray = pf[@"mfXray"] ? [pf[@"mfXray"] boolValue] : YES;
-        // v2.53.5: 观察与修复解耦——mfXrayRecon(全局键, Lab 开关)开启时
-        // 任何 app 都装载标本做观察采集, 不再要求先加进 mfCompatAppList
-        // (兼容列表本职=崩溃修复白名单, 被挪用当观察白名单是设计错误——用户抓的)
-        BOOL recon = [pf[@"mfXrayRecon"] boolValue];
+        // v2.53.9: mfXrayRecon 撤回——实验性标本装载导致 Filza 等无关 app 冷启动崩,
+        // 调试移至 VansonMod 桥(远程内存搜索/RVA 补丁, 不污染目标进程), 此路径永久关闭
+        BOOL recon = NO;
         BOOL viaList = mfCompatNeededRaw();
         if (recon && !viaList) {
             mfXrayLog("[xray] recon session (bid=%@)", bid ?: @"?");

@@ -1188,7 +1188,9 @@ void mfProcCaptureStart(void) {
     // 开=跳过 bid/version 闸门(EXCPORTS 侦查+MITM swap+应答器全链武装),
     // 但内存快照/ObjC 巡检等重活仍只对白名单跑(采集面板职责不变)
     NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"] ?: @{};
-    g_excArmed = [pf[@"mfExcArmed"] boolValue];
+    // v2.53.9: mfExcArmed 撤回——EXCPROBE 对任意 app 武装导致 Filza 等冷启动崩,
+    // 调试移至 VansonMod 桥. 永久关闭, 即使 prefs 残留 true 也不生效
+    g_excArmed = NO;
     BOOL excArmed = g_excArmed;
     if (excArmed) {
         mfLog(@"[capture] EXC-ARMED via mfExcArmed (bid=%@ ver=%@)", bid, ver);
