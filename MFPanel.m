@@ -1410,6 +1410,9 @@ extern BOOL mfReceiptForgeIsOn(void);
 extern BOOL mfL0IsOn(void);
 extern long mfL0ObserverCount(void);
 extern void mfL0SetOn(BOOL on);
+extern BOOL mfExcIsOn(void);        // v2.54.0: EXCPROBE 应答器开关状态
+extern long mfExcHits(void);        // 命中计数
+extern void mfExcSetOn(BOOL on);    // 写状态
 
 
 static UIView *mfSubSwitchRow(UIView *page, CGFloat y, NSString *title,
@@ -1465,9 +1468,14 @@ void mfShowLabPage(void) {
     mfSubSwitchRow(page, 244, @"L1 收据伪造（收据验证型）", mfReceiptForgeIsOn(),
         @selector(mfReceiptForgeSwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 收据验证型 — appStoreReceiptURL/transactionReceipt · 命中 %ld", mfReceiptForgeHits()]);
+    // v2.54.0: EXCPROBE 应答器 — 本地许可服务器(mach 型, Reflix/ScriptingPass 同族)应答器。
+    //   开关+白名单(mfIAPAppList)双门控, 在主进程 IAPtools 里换异常端口并对 brk 应答 x9=1。
+    mfSubSwitchRow(page, 304, @"EXCPROBE 应答器（mach 许可服务器）", mfExcIsOn(),
+        @selector(mfExcSwitchChanged:),
+        [NSString stringWithFormat:@"对应侦查: 本地许可服务器(异常端口 MIG, mach=1) — 只对 mfIAPAppList 内 App 生效 · 命中 %ld", mfExcHits()]);
 
 
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 308, g_mfCardW - 32, 96)];
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 368, g_mfCardW - 32, 96)];
     note.text = @"产品 ID 来自「扫描购买」列表 (iapids.plist)。\nentitlement 名自动发现(RC 缓存+二进制扫描), 回退 pro。\nlifetime 产品走 non_subscriptions (RC 官方规范)。\n解析型收据校验可过, hash 校验型必挂。";
     note.numberOfLines = 0;
     note.font = [UIFont systemFontOfSize:12];
@@ -1549,6 +1557,7 @@ void mfShowLabPage(void) {
 - (void)mfSubInjectSwitchChanged:(UISwitch *)sw { mfSubInjectSwitchChanged(sw); }
 - (void)mfReceiptForgeSwitchChanged:(UISwitch *)sw { mfReceiptForgeSwitchChanged(sw); }
 - (void)mfL0SwitchChanged:(UISwitch *)sw { mfL0SetOn(sw.on); }
+- (void)mfExcSwitchChanged:(UISwitch *)sw { mfExcSetOn(sw.on); }   // v2.54.0: EXCPROBE 应答器开关
 - (void)mfObjCHookToggle:(UISwitch *)sw { mfObjCHookToggle(sw); }
 - (void)mfObjCHookDelTapped:(UIButton *)b { mfObjCHookDelTapped(b); }
 - (void)mfObjCHookEditTapped:(UIView *)row { mfObjCHookEditTappedFromView(row); }

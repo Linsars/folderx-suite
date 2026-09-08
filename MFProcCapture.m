@@ -30,6 +30,20 @@ static mach_msg_return_t (*g_origMachMsg)(mach_msg_header_t *, mach_msg_option_t
                                           mach_msg_header_t *, mach_msg_size_t, mach_port_t, mach_msg_timeout_t);
 static os_unfair_lock g_machLock = OS_UNFAIR_LOCK_INIT;
 static int g_machCapCount = 0;
+static uint32_t g_excHitCount = 0;   // v2.54.0: EXCPROBE 应答命中计数
+
+// v2.54.0: EXCPROBE 应答器开关状态(mfExcEnabled)——实验模拟页 UISwitch
+BOOL mfExcIsOn(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"mfExcEnabled"];
+}
+void mfExcSetOn(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"mfExcEnabled"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    mfLog(@"[capture] EXCPROBE switch -> %@", on ? @"ON" : @"OFF");
+}
+long mfExcHits(void) { return (long)g_excHitCount; }
+// 应答命中时调用(在 mfExcProxy 应答逻辑处)
+static void mfExcBump(void) { g_excHitCount++; }
 
 static inline BOOL mf_licReqId(uint32_t id) { return id == 0x965 || id == 0x966 || id == 0x967; }
 static inline BOOL mf_licRepId(uint32_t id) { return id == 0x9c9 || id == 0x9ca || id == 0x9cb; }
@@ -360,6 +374,7 @@ static void *mf_mitmServer(void *arg) {
         mfLog(@"[capture] PROXY ans nonce=%#llx x4=%llu x9=1 pc=%llx->%llx",
               (unsigned long long)qaNonce, (unsigned long long)cnt4,
               (unsigned long long)pc, (unsigned long long)(pc + 4));
+        mfExcBump();    // v2.54.0: 应答命中计数(实验模拟页显示)
         emulated = 3;   // 3 = 替代模式
         goto reply_now;
     }
@@ -1183,21 +1198,26 @@ void mfProcCaptureStart(void) {
     if (g_capOn) return;
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-    // v2.54.0: EXCPROBE 门控统一到 mfCompatAppList(设置页白名单)——与 CompatPatcher 标本装载同门控。
-    //   之前用 mfExcArmed(全局键)绕过白名单导致 Filza 等无关 app 冷启动崩(2.53.8 教训)。
-    //   现在: 勾进「兼容 App 列表」的 app 才武装 EXCPROBE(EXCPORTS 侦查+MITM swap+应答器),
-    //   不在列表的 app 完全不碰(不 swap 异常端口、不起服务线程)——无关 app 不受影响。
+    // v2.54.0: EXCPROBE 归 IAPtools 管, 门控=主开关(mfExcEnabled) + 强制白名单(mfIAPAppList)。
+    //   - mfExcEnabled(实验区开关)不开 → 不武装(即使 app 在白名单)
+    //   - 只认 mfIAPAppList 白名单, 不跟随 mfIAPAutoApply——EXCPROBE 是重型武器(swap 异常端口
+    //     + catcher 所有 brk), 绝不能自动对所有 app 生效。2.53.8 mfExcArmed 崩 Filza 教训即此。
+    //   现在: 开关开 + app 勾进「应用程序列表」→ 才武装; 两者缺一不武装(无关 app 安全)。
     NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"] ?: @{};
-    NSArray *compatList = pf[@"mfCompatAppList"];
-    BOOL inCompatList = NO;
-    if ([compatList isKindOfClass:[NSArray class]] && bid.length > 0)
-        inCompatList = [compatList containsObject:bid];
-    // v2.54.0: 兼容列表为空或本 app 不在列表 = 不武装 EXCPROBE(无关 app 安全)
-    if (!inCompatList) {
-        mfLog(@"[capture] EXCPROBE skip (bid=%@ not in mfCompatAppList)", bid ?: @"?");
+    BOOL excEnabled = [pf[@"mfExcEnabled"] boolValue];
+    if (!excEnabled) {
+        mfLog(@"[capture] EXCPROBE skip (mfExcEnabled=NO)");
         return;
     }
-    mfLog(@"[capture] EXCPROBE armed via mfCompatAppList (bid=%@ ver=%@)", bid, ver);
+    NSArray *iapList = pf[@"mfIAPAppList"];
+    BOOL inIAPList = NO;
+    if ([iapList isKindOfClass:[NSArray class]] && iapList.count > 0 && bid.length > 0)
+        inIAPList = [iapList containsObject:bid];
+    if (!inIAPList) {
+        mfLog(@"[capture] EXCPROBE skip (bid=%@ not in mfIAPAppList)", bid ?: @"?");
+        return;
+    }
+    mfLog(@"[capture] EXCPROBE armed (mfExcEnabled + mfIAPAppList, bid=%@ ver=%@)", bid, ver);
 
     // v2.28.1: debug 通道已证伪(2.28.0 实测写入正确域仍不亮) — 默认关, 别污染采集对照
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfDebugOverride"]) {

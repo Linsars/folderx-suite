@@ -231,6 +231,10 @@ static void mfReconShowDetailPage(NSDictionary *recon);   // 前置
     mfPopPage();          // 回扫描页
     mfShowLabPage();      // 跳实验模拟
 }
+- (void)mfReconGoExc {
+    mfPopPage();          // v2.54.0: mach 型 → 跳实验模拟页开 EXCPROBE 应答器
+    mfShowLabPage();
+}
 - (void)mfReconGoCapture {
     mfPopPage();
     mfShowNetAnalyzerPage();   // v2.50.0: 实时捕获开关在网络分析页(原误跳捕获列表)
@@ -258,6 +262,19 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
         [lab addTarget:page action:NSSelectorFromString(@"mfReconGoLab") forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(page, "reconGoLab", @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [page addSubview:lab];
+        tvY = 142;
+    } else if ([recon[@"mach"] boolValue]) {
+        // v2.54.0: mach 型(本地许可服务器, Reflix/ScriptingPass 同族) → 引导去开 EXCPROBE 应答器
+        UIButton *exc = [UIButton buttonWithType:UIButtonTypeSystem];
+        exc.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
+        exc.backgroundColor = [UIColor systemPurpleColor];
+        exc.layer.cornerRadius = 9;
+        [exc setTitle:@"⏯ 去 IAP工具箱开 EXCPROBE 应答器" forState:UIControlStateNormal];
+        [exc setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        exc.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        [exc addTarget:page action:NSSelectorFromString(@"mfReconGoExc") forControlEvents:UIControlEventTouchUpInside];
+        objc_setAssociatedObject(page, "reconGoExc", @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [page addSubview:exc];
         tvY = 142;
     } else if (![recon[@"mach"] boolValue]) {
         UIButton *cap = [UIButton buttonWithType:UIButtonTypeSystem];
