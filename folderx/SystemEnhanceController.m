@@ -3,6 +3,7 @@
 
 #import <Preferences/PSListController.h>
 #import <Preferences/PSSpecifier.h>
+#import <dlfcn.h>   // 兼容列表(AltList)需 dlopen AltList.framework
 
 @interface SystemEnhanceController : PSListController
 @end
