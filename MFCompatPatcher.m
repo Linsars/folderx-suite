@@ -784,14 +784,9 @@ __attribute__((constructor)) static void CompatPatcherCtor(void) {
         // v2.51 probe: 标本装载 + 观察机(mfXray 缺省 ON, 显式 NO 关闭)
         NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
         BOOL xray = pf[@"mfXray"] ? [pf[@"mfXray"] boolValue] : YES;
-        // v2.53.9: mfXrayRecon 撤回——实验性标本装载导致 Filza 等无关 app 冷启动崩,
-        // 调试移至 VansonMod 桥(远程内存搜索/RVA 补丁, 不污染目标进程), 此路径永久关闭
-        BOOL recon = NO;
+        // v2.54.0: 标本装载只走 mfCompatAppList 白名单门控(勾了谁就装谁)。
+        //   2.53.8 的 mfXrayRecon(全局键)绕过白名单导致 Filza 无关 app 冷启动崩, 已永久移除。
         BOOL viaList = mfCompatNeededRaw();
-        if (recon && !viaList) {
-            mfXrayLog("[xray] recon session (bid=%@)", bid ?: @"?");
-            mfFixcrashStage(xray);
-        }
         if (viaList) mfFixcrashStage(xray);
         mfCKInstall();   // v2.52: 通用 CK 兼容引擎(门控同 mfCompatAppList)
     }

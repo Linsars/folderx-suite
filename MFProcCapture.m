@@ -822,7 +822,7 @@ typedef struct {
 
 static mfCapSeg g_capSegs[32];
 static int g_capNSeg = 0;
-static BOOL g_excArmed = NO;   // v2.53.6: EXCPROBE 全局武装(mfExcArmed), 跳过白名单闸门
+
 
 // v2.40.1: EXCPROBE 用 — 取 __TEXT 基线快照(ctor 原始字节)
 static uint8_t *mfCapSeg0Baseline(uint64_t *outSize) {
@@ -1183,20 +1183,21 @@ void mfProcCaptureStart(void) {
     if (g_capOn) return;
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-    // v2.53.6: EXCPROBE 独立门控 — 原闸门只认 Reflix(com.magicgroot.gooby),
-    // Scripting 战役需要它对任何 app 上岗: 全局键 mfExcArmed(默认 OFF),
-    // 开=跳过 bid/version 闸门(EXCPORTS 侦查+MITM swap+应答器全链武装),
-    // 但内存快照/ObjC 巡检等重活仍只对白名单跑(采集面板职责不变)
+    // v2.54.0: EXCPROBE 门控统一到 mfCompatAppList(设置页白名单)——与 CompatPatcher 标本装载同门控。
+    //   之前用 mfExcArmed(全局键)绕过白名单导致 Filza 等无关 app 冷启动崩(2.53.8 教训)。
+    //   现在: 勾进「兼容 App 列表」的 app 才武装 EXCPROBE(EXCPORTS 侦查+MITM swap+应答器),
+    //   不在列表的 app 完全不碰(不 swap 异常端口、不起服务线程)——无关 app 不受影响。
     NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"] ?: @{};
-    // v2.53.9: mfExcArmed 撤回——EXCPROBE 对任意 app 武装导致 Filza 等冷启动崩,
-    // 调试移至 VansonMod 桥. 永久关闭, 即使 prefs 残留 true 也不生效
-    g_excArmed = NO;
-    BOOL excArmed = g_excArmed;
-    if (excArmed) {
-        mfLog(@"[capture] EXC-ARMED via mfExcArmed (bid=%@ ver=%@)", bid, ver);
-    } else {
-    if (![bid isEqualToString:kCapBID] || ![ver isEqualToString:kCapVersion]) return;
+    NSArray *compatList = pf[@"mfCompatAppList"];
+    BOOL inCompatList = NO;
+    if ([compatList isKindOfClass:[NSArray class]] && bid.length > 0)
+        inCompatList = [compatList containsObject:bid];
+    // v2.54.0: 兼容列表为空或本 app 不在列表 = 不武装 EXCPROBE(无关 app 安全)
+    if (!inCompatList) {
+        mfLog(@"[capture] EXCPROBE skip (bid=%@ not in mfCompatAppList)", bid ?: @"?");
+        return;
     }
+    mfLog(@"[capture] EXCPROBE armed via mfCompatAppList (bid=%@ ver=%@)", bid, ver);
 
     // v2.28.1: debug 通道已证伪(2.28.0 实测写入正确域仍不亮) — 默认关, 别污染采集对照
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfDebugOverride"]) {
@@ -1208,6 +1209,7 @@ void mfProcCaptureStart(void) {
             mfLog(@"[mfdbg] proAccessOverride -> active (was %@)", cur ?: @"nil");
         } else {
             mfLog(@"[mfdbg] proAccessOverride already active");
+
         }
     }
 
@@ -1334,9 +1336,8 @@ void mfProcCaptureStart(void) {
         mfLog(@"[capture] framework segments snapshotted: %u", fwCount);
     }
     if (!g_capNSeg) {
-        // v2.53.6: excArmed 路径快照可空, 不应挡住 MITM 装甲(EXCPROBE 职责是守端口, 不是 diff)
-        if (!g_excArmed) { mfLog(@"[capture] no segments snapshotted"); return; }
-        mfLog(@"[capture] no segments snapshotted (excArmed — continue to MITM)");
+        mfLog(@"[capture] no segments snapshotted");
+        return;
     }
 
     g_capT0 = [[NSDate date] timeIntervalSinceReferenceDate];
@@ -1453,9 +1454,8 @@ void mfProcCaptureStart(void) {
     //   回调里武装 vendor 全套 GOT 钩 + 预 ctor 段快照 → 它 ctor 的每一步都在监视下
     _dyld_register_func_for_add_image(mf_vendorAddImageCB);
     mfLog(@"[capture] add_image callback registered (pre-dlopen)");
-    // v2.53.6: excArmed 禁 dlopen Reflix 样本(这是 Reflix 战役遗产, 栽进 Scripting 进程毫无意义)
-    if (!g_excArmed) mfCapLocateDylib();
-    if (!g_excArmed && !g_capDylibBase) {
+    mfCapLocateDylib();
+    if (!g_capDylibBase) {
         // v2.28.1: dlopen 兜底默认 ON(采集工作模式 — 增强采集需要 dylib 在场被逮)
         if ([[NSUserDefaults standardUserDefaults] objectForKey:@"mfCaptureDlopen"] == nil
             || [[NSUserDefaults standardUserDefaults] boolForKey:@"mfCaptureDlopen"]) {
