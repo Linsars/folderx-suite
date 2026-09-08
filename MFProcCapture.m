@@ -153,6 +153,12 @@ static void *mf_mitmServer(void *arg);
 //   swap EXC_BREAKPOINT 异常端口到自己, 起应答线程。由 ctor(mfProcCaptureStart)和开关变化(mfExcSetOn)调用。
 void mfExcArm(void) {
     if (g_mitmMyPort != MACH_PORT_NULL) return;   // 已武装
+    // v2.54.3: EXCPROBE 专用开关(mfExcEnabled)在这里判断——mach tap(记录)已与 EXCPROBE 解耦,
+    //   不再影响 mfProcCaptureStart。EXCPROBE 强行武装才需要这个开关 ON。
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"mfExcEnabled"]) {
+        mfLog(@"[capture] EXCPROBE skip (mfExcEnabled=NO)");
+        return;
+    }
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfExcProbeOff"]) return;   // 默认 ON, mfExcProbeOff=1 关
     // v2.39.4: 终局 MITM — swap EXC_BREAKPOINT 处理器到自己, 录 Q/A 后转发 vendor
     {
@@ -1202,22 +1208,16 @@ void mfProcCaptureStart(void) {
     if (g_capOn) return;
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-    // v2.54.1: EXCPROBE 门控与云验证 mock 一致——由 mfIsEnabledForCurrentApp(当前 app 用不用 IAP工具箱)
-    //   决定, EXCPROBE 开关(mfExcEnabled)决定专用功能. 不叠 mfIAPAppList(那是工具箱注入范围, 已在
-    //   mfIsEnabledForCurrentApp 里). 实验模拟页开关是用户主动控制, 不涉及无关 app 启动。
+    // v2.54.3: 门控解耦——mf_machMsgHook(mach_msg 通用记录)只需要 IAPtools 对当前 app 生效,
+    //   不受 EXCPROBE 专用开关卡住(之前把 mach tap 绑死到 mfExcEnabled, 导致抓不到 Scripting 的 mach_msg)。
+    //   EXCPROBE(强行武装)才单独看 mfExcEnabled(在 mfExcArm 内判断)。
     extern BOOL mfIsEnabledForCurrentApp(void);
     if (!mfIsEnabledForCurrentApp()) {
         mfLog(@"[capture] EXCPROBE skip (IAPtools not enabled for bid=%@)", bid ?: @"?");
         return;
     }
-    NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"] ?: @{};
-    BOOL excEnabled = [pf[@"mfExcEnabled"] boolValue];
-    if (!excEnabled) {
-        mfLog(@"[capture] EXCPROBE skip (mfExcEnabled=NO)");
-        return;
-    }
-    mfLog(@"[capture] EXCPROBE armed (mfIsEnabledForCurrentApp + mfExcEnabled, bid=%@ ver=%@)", bid, ver);
-    mfExcArm();   // v2.54.1: 提取的武装函数——ctor 时也武装
+    mfLog(@"[capture] EXCPROBE armed (mfIsEnabledForCurrentApp, bid=%@ ver=%@)", bid, ver);
+    mfExcArm();   // v2.54.1: 提取的武装函数——ctor 时也武装(内部自己看 mfExcEnabled)
 
     // v2.28.1: debug 通道已证伪(2.28.0 实测写入正确域仍不亮) — 默认关, 别污染采集对照
     if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfDebugOverride"]) {
