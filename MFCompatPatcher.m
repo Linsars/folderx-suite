@@ -477,11 +477,22 @@ static IMP t_setImp(Method m, IMP imp) {
                     mfImpWhere((uintptr_t)old), mfImpWhere((uintptr_t)imp));
     return old;   // 必须原样返回旧 IMP
 }
+static boolean_t mfMachAuthDemux(mach_msg_header_t *in, mach_msg_header_t *out) {
+    // v2.56.12: 许可服务器应答——全 0 应答 = KERN_SUCCESS = 授权通过
+    //   (MIG 协议透明赌注: 客户端判 rc != 0 才 fail, 全 0 即"通过")
+    if (!out) return FALSE;
+    memset(out, 0, sizeof(mach_msg_header_t));
+    out->msgh_bits = MACH_MSG_TYPE_MAKE_SEND;
+    out->msgh_remote_port = in ? in->msgh_remote_port : MACH_PORT_NULL;
+    out->msgh_local_port = MACH_PORT_NULL;
+    out->msgh_size = sizeof(mach_msg_header_t);
+    return TRUE;
+}
 // v2.53 授权体系蹦床: 只记参, 尾调原函数
-// v2.56.8: 样本 dlsym(SecItemCopyMatching) → 直接返授权 stub(记录 query + 恒授权)。
-//   ★根因: 样本 dlsym 动态解析(鱼钩 rebind 只改 GOT, 对 dlopen 的样本无效——v2.56.7 实测
-//   IAPtools 侧 dlsym rebind 拦不到样本; 而 xray GOT 蹦床在样本 dlopen 时刻布点, dlsym=6
-//   命中实锤拦截生效)。样本拿 stub → 调用 → 判定被截, query 记入日志学格式。
+// ★v2.56.12: t_dlsym 双拦截——
+//   样本 dlsym 动态解析所有关键函数(GOT 蹦床拦不到), 必须在 dlsym 层拦截:
+//   SecItemCopyMatching → mfObsKeychainStub(返回 cloudid 数据)
+//   mach_msg_server → mfMachAuthDemux(许可服务器应答=授权)
 static int (*g_realSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static int mfObsKeychainN = 0;
 // v2.56.11: 透传仍 errSecItemNotFound(st=-25300)→样本判定失败。改返回 cloudid:
@@ -501,10 +512,16 @@ static int mfObsKeychainStub(CFDictionaryRef query, CFTypeRef *result) {
     return 0;   // errSecSuccess — "找到授权条目, data=cloudid"
 }
 static void *t_dlsym(void *h, const char *name) {
+    // ★v2.56.12: 双拦截——样本 dlsym 动态解析(GOT 蹦床拦不到)
     if (name && (!strcmp(name, "SecItemCopyMatching") || !strcmp(name, "SecItemCopyMatchingWithAttributes"))) {
         g_realSecCopyMatching = (int (*)(CFDictionaryRef, CFTypeRef *))o_dlsym(h, name);
-        mfXrayLog("[xray] dlsym(%s) -> KEYCHAIN STUB (透传模式, 记录真实 data)", name);
+        mfXrayLog("[xray] dlsym(%s) -> KEYCHAIN STUB (返回 cloudid 数据)", name);
         return (void *)mfObsKeychainStub;
+    }
+    if (name && !strcmp(name, "mach_msg_server")) {
+        // ★样本起许可服务器(timeout=9223 等客户端), 应答=授权通过
+        mfXrayLog("[xray] dlsym(mach_msg_server) -> MACH AUTH DEMUX");
+        return (void *)mfMachAuthDemux;
     }
     void *r = o_dlsym(h, name);
     if (g_fcCnt[5]++ < XRAY_MAX_LOG)
