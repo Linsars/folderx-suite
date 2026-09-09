@@ -33,6 +33,71 @@ static int g_machCapCount = 0;
 static uint32_t g_excHitCount = 0;   // v2.54.0: EXCPROBE 应答命中计数
 void mfExcArm(void);   // v2.54.1: 前向声明(定义在下方), 开关变化时重触发武装
 
+// ==================== v2.55.3: DEMUX 重绑 mach 应答器 ====================
+// ★替换 EXCPROBE(异常端口 swap 型, 已证明对 Scripting 无效):
+//   Scripting 类走 _mach_msg_server demux 消息循环(不是异常端口), 故改为进程内
+//   rebind _mach_msg_server → hook 里把 demux 换成"永远授权"应答器。
+// 关键(iaptools 本身注入目标 app 进程 → 进程内 rebind, 无跨进程):
+//   1. fishhook rebind _mach_msg_server(mach_msg_server)
+//   2. hook: 记录 demux/maxsz/timeout, 若应答器 ON → demux 换成 mf_machDemuxAuthorize
+//   3. mf_machDemuxAuthorize(in,out): 按 MIG 协议构造"授权成功"应答, 返回 TRUE
+// 与观察/兼容列表完全无关——只认实验模拟开关 mfMachRespEnabled。
+// 注: 之前 mach_msg tap(记录型)会崩 Scripting(2.54.4 收窄); 本应答器只换 demux 不动消息,
+//     与 tap 解耦, 默认 OFF, 用户实验模拟页显式开启。
+
+typedef boolean_t (*mf_machDemux_t)(mach_msg_header_t *in_msg, mach_msg_header_t *out_msg);
+static mf_machDemux_t g_origMachServerDemux = NULL;   // 原 demux(记录用)
+static int (*g_origMachServerFn)(mf_machDemux_t, mach_msg_size_t, mach_port_t, mach_msg_options_t) = NULL;
+
+// MIG "授权成功"应答: 全 0 响应头 + 返回 TRUE —— 协议透明赌注:
+//   大多数 MIG 客户端判 rc != 0 才 fail, 全 0(等于 KERN_SUCCESS)即"通过"。
+//   不依赖具体布局(比回显头+RetCode 更通用, 避免 msgh_id 加 100/NDR 位置猜错)。
+//   in 为 nullptr(超时/轮询)时直接放行。
+static boolean_t mf_machDemuxAuthorize(mach_msg_header_t *in, mach_msg_header_t *out) {
+    if (!out) return FALSE;
+    memset(out, 0, sizeof(mach_msg_header_t));
+    out->msgh_bits = MACH_MSG_TYPE_MAKE_SEND;   // 单简单消息
+    out->msgh_remote_port = in ? in->msgh_remote_port : MACH_PORT_NULL;
+    out->msgh_local_port = MACH_PORT_NULL;
+    out->msgh_size = sizeof(mach_msg_header_t);   // 最小应答(客户端通常读 RetCode 区, 全 0)
+    return TRUE;   // TRUE = mach_msg_server 把 out 作为应答发回
+}
+
+// mach_msg_server hook: 应答器 ON → demux 换授权器; OFF → 原样 passthrough
+static int mf_machServerRespHook(mf_machDemux_t demux, mach_msg_size_t maxsz,
+                                 mach_port_t rcv, mach_msg_options_t opt) {
+    if (demux != g_origMachServerDemux)
+        g_origMachServerDemux = demux;   // 记录原 demux(首次)
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfMachRespEnabled"]) {
+        if (g_excHitCount < 64) {
+            mfLog(@"[capture] MACH-RESP demux=%p maxsz=%u subsys->authorize (应答器 ON)", (void *)demux, (unsigned)maxsz);
+            g_excHitCount++;
+        }
+        return g_origMachServerFn(mf_machDemuxAuthorize, maxsz, rcv, opt);   // ★换 demux
+    }
+    return g_origMachServerFn(demux, maxsz, rcv, opt);   // OFF → 原样
+}
+
+// demux 重绑武装(进程内 fishhook rebind _mach_msg_server)
+// 调用点: ctor(mfProcCaptureStart 尾部) + 开关变化(mfMachRespSetOn)
+static void mfMachRespArm(void) {
+    if (g_origMachServerFn) return;   // 已武装
+    // rebind 到含 _mach_msg_server 的镜像(libSystem 是符号宿主; 优先精确匹配)
+    const struct mach_header *mh = NULL;
+    intptr_t slide = 0;
+    uint32_t cnt = _dyld_image_count();
+    for (uint32_t i = 0; i < cnt; i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (!h || h->magic != MH_MAGIC_64) continue;
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && (strstr(nm, "libSystem") || strstr(nm, "libsystem_kernel") || strstr(nm, "system/lib"))) { mh = h; slide = _dyld_get_image_vmaddr_slide(i); break; }
+    }
+    if (!mh) { mfLog(@"[capture] MACH-RESP no libSystem image"); return; }
+    struct rebinding rb = {"mach_msg_server", (void *)mf_machServerRespHook, (void **)&g_origMachServerFn};
+    int r = rebind_symbols_image((void *)mh, slide, &rb, 1);
+    mfLog(@"[capture] MACH-RESP mach_msg_server rebind: %d (orig=%p)", r, g_origMachServerFn);
+}
+
 // v2.54.0: EXCPROBE 应答器开关状态(mfExcEnabled)——实验模拟页 UISwitch
 BOOL mfExcIsOn(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"mfExcEnabled"];
@@ -44,6 +109,18 @@ void mfExcSetOn(BOOL on) {
     if (on) mfExcArm();   // v2.54.1: 开关打开时立即武装(不等 ctor)——解决运行时开开关不生效的时机问题
 }
 long mfExcHits(void) { return (long)g_excHitCount; }
+
+// v2.55.3: DEMUX 应答器开关(mfMachRespEnabled)——实验模拟页, 换 demux 为"永远授权"
+BOOL mfMachRespIsOn(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"mfMachRespEnabled"];
+}
+void mfMachRespSetOn(BOOL on) {
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"mfMachRespEnabled"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    mfLog(@"[capture] MACH-RESP switch -> %@", on ? @"ON" : @"OFF");
+    if (on) mfMachRespArm();   // 打开即武装(进程内 rebind, 不等 ctor)
+}
+long mfMachRespHits(void) { return (long)g_excHitCount; }
 // 应答命中时调用(在 mfExcProxy 应答逻辑处)
 static void mfExcBump(void) { g_excHitCount++; }
 
@@ -1217,6 +1294,9 @@ void mfProcCaptureStart(void) {
     BOOL inCompat = NO;
     if ([compatList isKindOfClass:[NSArray class]] && bid.length > 0)
         inCompat = [compatList containsObject:bid];
+    // v2.55.3: DEMUX mach 应答器武装——必须先于 inCompat return(完全独立于兼容/观察列表,
+    //   只认实验模拟开关 mfMachRespEnabled; iaptools 本来就注入目标 app, 进程内 rebind)。
+    mfMachRespArm();
     // EXCPROBE 武装: 兼容列表内的 app + 开关 ON(在 mfExcArm 内部判断 mfExcEnabled)
     if (!inCompat) {
         mfLog(@"[capture] EXCPROBE skip (bid=%@ not in mfCompatAppList)", bid ?: @"?");

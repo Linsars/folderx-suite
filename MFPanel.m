@@ -1413,6 +1413,10 @@ extern void mfL0SetOn(BOOL on);
 extern BOOL mfExcIsOn(void);        // v2.54.0: EXCPROBE 应答器开关状态
 extern long mfExcHits(void);        // 命中计数
 extern void mfExcSetOn(BOOL on);    // 写状态
+// v2.55.3: DEMUX mach 应答器(替换 EXCPROBE——异常端口型对 Scripting 无效)
+extern BOOL mfMachRespIsOn(void);       // demux 重绑应答器开关状态
+extern long mfMachRespHits(void);       // 命中计数
+extern void mfMachRespSetOn(BOOL on);   // 写状态
 
 
 static UIView *mfSubSwitchRow(UIView *page, CGFloat y, NSString *title,
@@ -1468,11 +1472,12 @@ void mfShowLabPage(void) {
     mfSubSwitchRow(page, 244, @"L1 收据伪造（收据验证型）", mfReceiptForgeIsOn(),
         @selector(mfReceiptForgeSwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 收据验证型 — appStoreReceiptURL/transactionReceipt · 命中 %ld", mfReceiptForgeHits()]);
-    // v2.54.0: EXCPROBE 应答器 — 本地许可服务器(mach 型, Reflix/ScriptingPass 同族)应答器。
-    //   开关+白名单(mfIAPAppList)双门控, 在主进程 IAPtools 里换异常端口并对 brk 应答 x9=1。
-    mfSubSwitchRow(page, 304, @"EXCPROBE 应答器（mach 许可服务器）", mfExcIsOn(),
-        @selector(mfExcSwitchChanged:),
-        [NSString stringWithFormat:@"对应侦查: 本地许可服务器(异常端口 MIG, mach=1) — 只对 mfIAPAppList 内 App 生效 · 命中 %ld", mfExcHits()]);
+    // v2.55.3: DEMUX mach 应答器 —— 替换 EXCPROBE(异常端口型, 已证明对 Scripting 无效)。
+    //   Scripting 类走 _mach_msg_server demux 消息循环(非异常端口), 故进程内 rebind
+    //   mach_msg_server → demux 换成"永远授权"。独立于兼容/观察列表, 只认本开关。
+    mfSubSwitchRow(page, 304, @"mach 许可服务器应答器（demux 重绑）", mfMachRespIsOn(),
+        @selector(mfMachRespSwitchChanged:),
+        [NSString stringWithFormat:@"对应侦查: 本地许可服务器(mach=1, MACH_MSG_SERVER) — 换 demux 永远授权 · 命中 %ld", mfMachRespHits()]);
 
 
     UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 368, g_mfCardW - 32, 96)];
@@ -1558,6 +1563,7 @@ void mfShowLabPage(void) {
 - (void)mfReceiptForgeSwitchChanged:(UISwitch *)sw { mfReceiptForgeSwitchChanged(sw); }
 - (void)mfL0SwitchChanged:(UISwitch *)sw { mfL0SetOn(sw.on); }
 - (void)mfExcSwitchChanged:(UISwitch *)sw { mfExcSetOn(sw.on); }   // v2.54.0: EXCPROBE 应答器开关
+- (void)mfMachRespSwitchChanged:(UISwitch *)sw { mfMachRespSetOn(sw.on); }   // v2.55.3: DEMUX 应答器开关
 - (void)mfObjCHookToggle:(UISwitch *)sw { mfObjCHookToggle(sw); }
 - (void)mfObjCHookDelTapped:(UIButton *)b { mfObjCHookDelTapped(b); }
 - (void)mfObjCHookEditTapped:(UIView *)row { mfObjCHookEditTappedFromView(row); }
