@@ -483,17 +483,46 @@ static IMP t_setImp(Method m, IMP imp) {
 //   IAPtools 侧 dlsym rebind 拦不到样本; 而 xray GOT 蹦床在样本 dlopen 时刻布点, dlsym=6
 //   命中实锤拦截生效)。样本拿 stub → 调用 → 判定被截, query 记入日志学格式。
 static int mfObsKeychainN = 0;
-static int mfObsKeychainStub(CFDictionaryRef query, CFTypeRef *result) {
-    // Security 常量数值稳定, 用 CF 字面量(不链 Security 框架): kSecAttrService="svce" kSecAttrAccount="acct"
-    NSString *svc = @"?", *acct = @"?", *cls = @"?";
-    if (query) {
-        CFTypeRef v;
-        if ((v = CFDictionaryGetValue(query, CFSTR("svce")))) svc = (__bridge NSString *)v;
-        if ((v = CFDictionaryGetValue(query, CFSTR("acct")))) acct = (__bridge NSString *)v;
-        if ((v = CFDictionaryGetValue(query, CFSTR("class")))) cls = (__bridge NSString *)v;
+// v2.56.9: mfXrayLog 是 C 风格日志(%@ 不支持, 上版打印全是 '@')——CFString 转 C 串用 %s
+static void cfstrDump(CFTypeRef v, char *buf, size_t sz) {
+    buf[0] = 0;
+    if (!v) return;
+    if (CFGetTypeID(v) == CFStringGetTypeID()) {
+        if (!CFStringGetCString(v, buf, sz, 0x08000100 /*kCFStringEncodingUTF8*/)) buf[0] = 0;
+    } else if (CFGetTypeID(v) == CFDataGetTypeID()) {
+        // 二进制值: 打前 32 字节 hex(授权 blob 形状)
+        CFDataRef dd = (CFDataRef)v;
+        const uint8_t *b = CFDataGetBytePtr(dd);
+        CFIndex n = CFDataGetLength(dd);
+        size_t o = 0;
+        if (n > 32) n = 32;
+        for (CFIndex i = 0; i < n && o + 3 < sz; i++) o += snprintf(buf + o, sz - o, "%02x", b[i]);
+        if (CFDataGetLength(dd) > 32) snprintf(buf + o, sz - o, "..(%ldB)", (long)CFDataGetLength(dd));
+    } else if (v == kCFBooleanTrue) { snprintf(buf, sz, "YES");
+    } else if (v == kCFBooleanFalse) { snprintf(buf, sz, "NO");
+    } else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+        long lv; CFNumberGetValue(v, 4 /*kCFNumberLongType*/, &lv); snprintf(buf, sz, "%ld", lv);
     }
-    if (mfObsKeychainN < 32)
-        mfXrayLog("[xray] KEYCHAIN-ANS q: cls=%@ svc=%@ acct=%@", cls, svc, acct);
+}
+static int mfObsKeychainStub(CFDictionaryRef query, CFTypeRef *result) {
+    if (mfObsKeychainN < 32) {
+        // ★dump 全部键值对(上版只打 svce/acct/class 三个还打坏了)——样本查什么一目了然
+        char out[1024]; size_t o = 0;
+        out[0] = 0;
+        if (query) {
+            CFIndex cnt = CFDictionaryGetCount(query);
+            const void *keys[16], *vals[16];
+            if (cnt > 16) cnt = 16;
+            CFDictionaryGetKeysAndValues(query, keys, vals);
+            for (CFIndex i = 0; i < cnt && o < sizeof(out) - 80; i++) {
+                char kb[64], vb[192];
+                cfstrDump(keys[i], kb, sizeof(kb));
+                cfstrDump(vals[i], vb, sizeof(vb));
+                o += snprintf(out + o, sizeof(out) - o, "%s%s=%s", i ? " " : "", kb, vb);
+            }
+        }
+        mfXrayLog("[xray] KEYCHAIN-ANS #%d q: %s", mfObsKeychainN, out);
+    }
     mfObsKeychainN++;
     if (result) {
         CFDataRef fake = CFDataCreate(NULL, (const uint8_t *)"OK", 2);
