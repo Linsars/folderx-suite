@@ -82,20 +82,12 @@ static int mf_machServerRespHook(mf_machDemux_t demux, mach_msg_size_t maxsz,
 // 调用点: ctor(mfProcCaptureStart 尾部) + 开关变化(mfMachRespSetOn)
 static void mfMachRespArm(void) {
     if (g_origMachServerFn) return;   // 已武装
-    // rebind 到含 _mach_msg_server 的镜像(libSystem 是符号宿主; 优先精确匹配)
-    const struct mach_header *mh = NULL;
-    intptr_t slide = 0;
-    uint32_t cnt = _dyld_image_count();
-    for (uint32_t i = 0; i < cnt; i++) {
-        const struct mach_header *h = _dyld_get_image_header(i);
-        if (!h || h->magic != MH_MAGIC_64) continue;
-        const char *nm = _dyld_get_image_name(i);
-        if (nm && (strstr(nm, "libSystem") || strstr(nm, "libsystem_kernel") || strstr(nm, "system/lib"))) { mh = h; slide = _dyld_get_image_vmaddr_slide(i); break; }
-    }
-    if (!mh) { mfLog(@"[capture] MACH-RESP no libSystem image"); return; }
+    // ★rebind 必须用全局 rebind_symbols(不带 image)——mach_msg_server 定义在 libSystem,
+    //   rebind_symbols_image(libSystem) 只 rebind 该镜像内部引用(它不引用自己)= 0。
+    //   调用方(Scripting 主镜像/混淆大师 dylib)的 GOT 引用只有全局 rebind_symbols 能重写。
     struct rebinding rb = {"mach_msg_server", (void *)mf_machServerRespHook, (void **)&g_origMachServerFn};
-    int r = rebind_symbols_image((void *)mh, slide, &rb, 1);
-    mfLog(@"[capture] MACH-RESP mach_msg_server rebind: %d (orig=%p)", r, g_origMachServerFn);
+    int r = rebind_symbols(&rb, 1);
+    mfLog(@"[capture] MACH-RESP mach_msg_server global-rebind: %d (orig=%p)", r, g_origMachServerFn);
 }
 
 // v2.54.0: EXCPROBE 应答器开关状态(mfExcEnabled)——实验模拟页 UISwitch
