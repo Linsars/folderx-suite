@@ -1807,9 +1807,10 @@ void mfShowLabPage(void) {
 }
 
 // 网络捕获开关（v2.0.1 持久化：默认开，手动关过则冷启动也不自动开）
+// v2.56.3: per-app —— key 改为 mfCaptureEnabled_<bid>(不同 app 独立; 修复跨 app 共享)
 - (void)mfCaptureSwitchChanged:(UISwitch *)sw {
     g_captureEnabled = sw.on;
-    mfSetBoolPref(@"mfCaptureEnabled", sw.on);
+    mfSetBoolPref([NSString stringWithFormat:@"mfCaptureEnabled_%@", [[NSBundle mainBundle] bundleIdentifier]], sw.on);
     if (sw.on) {
         extern void mfInstallNetworkCapture(void);
         mfInstallNetworkCapture();
@@ -2417,7 +2418,9 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
         mfCloudKitWarmupStart();
         // 实时捕获(v2.2.8):默认 OFF;用户开过则持久化,冷启动即装协议——
         // 解决"启动后才开开关截不到老会话"(v2.0.2 一刀切留下的坑)
-        if (mfPrefBool(@"mfCaptureEnabled", NO)) {
+        // v2.56.3: per-app——读 mfCaptureEnabled_<bid>(每个 app 独立, 冷启动按各自键恢复)
+        NSString *capKey = [NSString stringWithFormat:@"mfCaptureEnabled_%@", [[NSBundle mainBundle] bundleIdentifier]];
+        if (mfPrefBool(capKey, NO)) {
             g_captureEnabled = YES;
             extern void mfInstallNetworkCapture(void);
             mfInstallNetworkCapture();

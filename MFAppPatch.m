@@ -29,12 +29,21 @@
 #import <libkern/OSCacheControl.h>
 #import <Security/Security.h>   // v2.56: SecItemCopyMatching hook(样本授权判定数据源)
 #import "fishhook.h"            // v2.56: fishhook rebind(样本判定链解锁)
+#import <objc/message.h>        // v2.56.3: objc_msgSend(CloudKit hook 运行时构造 CKRecordID)
 #include <sys/sysctl.h>
 
 #import "MFPanel.h"
 
+// v2.56.3: per-app 开关化 —— patch 引擎/采集器开关从全局键改为 per-app 键
+//   (<base>_<bid>, 如 mfAppPatchEnabled_com.scripting.ios)。用户反馈: 全局键导致
+//   A app 打开, B app 呼出面板还是开的。无全局 fallback —— 每个 app 独立。
+static NSString *apCurBundleID(void); // fwd (定义于下方)
+static NSString *apPrefKey(NSString *base) {
+    NSString *bid = apCurBundleID();
+    return [NSString stringWithFormat:@"%@_%@", base, bid];
+}
 BOOL mfAppPatchIsOn(void) {
-    return mfPrefBool(@"mfAppPatchEnabled", NO);
+    return mfPrefBool(apPrefKey(@"mfAppPatchEnabled"), NO);
 }
 long mfAppPatchHits(void); // fwd
 void apInstallCollectors(void); // fwd
@@ -201,14 +210,51 @@ static void apKeychainInstall(void) {
     });
 }
 
-// v2.56b: CloudKit 授权豁免——hook fetchUserRecordID 恒返回"已授权用户"(样本判定链的另一腿)
-//   CKContainer fetchUserRecordIDWithCompletionHandler: (CKRecordID*, NSError*)block
-//   hook: 直接回调伪造已授权 recordID(授权判定=云端身份, cloudid 从这里拿)
+// v2.56.3: CloudKit 授权豁免 —— hook CKContainer fetchUserRecordIDWithCompletionHandler:
+//   恒回调"本机已授权 cloudid"(样本判定链另一腿: CloudKit 身份 + Keychain 缓存)。
+//   Keychain(v2.56.0)已 hook, 此补 CloudKit: 返回真实本机 recordID(名单内 → 判定授权)。
+//   纯运行时(NSClassFromString + method_setImplementation), 不引入编译依赖。
+static void (*g_origKitFetch)(id, SEL, id) = NULL;
+static NSString *apCloudKitFakeID(void) {
+    // 可配置: prefs mfCloudKitFakeID; 默认用户提供的本机 Scripting cloudid
+    id v = mfReadPrefObj(@"mfCloudKitFakeID");
+    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
+    return @"cloudid_6fa82d041cdb54b2f3e558828754bf08";
+}
+static void apCloudKitFetchHook(id self, SEL _cmd, id completion) {
+    apLog(@"[cloudkit] fetchUserRecordID consult (authorize->yes, fake=%@)", apCloudKitFakeID());
+    g_apHits++;
+    if (!completion) return;
+    @try {
+        Class rCls = NSClassFromString(@"CKRecordID");
+        id rec = nil;
+        if (rCls) {
+            SEL initSel = NSSelectorFromString(@"initWithRecordName:");
+            rec = ((id (*)(id, SEL, id))objc_msgSend)([rCls alloc], initSel, apCloudKitFakeID());
+        } else {
+            apLog(@"[cloudkit] CKRecordID class not found");
+        }
+        void (^blk)(id, id) = (void (^)(id, id))completion;
+        blk(rec, nil);
+    } @catch (NSException *e) {
+        apLog(@"[cloudkit] hook cb exc: %@", e.reason);
+    }
+}
 static void apCloudKitInstall(void) {
-    // CKContainer 的 fetchUserRecordID 是 ObjC 方法, 用 swizzle 更稳(非 C API)
-    // 说明: fetchUserRecordIDWithCompletionHandler 在 CKContainer 类上
-    // 实现: 用 method_setImplementation 替换(样本 dlopen 后调用就走我们的)
-    // 注: 完整实现需要处理 block 参数(第一个参数是 completion block)
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // rootless: /var/jb/System 优先, 兜底 /System (动态加载器有路径解析)
+        dlopen("/var/jb/System/Library/Frameworks/CloudKit.framework/CloudKit", RTLD_NOW);
+        dlopen("/System/Library/Frameworks/CloudKit.framework/CloudKit", RTLD_NOW);
+        Class cls = NSClassFromString(@"CKContainer");
+        if (!cls) { apLog(@"[cloudkit] CKContainer class not found"); return; }
+        SEL sel = NSSelectorFromString(@"fetchUserRecordIDWithCompletionHandler:");
+        Method m = class_getInstanceMethod(cls, sel);
+        if (!m) { apLog(@"[cloudkit] fetchUserRecordID method not found"); return; }
+        g_origKitFetch = (void (*)(id, SEL, id))method_getImplementation(m);
+        method_setImplementation(m, (IMP)apCloudKitFetchHook);
+        apLog(@"[cloudkit] fetchUserRecordID hooked (orig=%p)", g_origKitFetch);
+    });
 }
 
 // ====== 规则执行 ======
@@ -251,6 +297,10 @@ static void apApplyRules(void) {
                     // v2.56: Keychain 授权豁免(样本判定链数据源)
                     apKeychainInstall();
                     ok = YES;   // 全局生效(进程内)
+                } else if ([kind isEqualToString:@"cloudkit"]) {
+                    // v2.56.3: CloudKit 授权豁免(样本判定链另一腿: 云端身份)
+                    apCloudKitInstall();
+                    ok = YES;   // 全局生效(进程内)
                 }
                 if (ok) { g_apHits++; apLog(@"✓ %@ patch applied", kind); }
                 else apLog(@"✗ %@ failed: %@", kind, err);
@@ -277,7 +327,7 @@ void mfAppPatchBoot(void) {
 // 破法: ReflixiOS 二进制文件 = 原始字节 (主程序 vmaddr偏移==文件偏移),
 // 文件区段 vs 内存同偏移对照, 何时打的 patch 都能现形
 // ==================================================================
-BOOL mfAppPatchCollIsOn(void) { return mfPrefBool(@"mfAppPatchCollector", NO); }
+BOOL mfAppPatchCollIsOn(void) { return mfPrefBool(apPrefKey(@"mfAppPatchCollector"), NO); }
 
 static dispatch_source_t g_collTimer = nil;
 static NSData *g_collBase = nil;      // 内存首拍 (__TEXT 全量, 第二层)
@@ -485,12 +535,12 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 static UITextView *g_apEditor = nil;
 @implementation MFPanelCtrl (AppPatch)
 - (void)mfAPSwitchChanged:(UISwitch *)sw {
-    mfSetBoolPref(@"mfAppPatchEnabled", sw.on);
+    mfSetBoolPref(apPrefKey(@"mfAppPatchEnabled"), sw.on);
     if (sw.on) mfAppPatchBoot();
-    mfToast(sw.on ? @"引擎已开, 冷启动 app 生效" : @"引擎已关");
+    mfToast(sw.on ? @"引擎已开(本 app), 冷启动生效" : @"引擎已关(本 app)");
 }
 - (void)mfAPCollSwitchChanged:(UISwitch *)sw {
-    mfSetBoolPref(@"mfAppPatchCollector", sw.on);
+    mfSetBoolPref(apPrefKey(@"mfAppPatchCollector"), sw.on);
     if (sw.on) { apInstallCollectors(); mfToast(@"采集器已装 (被动快照模式)"); }
     else mfToast(@"开关已存, 重启 app 卸载");
 }
