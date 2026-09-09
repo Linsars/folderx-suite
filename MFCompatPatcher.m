@@ -21,6 +21,7 @@
 #import <objc/message.h>
 #import <dispatch/dispatch.h>
 #import <mach/mach_time.h>
+#import <mach/mach.h>   // boolean_t / mach_msg_header_t(授权应答器类型)
 #import <dlfcn.h>
 #import <unistd.h>
 #include <string.h>
@@ -496,10 +497,34 @@ static int t_sysctl(const char *name, void *oldp, unsigned long *oldlenp, void *
         mfXrayLog("[xray] sysctlbyname(%s) kr=%d", name ?: "?", r);
     return r;
 }
+// v2.55.5: mach 许可服务器授权应答器 demux(和 Xray 蹦床同一个布点, 已验证 7/10 生效)
+//   MIG 协议透明赌注: 全 0 响应 = KERN_SUCCESS = "授权通过" (不依赖具体消息布局)
+static boolean_t mfMachAuthDemux(mach_msg_header_t *in, mach_msg_header_t *out) {
+    if (!out) return FALSE;
+    memset(out, 0, sizeof(mach_msg_header_t));
+    out->msgh_bits = MACH_MSG_TYPE_MAKE_SEND;
+    out->msgh_remote_port = in ? in->msgh_remote_port : MACH_PORT_NULL;
+    out->msgh_local_port = MACH_PORT_NULL;
+    out->msgh_size = sizeof(mach_msg_header_t);
+    return TRUE;   // TRUE = mach_msg_server 把 out 作为应答发回 → 授权通过
+}
+
+// ★v2.55.5: t_machServer 双模式——记录(观察) + 应答(实验模拟 mach 应答器)。
+//   布点不变(Xray GOT 蹦床, 标本 dlopen 时 mfXrayAddImage 布, 已验证 mach=1 命中),
+//   只是行为升级: mfMachRespEnabled=ON 时换 demux 为"永远授权"。
+//   fishhook rebind 已证伪(混淆大师 dlsym 动态解析 mach_msg_server, 静态 GOT 无引用
+//   → rebind 0); Xray 手工 Mach-O 解析布 GOT 槽是唯一可靠的 hook 点。
 static int t_machServer(void *demux, unsigned int maxsz, unsigned int timeout, unsigned int subsys) {
     if (g_fcCnt[8]++ < XRAY_MAX_LOG)
         mfXrayLog("[xray] *** MACH_MSG_SERVER demux=%s maxsz=%u timeout=%u subsys=%u —— 许可服务器上线",
                     mfImpWhere((uintptr_t)demux), maxsz, timeout, subsys);
+    // 实验模拟 mach 应答器: 换 demux 永远授权(与观察模块解耦, 纯开关控)
+    NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
+    if ([pf[@"mfMachRespEnabled"] boolValue]) {
+        mfXrayLog("[xray] MACH-RESP demux=%s -> AUTHORIZE (应答器 ON, maxsz=%u)",
+                  mfImpWhere((uintptr_t)demux), maxsz);
+        return o_machServer((void *)mfMachAuthDemux, maxsz, timeout, subsys);
+    }
     return o_machServer(demux, maxsz, timeout, subsys);
 }
 static int t_pthreadCreate(void *t, const void *attr, void *(*fn)(void *), void *arg) {
