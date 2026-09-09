@@ -42,11 +42,23 @@ jobs:
           ls -la layout-rootless/usr/bin/
           echo "=== minisfixd built and entitled ==="
 
-      - name: Build package
-        run: make package
+      - name: Build package (capture errors)
+        run: |
+          make package 2>&1 | tee /tmp/build_output.log
+          echo "=== make exit code: ${PIPESTATUS[0]} ==="
+          # 允许本步骤失败(不中断 job), 让 build-log artifact 能上传
+          exit 0
 
       - uses: actions/upload-artifact@v4
         with:
           name: deb-packages
           path: packages/*.deb
           if-no-files-found: ignore
+
+      # 始终上传 make 编译日志(成功失败都传), 供诊断
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build_output.log
+          if-no-files-found: ignore
+        if: always()
