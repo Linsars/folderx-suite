@@ -27,6 +27,8 @@
 #import <dlfcn.h>
 #import <objc/runtime.h>
 #import <libkern/OSCacheControl.h>
+#import <Security/Security.h>   // v2.56: SecItemCopyMatching hook(样本授权判定数据源)
+#import "fishhook.h"            // v2.56: fishhook rebind(样本判定链解锁)
 #include <sys/sysctl.h>
 
 #import "MFPanel.h"
@@ -172,6 +174,40 @@ static BOOL apMethodPatch(NSString *clsName, NSString *selName, BOOL ret, NSStri
     return YES;
 }
 
+// ====== v2.56: Keychain 授权豁免(学习自 ScriptingPass 判定链数据源) ======
+// 样本(ScriptingPass)授权判定: fetchUserRecordID(CloudKit 身份) + SecItemCopyMatching(Keychain 缓存)
+// hook SecItemCopyMatching → 恒"找到授权项"(errSecSuccess + 伪 data) → 样本/主进程判定"已授权"
+static OSStatus (*g_origSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
+static OSStatus apSecCopyMatchingHook(CFDictionaryRef query, CFTypeRef *result) {
+    // 记录(样本读它=授权查询)
+    if (g_apHits < 64) apLog(@"[keychain] SecItemCopyMatching consult (authorize->yes)");
+    g_apHits++;
+    // 恒授权: 返回"找到"+伪造数据(空 data 通常代表"已存授权")
+    if (result) {
+        CFDataRef fake = CFDataCreate(NULL, (const uint8_t *)"OK", 2);
+        *result = fake;
+    }
+    return errSecSuccess;
+}
+static void apKeychainInstall(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct rebinding rb = {"SecItemCopyMatching", (void *)apSecCopyMatchingHook, (void **)&g_origSecCopyMatching};
+        int r = rebind_symbols(&rb, 1);
+        apLog(@"[keychain] SecItemCopyMatching rebind: %d (orig=%p)", r, g_origSecCopyMatching);
+    });
+}
+
+// v2.56b: CloudKit 授权豁免——hook fetchUserRecordID 恒返回"已授权用户"(样本判定链的另一腿)
+//   CKContainer fetchUserRecordIDWithCompletionHandler: (CKRecordID*, NSError*)block
+//   hook: 直接回调伪造已授权 recordID(授权判定=云端身份, cloudid 从这里拿)
+static void apCloudKitInstall(void) {
+    // CKContainer 的 fetchUserRecordID 是 ObjC 方法, 用 swizzle 更稳(非 C API)
+    // 说明: fetchUserRecordIDWithCompletionHandler 在 CKContainer 类上
+    // 实现: 用 method_setImplementation 替换(样本 dlopen 后调用就走我们的)
+    // 注: 完整实现需要处理 block 参数(第一个参数是 completion block)
+}
+
 // ====== 规则执行 ======
 static void apApplyRules(void) {
     @try {
@@ -208,6 +244,10 @@ static void apApplyRules(void) {
                     NSData *new = apHexToBytes(p[@"new"] ?: @"");
                     if (!new.length) err = @"empty new bytes";
                     else ok = apTextPatch((uintptr_t)off, old, new, &err);
+                } else if ([kind isEqualToString:@"keychain"]) {
+                    // v2.56: Keychain 授权豁免(样本判定链数据源)
+                    apKeychainInstall();
+                    ok = YES;   // 全局生效(进程内)
                 }
                 if (ok) { g_apHits++; apLog(@"✓ %@ patch applied", kind); }
                 else apLog(@"✗ %@ failed: %@", kind, err);

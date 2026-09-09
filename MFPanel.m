@@ -2442,6 +2442,8 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
         mfReflixOracleStart();
         extern void mfProcCaptureStart(void);   // v2.26.0: 第二拳·被动点位采集(白名单 app)
         mfProcCaptureStart();
+        extern void mfAppPatchBoot(void);       // v2.56: patch 引擎(patch 规则自判开关)
+        mfAppPatchBoot();
         mfObjCHookApplySilent();
         mfSubInjectAutoStart();
         mfReceiptForgeAutoStart();
