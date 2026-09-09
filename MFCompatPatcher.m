@@ -478,7 +478,34 @@ static IMP t_setImp(Method m, IMP imp) {
     return old;   // 必须原样返回旧 IMP
 }
 // v2.53 授权体系蹦床: 只记参, 尾调原函数
+// v2.56.8: 样本 dlsym(SecItemCopyMatching) → 直接返授权 stub(记录 query + 恒授权)。
+//   ★根因: 样本 dlsym 动态解析(鱼钩 rebind 只改 GOT, 对 dlopen 的样本无效——v2.56.7 实测
+//   IAPtools 侧 dlsym rebind 拦不到样本; 而 xray GOT 蹦床在样本 dlopen 时刻布点, dlsym=6
+//   命中实锤拦截生效)。样本拿 stub → 调用 → 判定被截, query 记入日志学格式。
+static int mfObsKeychainN = 0;
+static int mfObsKeychainStub(CFDictionaryRef query, CFTypeRef *result) {
+    // Security 常量数值稳定, 用 CF 字面量(不链 Security 框架): kSecAttrService="svce" kSecAttrAccount="acct"
+    NSString *svc = @"?", *acct = @"?", *cls = @"?";
+    if (query) {
+        CFTypeRef v;
+        if ((v = CFDictionaryGetValue(query, CFSTR("svce")))) svc = (__bridge NSString *)v;
+        if ((v = CFDictionaryGetValue(query, CFSTR("acct")))) acct = (__bridge NSString *)v;
+        if ((v = CFDictionaryGetValue(query, CFSTR("class")))) cls = (__bridge NSString *)v;
+    }
+    if (mfObsKeychainN < 32)
+        mfXrayLog("[xray] KEYCHAIN-ANS q: cls=%@ svc=%@ acct=%@", cls, svc, acct);
+    mfObsKeychainN++;
+    if (result) {
+        CFDataRef fake = CFDataCreate(NULL, (const uint8_t *)"OK", 2);
+        *result = fake;
+    }
+    return 0;   // errSecSuccess — 恒"找到授权"
+}
 static void *t_dlsym(void *h, const char *name) {
+    if (name && (!strcmp(name, "SecItemCopyMatching") || !strcmp(name, "SecItemCopyMatchingWithAttributes"))) {
+        mfXrayLog("[xray] dlsym(%s) -> KEYCHAIN STUB (样本要授权函数, 直接给 stub)", name);
+        return (void *)mfObsKeychainStub;
+    }
     void *r = o_dlsym(h, name);
     if (g_fcCnt[5]++ < XRAY_MAX_LOG)
         mfXrayLog("[xray] dlsym(handle=%p %s) -> %s", h, name ?: "?", mfImpWhere((uintptr_t)r));
