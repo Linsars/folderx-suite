@@ -191,8 +191,23 @@ static BOOL apMethodPatch(NSString *clsName, NSString *selName, BOOL ret, NSStri
 // hook SecItemCopyMatching → 恒"找到授权项"(errSecSuccess + 伪 data) → 样本/主进程判定"已授权"
 static OSStatus (*g_origSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static OSStatus apSecCopyMatchingHook(CFDictionaryRef query, CFTypeRef *result) {
-    // 记录(样本读它=授权查询)
-    if (g_apHits < 64) apLog(@"[keychain] SecItemCopyMatching consult (authorize->yes)");
+    // v2.56.5: 记录 query 关键字段——判定链样本装载后, 看它到底查什么(service/account/返回类型),
+    //   才知道该怎么伪造正确格式的数据("OK" 2 字节可能不是样本期望的结构)。
+    if (g_apHits < 64) {
+        NSString *svc = @"?";
+        NSString *acct = @"?";
+        NSString *cls = @"?";
+        NSString *retData = @"?";
+        if (query) {
+            CFTypeRef v;
+            if ((v = CFDictionaryGetValue(query, kSecAttrService))) svc = (__bridge NSString *)v;
+            if ((v = CFDictionaryGetValue(query, kSecAttrAccount))) acct = (__bridge NSString *)v;
+            if ((v = CFDictionaryGetValue(query, kSecClass))) cls = (__bridge NSString *)v;
+            if (CFDictionaryContainsKey(query, kSecReturnData)) retData = @"RETURN_DATA";
+            if (CFDictionaryContainsKey(query, kSecReturnRef)) retData = @"RETURN_REF";
+        }
+        apLog(@"[keychain] consult q: cls=%@ svc=%@ acct=%@ %@", cls, svc, acct, retData);
+    }
     g_apHits++;
     // 恒授权: 返回"找到"+伪造数据(空 data 通常代表"已存授权")
     if (result) {
