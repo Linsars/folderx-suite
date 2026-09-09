@@ -535,7 +535,11 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
     for (uint32_t i = 0; i < n; i++) {
         if ((const struct mach_header_64 *)_dyld_get_image_header(i) != m64) continue;
         const char *nm = _dyld_get_image_name(i);
-        if (nm && (strstr(nm, "FixCrash.dylib") || strstr(nm, "ScriptingPass.dylib") || strstr(nm, "MinisFix/"))) ours = YES;
+        // v2.55.2: 标本路径匹配通用化——观察目录内任意 dylib 都算(不再硬编码旧路径/文件名)。
+        //   旧判断只认 FixCrash.dylib / ScriptingPass.dylib / "MinisFix/" 段,
+        //   而 v2.55 后标本在 /var/jb/var/mobile/minisfix/ 下(路径 minisfix/ 无 MinisFix/ 大写段) → 匹配失败。
+        if (nm && (strstr(nm, "FixCrash.dylib") || strstr(nm, "ScriptingPass.dylib")
+                   || strstr(nm, "minisfix/") || strstr(nm, "MinisFix/") || strstr(nm, "minisfix"))) ours = YES;
         break;
     }
     if (!ours) return;
