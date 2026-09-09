@@ -665,9 +665,13 @@ static BOOL mfObserveNeeded(NSString *bid) {
     NSArray *apps = pf[@"mfObserveAppList"];
     if (![apps isKindOfClass:[NSArray class]] || apps.count == 0) return NO;
     if (![apps containsObject:bid]) return NO;
-    // 标本清单: "不装载任何"(空) = 无标本可观察, 直接 return
-    NSArray *sel = pf[@"mfObserveSelect"];
-    if (![sel isKindOfClass:[NSArray class]] || sel.count == 0) return NO;
+    // 标本清单: 没有任何 mfObserve_* 开关开着 = "不装载任何" → 无标本可观察, 直接 return
+    NSArray *all = [pf allKeys];
+    BOOL anySel = NO;
+    for (NSString *k in all) {
+        if ([k hasPrefix:@"mfObserve_"] && [pf[k] boolValue]) { anySel = YES; break; }
+    }
+    if (!anySel) return NO;
     return YES;
 }
 
@@ -676,23 +680,21 @@ static void mfFixcrashStage(BOOL xray, BOOL observeOn) {
     // 观察门控: 不满足三层门控直接 return, 不 dlopen/不注册 add_image/零日志
     if (!observeOn) return;
     // v2.53: 目录枚举——/var/jb/usr/lib/MinisFix/*.dylib 全部作为标本逐个装载
+    // v2.55: 标本装载目录改为 /var/mobile/minisfix(mobile 可写可读, 用户 UIDocumentPicker 导入到这里)
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *dir = @"/var/jb/usr/lib/MinisFix";
-    // v2.55: 目录可配(mfObserveDir), 默认 /var/jb/usr/lib/MinisFix
+    NSString *dir = @"/var/mobile/minisfix";
+    // v2.55: 目录可配(mfObserveDir), 默认 /var/mobile/minisfix
     NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
     NSString *cfg = pf[@"mfObserveDir"];
     if ([cfg isKindOfClass:[NSString class]] && cfg.length > 0) dir = cfg;
-    // 标本清单过滤: 只装 mfObserveSelect 勾选的 dylib
-    NSArray *sel = pf[@"mfObserveSelect"];
-    NSSet *selSet = nil;
-    if ([sel isKindOfClass:[NSArray class]]) selSet = [NSSet setWithArray:sel];
+    // 标本清单过滤: mfObserve_<文件名> = YES 才装(方案 B 多选清单, 每个 dylib 一个开关)
     NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil] ?: @[];
     BOOL any = NO;
     for (NSString *f in [files sortedArrayUsingSelector:@selector(compare)]) {
         if (![f.pathExtension isEqualToString:@"dylib"]) continue;
-        // v2.55: 标本清单过滤——selSet 含文件名才装; selSet 空("不装载任何")全部 skip
-        if (selSet && selSet.count == 0) continue;      // "不装载任何" → 跳过全部
-        if (selSet && ![selSet containsObject:f]) continue;  // 不在勾选清单 → 跳过
+        // 不装载任何: 该 dylib 没被勾选(mfObserve_<名> != YES) → skip
+        NSString *key = [@"mfObserve_" stringByAppendingString:f];
+        if (![pf[key] boolValue]) continue;   // 未勾选 = 不装载这个
         any = YES;
         NSString *full = [dir stringByAppendingPathComponent:f];
         g_xrayOn = xray;

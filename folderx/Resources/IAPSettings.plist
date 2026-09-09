@@ -140,6 +140,16 @@
 			<key>useSearchBar</key>
 			<true/>
 		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSLinkCell</string>
+			<key>detail</key>
+			<string>ObserveImportController</string>
+			<key>isController</key>
+			<true/>
+			<key>label</key>
+			<string>导入标本(选择 dylib)</string>
+		</dict>
 	</array>
 	<key>title</key>
 	<string>IAP工具箱</string>
