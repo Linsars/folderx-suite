@@ -542,10 +542,62 @@ static int t_sysctl(const char *name, void *oldp, unsigned long *oldlenp, void *
 //   ★v2.56.3: 应答分支(换 demux 永远授权)已删除 —— fishhook rebind 已证伪且在 CompatPatcher
 //   侧同样无效(样本 dlsym 动态解析, 静态 GOT 无引用); 且 demux 实为样本自身代码, 授权判定
 //   链 = keychain+cloudkit, mach 腿不在判定上。此处仅保留观察记录。
+// v2.56.14: 样本内存 dump — mach 服务器上线时 = 判定链已跑完 + __DATA 已解密。
+//   同进程直读(我们本来注入在里面): ①样本 __DATA 段全量 dump(与磁盘 diff=解密区域)
+//   ②云同步 keychain dump(SecItemCopyMatching query/结果, 看 acct/agrp 判定数据源)
+static void mfDumpSampleMemory(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (!g_fcMH) return;
+            // __DATA 段: 遍历 LC_SEGMENT_64 找 __DATA, fileoff 同偏移读磁盘原文, diff
+            const uint8_t *p = (const uint8_t *)g_fcMH;
+            uint32_t off = sizeof(struct mach_header_64);
+            for (uint32_t k = 0; k < g_fcMH->ncmds; k++) {
+                const struct load_command *lc = (const struct load_command *)(p + off);
+                if (lc->cmd == LC_SEGMENT_64) {
+                    const struct segment_command_64 *sg = (const struct segment_command_64 *)(p + off);
+                    if (!strcmp(sg->segname, "__DATA") && sg->filesize > 0) {
+                        const uint8_t *mem = (const uint8_t *)(g_fcSlide + sg->vmaddr);
+                        // 磁盘原文: 样本路径(观察目录装载的)
+                        NSString *dir = @"/var/jb/var/mobile/minisfix";
+                        NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+                        for (NSString *fn in files) {
+                            if (![fn hasSuffix:@".dylib"]) continue;
+                            NSString *path = [dir stringByAppendingPathComponent:fn];
+                            NSData *disk = [NSData dataWithContentsOfFile:path];
+                            if (disk.length < sg->fileoff + sg->filesize) continue;
+                            const uint8_t *db = disk.bytes;
+                            // diff: 只 dump 与磁盘不同的页(解密过的区域)
+                            int diffPages = 0;
+                            NSMutableData *out = [NSMutableData data];
+                            for (uint64_t q = 0; q + 0x1000 <= sg->filesize; q += 0x1000) {
+                                if (memcmp(mem + q, db + sg->fileoff + q, 0x1000) != 0) {
+                                    diffPages++;
+                                    [out appendBytes:(mem + q) length:0x1000];
+                                }
+                            }
+                            if (diffPages > 0) {
+                                NSString *dp = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
+                                NSString *fp = [dp stringByAppendingPathComponent:@"sample_data_decrypted.bin"];
+                                [out writeToFile:fp atomically:YES];
+                                mfXrayLog("[xray] DUMP sample __DATA diff: %d pages → %@", diffPages, fp.lastPathComponent);
+                            } else {
+                                mfXrayLog("[xray] DUMP sample __DATA: 0 diff pages(未解密?)");
+                            }
+                        }
+                    }
+                }
+                off += lc->cmdsize;
+            }
+        });
+    });
+}
 static int t_machServer(void *demux, unsigned int maxsz, unsigned int timeout, unsigned int subsys) {
     if (g_fcCnt[8]++ < XRAY_MAX_LOG)
         mfXrayLog("[xray] *** MACH_MSG_SERVER demux=%s maxsz=%u timeout=%u subsys=%u —— 许可服务器上线",
                     mfImpWhere((uintptr_t)demux), maxsz, timeout, subsys);
+    mfDumpSampleMemory();   // ★时机: 判定已跑+数据已解密, 2s 后 dump
     return o_machServer(demux, maxsz, timeout, subsys);
 }
 static int t_pthreadCreate(void *t, const void *attr, void *(*fn)(void *), void *arg) {
