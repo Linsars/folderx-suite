@@ -1480,8 +1480,15 @@ void mfShowLabPage(void) {
         [NSString stringWithFormat:@"对应侦查: 本地许可服务器(mach=1, MACH_MSG_SERVER) — 换 demux 永远授权 · 命中 %ld", mfMachRespHits()]);
 
 
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, 368, g_mfCardW - 32, 96)];
-    note.text = @"产品 ID 来自「扫描购买」列表 (iapids.plist)。\nentitlement 名自动发现(RC 缓存+二进制扫描), 回退 pro。\nlifetime 产品走 non_subscriptions (RC 官方规范)。\n解析型收据校验可过, hash 校验型必挂。";
+    // v2.56: patch 引擎(规则驱动: method swizzle / text vm_protect / keychain 授权豁免)
+    //   ——学习自 ScriptingPass 判定链的落地容器。规则格式: mfAppPatchRules JSON
+    //   [{"bid":"com.scripting.ios","ver":"","patches":[{"kind":"keychain"}]}]
+    CGFloat apY = 368;
+    extern void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio);
+    mfAppPatchSectionInLabPage(page, &apY);
+
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, apY + 8, g_mfCardW - 32, 80)];
+    note.text = @"patch 规则: bid+ver 匹配 → method(swizzle)/text(vm_protect)/keychain(授权豁免)。\n规则 JSON 在 mfAppPatchRules(设置页/手动写入)。\n冷启动生效(重开 app)。";
     note.numberOfLines = 0;
     note.font = [UIFont systemFontOfSize:12];
     note.textColor = [UIColor secondaryLabelColor];
