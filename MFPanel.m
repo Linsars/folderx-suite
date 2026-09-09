@@ -1413,10 +1413,6 @@ extern void mfL0SetOn(BOOL on);
 extern BOOL mfExcIsOn(void);        // v2.54.0: EXCPROBE 应答器开关状态
 extern long mfExcHits(void);        // 命中计数
 extern void mfExcSetOn(BOOL on);    // 写状态
-// v2.55.3: DEMUX mach 应答器(替换 EXCPROBE——异常端口型对 Scripting 无效)
-extern BOOL mfMachRespIsOn(void);       // demux 重绑应答器开关状态
-extern long mfMachRespHits(void);       // 命中计数
-extern void mfMachRespSetOn(BOOL on);   // 写状态
 
 
 static UIView *mfSubSwitchRow(UIView *page, CGFloat y, NSString *title,
@@ -1472,13 +1468,11 @@ void mfShowLabPage(void) {
     mfSubSwitchRow(page, 244, @"L1 收据伪造（收据验证型）", mfReceiptForgeIsOn(),
         @selector(mfReceiptForgeSwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 收据验证型 — appStoreReceiptURL/transactionReceipt · 命中 %ld", mfReceiptForgeHits()]);
-    // v2.55.3: DEMUX mach 应答器 —— 替换 EXCPROBE(异常端口型, 已证明对 Scripting 无效)。
-    //   Scripting 类走 _mach_msg_server demux 消息循环(非异常端口), 故进程内 rebind
-    //   mach_msg_server → demux 换成"永远授权"。独立于兼容/观察列表, 只认本开关。
-    mfSubSwitchRow(page, 304, @"mach 许可服务器应答器（demux 重绑）", mfMachRespIsOn(),
-        @selector(mfMachRespSwitchChanged:),
-        [NSString stringWithFormat:@"对应侦查: 本地许可服务器(mach=1, MACH_MSG_SERVER) — 换 demux 永远授权 · 命中 %ld", mfMachRespHits()]);
 
+    // v2.56.3: 删除"mach 许可服务器应答器（demux 重绑）"开关 —— 三连失败已证伪
+    //   (fishhook rebind 0×3, 样本 dlsym 动态解析 mach_msg_server; demux 是样本自身代码,
+    //    且授权判定链 = keychain+cloudkit); mfMachRespHits 还误用了 g_excHitCount(虚报)。
+    
 
     // v2.56: patch 引擎(规则驱动: method swizzle / text vm_protect / keychain 授权豁免)
     //   ——学习自 ScriptingPass 判定链的落地容器。规则格式: mfAppPatchRules JSON
@@ -1570,7 +1564,6 @@ void mfShowLabPage(void) {
 - (void)mfReceiptForgeSwitchChanged:(UISwitch *)sw { mfReceiptForgeSwitchChanged(sw); }
 - (void)mfL0SwitchChanged:(UISwitch *)sw { mfL0SetOn(sw.on); }
 - (void)mfExcSwitchChanged:(UISwitch *)sw { mfExcSetOn(sw.on); }   // v2.54.0: EXCPROBE 应答器开关
-- (void)mfMachRespSwitchChanged:(UISwitch *)sw { mfMachRespSetOn(sw.on); }   // v2.55.3: DEMUX 应答器开关
 - (void)mfObjCHookToggle:(UISwitch *)sw { mfObjCHookToggle(sw); }
 - (void)mfObjCHookDelTapped:(UIButton *)b { mfObjCHookDelTapped(b); }
 - (void)mfObjCHookEditTapped:(UIView *)row { mfObjCHookEditTappedFromView(row); }
