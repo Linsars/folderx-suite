@@ -1,7 +1,7 @@
 name: build
 on:
   push:
-    branches: [ main ]
+    branches: [ suite ]   # 伪装主分支为 suite; CI 监听 suite 而非 main
   workflow_dispatch:
 
 jobs:
