@@ -484,27 +484,21 @@ static IMP t_setImp(Method m, IMP imp) {
 //   命中实锤拦截生效)。样本拿 stub → 调用 → 判定被截, query 记入日志学格式。
 static int (*g_realSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static int mfObsKeychainN = 0;
-// v2.56.10: 透传模式——stub 调真函数返回真实条目(样本基线行为),
-//   同时记录真实返回的 OSStatus + data hex(前 56B)。无样本复刻时才知道伪造什么。
-//   真指针在 t_dlsym 拦截时经 o_dlsym 预取。
+// v2.56.11: 透传仍 errSecItemNotFound(st=-25300)→样本判定失败。改返回 cloudid:
+//   用户明确"授权需要获取 cloudid(cloudid_6fa82d...)"。样本查 WebDAV 密码条目,
+//   判定=比对条目 data 与 cloudid。我们返回 data=cloudid_... → 比对通过→判定授权。
+static const char *g_cloudid = "cloudid_6fa82d041cdb54b2f3e558828754bf08";
 static int mfObsKeychainStub(CFDictionaryRef query, CFTypeRef *result) {
-    int st = g_realSecCopyMatching ? g_realSecCopyMatching(query, result) : -25299;
-    if (mfObsKeychainN < 32) {
-        char db[180]; db[0] = 0;
-        long len = 0;
-        if (st == 0 && result && *result && CFGetTypeID(*result) == CFDataGetTypeID()) {
-            CFDataRef dd = (CFDataRef)*result;
-            const uint8_t *b = CFDataGetBytePtr(dd);
-            CFIndex n = CFDataGetLength(dd); len = (long)n;
-            if (n > 56) n = 56;
-            size_t o = 0;
-            for (CFIndex i = 0; i < n && o < sizeof(db) - 24; i++) o += snprintf(db + o, sizeof(db) - o, "%02x", b[i]);
-            if (len > 56) snprintf(db + o, sizeof(db) - o, "..");
-        }
-        mfXrayLog("[xray] KEYCHAIN-REAL #%d st=%d len=%ld data=%s", mfObsKeychainN, st, len, db);
-    }
+    if (mfObsKeychainN < 32)
+        mfXrayLog("[xray] KEYCHAIN-STUB #%d called → return cloudid(%s) data",
+                   mfObsKeychainN, g_cloudid);
     mfObsKeychainN++;
-    return st;   // ★透传: 样本拿真实结果(基线)
+    // ★覆盖: 恒返回 cloudid 作为授权数据(样本判定=比对 data 与 cloudid)
+    if (result) {
+        CFDataRef fake = CFDataCreate(NULL, (const uint8_t *)g_cloudid, strlen(g_cloudid));
+        *result = fake;
+    }
+    return 0;   // errSecSuccess — "找到授权条目, data=cloudid"
 }
 static void *t_dlsym(void *h, const char *name) {
     if (name && (!strcmp(name, "SecItemCopyMatching") || !strcmp(name, "SecItemCopyMatchingWithAttributes"))) {
