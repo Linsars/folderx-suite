@@ -1208,15 +1208,21 @@ void mfProcCaptureStart(void) {
     if (g_capOn) return;
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-    // v2.54.3: 门控解耦——mf_machMsgHook(mach_msg 通用记录)只需要 IAPtools 对当前 app 生效,
-    //   不受 EXCPROBE 专用开关卡住(之前把 mach tap 绑死到 mfExcEnabled, 导致抓不到 Scripting 的 mach_msg)。
-    //   EXCPROBE(强行武装)才单独看 mfExcEnabled(在 mfExcArm 内判断)。
-    extern BOOL mfIsEnabledForCurrentApp(void);
-    if (!mfIsEnabledForCurrentApp()) {
-        mfLog(@"[capture] EXCPROBE skip (IAPtools not enabled for bid=%@)", bid ?: @"?");
+    // v2.54.4: 止损——mach tap(mach_msg rebind)对任意 app 是高侵入(全 iOS 系统通信走 mach_msg,
+    //   rebind 后 Scripting 崩, Reflix 战役 2.29.0 也踩过同样坑: NSInvocation tap 碰系统 selector 启动崩)。
+    //   mach tap 只对 mfCompatAppList(用户勾选的明确观察目标)装, 不对 mfIsEnabledForCurrentApp 的所有 app 装。
+    //   记录当前 app 是否在兼容列表(mach tap + EXCPROBE 观察共用)。
+    NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"] ?: @{};
+    NSArray *compatList = pf[@"mfCompatAppList"];
+    BOOL inCompat = NO;
+    if ([compatList isKindOfClass:[NSArray class]] && bid.length > 0)
+        inCompat = [compatList containsObject:bid];
+    // EXCPROBE 武装: 兼容列表内的 app + 开关 ON(在 mfExcArm 内部判断 mfExcEnabled)
+    if (!inCompat) {
+        mfLog(@"[capture] EXCPROBE skip (bid=%@ not in mfCompatAppList)", bid ?: @"?");
         return;
     }
-    mfLog(@"[capture] EXCPROBE armed (mfIsEnabledForCurrentApp, bid=%@ ver=%@)", bid, ver);
+    mfLog(@"[capture] EXCPROBE armed (mfCompatAppList, bid=%@ ver=%@)", bid, ver);
     mfExcArm();   // v2.54.1: 提取的武装函数——ctor 时也武装(内部自己看 mfExcEnabled)
 
     // v2.28.1: debug 通道已证伪(2.28.0 实测写入正确域仍不亮) — 默认关, 别污染采集对照
@@ -1526,7 +1532,9 @@ void mfProcCaptureStart(void) {
     // v2.29.0: 审讯层 — 主二进制引用扫描(invocation/UD 窃听已提前到 dlopen 之前, v2.34.0)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ mfCapScanMainBinary(); });
     // v2.30.0: 层5 — 主二进制 mach_msg/mach_msg2 重绑(license 客户端握手双向捕获)
-    if (mh) {
+    // v2.54.4: 止损——mach_msg rebind 是高侵入(全 iOS 通信走 mach_msg, 曾崩 Scripting/Reflix)。
+    //   加独立开关 mfMachTapEnabled(默认关): 开了才 rebind, 否则跳过。防误全局刷新崩。
+    if (mh && [[NSUserDefaults standardUserDefaults] boolForKey:@"mfMachTapEnabled"]) {
         mfCapInstallMachTap(mh, mainSlide);
         struct rebinding rb2 = {"mach_msg2", (void *)mf_machMsg2Hook, (void **)&g_origMachMsg2};
         int r2 = rebind_symbols_image((void *)mh, mainSlide, &rb2, 1);
