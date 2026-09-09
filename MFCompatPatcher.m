@@ -488,40 +488,36 @@ static boolean_t mfMachAuthDemux(mach_msg_header_t *in, mach_msg_header_t *out) 
     out->msgh_size = sizeof(mach_msg_header_t);
     return TRUE;
 }
-// v2.53 授权体系蹦床: 只记参, 尾调原函数
-// ★v2.56.12: t_dlsym 双拦截——
-//   样本 dlsym 动态解析所有关键函数(GOT 蹦床拦不到), 必须在 dlsym 层拦截:
-//   SecItemCopyMatching → mfObsKeychainStub(返回 cloudid 数据)
-//   mach_msg_server → mfMachAuthDemux(许可服务器应答=授权)
+// v2.56.12 错误修正：t_dlsym 双拦截(mach_msg_server)阻止样本起许可服务器。
+// 样本本身就是授权组件，样本挂上=亮(样本自己判定)。我们的 hook 反而干扰样本。
+// 本版恢复透传(让样本自己跑)，并逆向 ScriptingPass.dylib 确定 keychain 条目格式。
 static int (*g_realSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static int mfObsKeychainN = 0;
-// v2.56.11: 透传仍 errSecItemNotFound(st=-25300)→样本判定失败。改返回 cloudid:
-//   用户明确"授权需要获取 cloudid(cloudid_6fa82d...)"。样本查 WebDAV 密码条目,
-//   判定=比对条目 data 与 cloudid。我们返回 data=cloudid_... → 比对通过→判定授权。
-static const char *g_cloudid = "cloudid_6fa82d041cdb54b2f3e558828754bf08";
+// 透传: 让样本自己跑(样本挂上=亮)。记录真实条目(若存在)。
 static int mfObsKeychainStub(CFDictionaryRef query, CFTypeRef *result) {
-    if (mfObsKeychainN < 32)
-        mfXrayLog("[xray] KEYCHAIN-STUB #%d called → return cloudid(%s) data",
-                   mfObsKeychainN, g_cloudid);
-    mfObsKeychainN++;
-    // ★覆盖: 恒返回 cloudid 作为授权数据(样本判定=比对 data 与 cloudid)
-    if (result) {
-        CFDataRef fake = CFDataCreate(NULL, (const uint8_t *)g_cloudid, strlen(g_cloudid));
-        *result = fake;
+    int st = g_realSecCopyMatching ? g_realSecCopyMatching(query, result) : -25299;
+    if (mfObsKeychainN < 8) {
+        char db[120]; db[0] = 0;
+        if (st == 0 && result && *result && CFGetTypeID(*result) == CFDataGetTypeID()) {
+            CFDataRef dd = (CFDataRef)*result;
+            const uint8_t *b = CFDataGetBytePtr(dd);
+            CFIndex n = CFDataGetLength(dd); if (n > 48) n = 48;
+            size_t o = 0;
+            for (CFIndex i = 0; i < n && o < sizeof(db) - 24; i++) o += snprintf(db + o, sizeof(db) - o, "%02x", b[i]);
+        }
+        mfXrayLog("[xray] KEYCHAIN-REAL #%d st=%d data=%s", mfObsKeychainN, st, db);
     }
-    return 0;   // errSecSuccess — "找到授权条目, data=cloudid"
+    mfObsKeychainN++;
+    return st;   // ★透传: 让样本自己跑(样本挂上=亮)
 }
 static void *t_dlsym(void *h, const char *name) {
-    // ★v2.56.12: 双拦截——样本 dlsym 动态解析(GOT 蹦床拦不到)
+    // ★仅拦截 SecItemCopyMatching(透传，记录真实条目)
     if (name && (!strcmp(name, "SecItemCopyMatching") || !strcmp(name, "SecItemCopyMatchingWithAttributes"))) {
         g_realSecCopyMatching = (int (*)(CFDictionaryRef, CFTypeRef *))o_dlsym(h, name);
-        mfXrayLog("[xray] dlsym(%s) -> KEYCHAIN STUB (返回 cloudid 数据)", name);
+        mfXrayLog("[xray] dlsym(%s) -> KEYCHAIN STUB (透传, 记录真实条目)", name);
         return (void *)mfObsKeychainStub;
     }
-    if (name && !strcmp(name, "mach_msg_server")) {
-        // ★样本起许可服务器(timeout=9223 等客户端), 应答=授权通过
-        mfXrayLog("[xray] dlsym(mach_msg_server) -> MACH AUTH DEMUX");
-        return (void *)mfMachAuthDemux;
+    void *r = o_dlsym(h, name);
     }
     void *r = o_dlsym(h, name);
     if (g_fcCnt[5]++ < XRAY_MAX_LOG)
