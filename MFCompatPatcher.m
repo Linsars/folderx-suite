@@ -518,8 +518,6 @@ static void *t_dlsym(void *h, const char *name) {
         return (void *)mfObsKeychainStub;
     }
     void *r = o_dlsym(h, name);
-    }
-    void *r = o_dlsym(h, name);
     if (g_fcCnt[5]++ < XRAY_MAX_LOG)
         mfXrayLog("[xray] dlsym(handle=%p %s) -> %s", h, name ?: "?", mfImpWhere((uintptr_t)r));
     return r;
