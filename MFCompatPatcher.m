@@ -679,11 +679,13 @@ static BOOL mfObserveNeeded(NSString *bid) {
 static void mfFixcrashStage(BOOL xray, BOOL observeOn) {
     // 观察门控: 不满足三层门控直接 return, 不 dlopen/不注册 add_image/零日志
     if (!observeOn) return;
-    // v2.53: 目录枚举——/var/jb/usr/lib/MinisFix/*.dylib 全部作为标本逐个装载
-    // v2.55: 标本装载目录改为 /var/mobile/minisfix(mobile 可写可读, 用户 UIDocumentPicker 导入到这里)
+    // ★v2.55.1: 标本装载目录用 /var/jb/var/mobile/minisfix —— 关键修正:
+    //   /var/mobile/minisfix 在沙盒 app 里读不到(沙盒挡 /var/mobile/);
+    //   /var/jb/ 是注入器放宽的路径(老代码读 /var/jb/usr/lib 已证明沙盒可读),
+    //   且 /var/jb/var/mobile/minisfix 属 mobile 拥有(设置页可写) → 两全。
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *dir = @"/var/mobile/minisfix";
-    // v2.55: 目录可配(mfObserveDir), 默认 /var/mobile/minisfix
+    NSString *dir = @"/var/jb/var/mobile/minisfix";
+    // v2.55: 目录可配(mfObserveDir), 默认 /var/jb/var/mobile/minisfix
     NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
     NSString *cfg = pf[@"mfObserveDir"];
     if ([cfg isKindOfClass:[NSString class]] && cfg.length > 0) dir = cfg;

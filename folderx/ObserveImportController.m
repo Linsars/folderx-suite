@@ -1,9 +1,10 @@
 // ObserveImportController.m — 标本观察·导入 + 多选清单页(v2.55)
-// 功能: 顶栏「导入」→ 文件 app(UIDocumentPicker)选 .dylib → 拷到 /var/mobile/minisfix/(mobile 可写)
+// 功能: 顶栏「导入」→ 文件 app(UIDocumentPicker)选 .dylib → 拷到 /var/jb/var/mobile/minisfix/
 //       主体 = 多选清单(每个 dylib 一个 PSSwitchTableCell, key=mfObserve_<文件名>)
 //              + 「不装载任何」说明(全关 = 无标本不观察, 配合门控逻辑)
-// 装载: CompatPatcher(mfFixcrashStage) 启动时扫 /var/mobile/minisfix/, 装 mfObserve_* = ON 的 dylib
-// 说明: 目录实测 mobile 可读可写, 无需 root 通道。
+// 装载: CompatPatcher(mfFixcrashStage) 启动时扫 /var/jb/var/mobile/minisfix/, 装 mfObserve_* = ON 的 dylib
+// ★路径铁律: 必须在 /var/jb/ 下(注入器放宽, 沙盒 app 能读), 且 mobile 拥有(设置页能写)。
+//   /var/mobile/ 沙盒读不到(实测 no selected sample)
 
 #import <Preferences/PSListController.h>
 #import <Preferences/PSTableCell.h>
@@ -12,7 +13,7 @@
 #import <UIKit/UIKit.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
-#define kObserveDir @"/var/mobile/minisfix"
+#define kObserveDir @"/var/jb/var/mobile/minisfix"   // ★JB 根链 mobile 可写 + 沙盒可读(注入器放宽 /var/jb)
 #define kObservePrefix @"mfObserve_"
 #define kPrefsDomain @"com.linsars.minisfix"
 
