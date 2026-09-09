@@ -44,7 +44,10 @@ void mfAppPatchSetRulesJSON(NSString *json);
 
 // ====== 偏好 ======
 static NSString *MFPrefsPath(void) {
-    return @"/var/mobile/Library/Preferences/com.linsars.minisfix.plist";
+    // ★v2.56.2 修复: 曾写成 /var/mobile/...(无 /var/jb)导致规则读写落在错误文件,
+    //   mfAppPatchRules 永远保存不进去(开关 Enabled 在 /var/jb 文件, 规则却读 /var/mobile)。
+    //   与 mfPrefsDict/mfSetPrefs(MFPanel.m)统一为 /var/jb/var/mobile/...
+    return @"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist";
 }
 static id mfReadPrefObj(NSString *key) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:MFPrefsPath()];
