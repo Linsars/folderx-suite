@@ -312,10 +312,16 @@ static void apApplyRules(void) {
 }
 
 // 引擎拉起: 主线程延迟执行 (dyld 阶段 ObjC 类未注册完, 太早 hook 会 miss)
+// v2.56.4: keychain+cloudkit 豁免双腿 = 引擎 ON 即装(立即, 不等 1.5s):
+//   ★经验教训: 规则表只写 keychain → cloudkit 腿漏装 → 判定链缺腿不亮。
+//   豁免是进程级全局行为, 与规则表(bid/ver 定向 method/text)解耦, 不依赖规则条目。
+//   立即装也避免样本在 1.5s 窗口内先调 fetchUserRecordID(拿到真 cloudid 后缓存, 不再调)。
 void mfAppPatchBoot(void) {
     if (!mfAppPatchIsOn()) return;
+    apKeychainInstall();       // v2.56.0: Keychain 豁免(样本判定链数据源)
+    apCloudKitInstall();       // v2.56.3: CloudKit 豁免(样本判定链另一腿: 云端身份)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        apApplyRules();
+        apApplyRules();        // 规则表只管 method/text 定向补丁(类注册齐后)
     });
     apInstallCollectors(); // 采集器顺带装上 (内部自判开关)
 }
