@@ -39,7 +39,6 @@
         [arr addObject:grp];
 
         // 每个 dylib 一个开关; key = mfObserve_<文件名>; 全关 = 不装载任何
-        NSUserDefaults *def = [[NSUserDefaults alloc] initWithSuiteName:kPrefsDomain];
         if (files.count == 0) {
             PSSpecifier *empty = [PSSpecifier preferenceSpecifierNamed:@"目录为空, 请先导入"
                                                                 target:self
