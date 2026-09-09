@@ -482,57 +482,34 @@ static IMP t_setImp(Method m, IMP imp) {
 //   ★根因: 样本 dlsym 动态解析(鱼钩 rebind 只改 GOT, 对 dlopen 的样本无效——v2.56.7 实测
 //   IAPtools 侧 dlsym rebind 拦不到样本; 而 xray GOT 蹦床在样本 dlopen 时刻布点, dlsym=6
 //   命中实锤拦截生效)。样本拿 stub → 调用 → 判定被截, query 记入日志学格式。
+static int (*g_realSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static int mfObsKeychainN = 0;
-// v2.56.9: mfXrayLog 是 C 风格日志(%@ 不支持, 上版打印全是 '@')——CFString 转 C 串用 %s
-static void cfstrDump(CFTypeRef v, char *buf, size_t sz) {
-    buf[0] = 0;
-    if (!v) return;
-    if (CFGetTypeID(v) == CFStringGetTypeID()) {
-        if (!CFStringGetCString(v, buf, sz, 0x08000100 /*kCFStringEncodingUTF8*/)) buf[0] = 0;
-    } else if (CFGetTypeID(v) == CFDataGetTypeID()) {
-        // 二进制值: 打前 32 字节 hex(授权 blob 形状)
-        CFDataRef dd = (CFDataRef)v;
-        const uint8_t *b = CFDataGetBytePtr(dd);
-        CFIndex n = CFDataGetLength(dd);
-        size_t o = 0;
-        if (n > 32) n = 32;
-        for (CFIndex i = 0; i < n && o + 3 < sz; i++) o += snprintf(buf + o, sz - o, "%02x", b[i]);
-        if (CFDataGetLength(dd) > 32) snprintf(buf + o, sz - o, "..(%ldB)", (long)CFDataGetLength(dd));
-    } else if (v == kCFBooleanTrue) { snprintf(buf, sz, "YES");
-    } else if (v == kCFBooleanFalse) { snprintf(buf, sz, "NO");
-    } else if (CFGetTypeID(v) == CFNumberGetTypeID()) {
-        long lv; CFNumberGetValue(v, 4 /*kCFNumberLongType*/, &lv); snprintf(buf, sz, "%ld", lv);
-    }
-}
+// v2.56.10: 透传模式——stub 调真函数返回真实条目(样本基线行为),
+//   同时记录真实返回的 OSStatus + data hex(前 56B)。无样本复刻时才知道伪造什么。
+//   真指针在 t_dlsym 拦截时经 o_dlsym 预取。
 static int mfObsKeychainStub(CFDictionaryRef query, CFTypeRef *result) {
+    int st = g_realSecCopyMatching ? g_realSecCopyMatching(query, result) : -25299;
     if (mfObsKeychainN < 32) {
-        // ★dump 全部键值对(上版只打 svce/acct/class 三个还打坏了)——样本查什么一目了然
-        char out[1024]; size_t o = 0;
-        out[0] = 0;
-        if (query) {
-            CFIndex cnt = CFDictionaryGetCount(query);
-            const void *keys[16], *vals[16];
-            if (cnt > 16) cnt = 16;
-            CFDictionaryGetKeysAndValues(query, keys, vals);
-            for (CFIndex i = 0; i < cnt && o < sizeof(out) - 80; i++) {
-                char kb[64], vb[192];
-                cfstrDump(keys[i], kb, sizeof(kb));
-                cfstrDump(vals[i], vb, sizeof(vb));
-                o += snprintf(out + o, sizeof(out) - o, "%s%s=%s", i ? " " : "", kb, vb);
-            }
+        char db[180]; db[0] = 0;
+        long len = 0;
+        if (st == 0 && result && *result && CFGetTypeID(*result) == CFDataGetTypeID()) {
+            CFDataRef dd = (CFDataRef)*result;
+            const uint8_t *b = CFDataGetBytePtr(dd);
+            CFIndex n = CFDataGetLength(dd); len = (long)n;
+            if (n > 56) n = 56;
+            size_t o = 0;
+            for (CFIndex i = 0; i < n && o < sizeof(db) - 24; i++) o += snprintf(db + o, sizeof(db) - o, "%02x", b[i]);
+            if (len > 56) snprintf(db + o, sizeof(db) - o, "..");
         }
-        mfXrayLog("[xray] KEYCHAIN-ANS #%d q: %s", mfObsKeychainN, out);
+        mfXrayLog("[xray] KEYCHAIN-REAL #%d st=%d len=%ld data=%s", mfObsKeychainN, st, len, db);
     }
     mfObsKeychainN++;
-    if (result) {
-        CFDataRef fake = CFDataCreate(NULL, (const uint8_t *)"OK", 2);
-        *result = fake;
-    }
-    return 0;   // errSecSuccess — 恒"找到授权"
+    return st;   // ★透传: 样本拿真实结果(基线)
 }
 static void *t_dlsym(void *h, const char *name) {
     if (name && (!strcmp(name, "SecItemCopyMatching") || !strcmp(name, "SecItemCopyMatchingWithAttributes"))) {
-        mfXrayLog("[xray] dlsym(%s) -> KEYCHAIN STUB (样本要授权函数, 直接给 stub)", name);
+        g_realSecCopyMatching = (int (*)(CFDictionaryRef, CFTypeRef *))o_dlsym(h, name);
+        mfXrayLog("[xray] dlsym(%s) -> KEYCHAIN STUB (透传模式, 记录真实 data)", name);
         return (void *)mfObsKeychainStub;
     }
     void *r = o_dlsym(h, name);
