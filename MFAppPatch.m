@@ -190,6 +190,9 @@ static BOOL apMethodPatch(NSString *clsName, NSString *selName, BOOL ret, NSStri
 // 样本(ScriptingPass)授权判定: fetchUserRecordID(CloudKit 身份) + SecItemCopyMatching(Keychain 缓存)
 // hook SecItemCopyMatching → 恒"找到授权项"(errSecSuccess + 伪 data) → 样本/主进程判定"已授权"
 static OSStatus (*g_origSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
+// v2.56.7: dlsym hook 前向声明(kc Install 先于定义使用)
+static void *(*g_origDlsym)(void *, const char *) = NULL;
+static void *apDlsymHook(void *handle, const char *name);
 static OSStatus apSecCopyMatchingHook(CFDictionaryRef query, CFTypeRef *result) {
     // v2.56.5: 记录 query 关键字段——判定链样本装载后, 看它到底查什么(service/account/返回类型),
     //   才知道该怎么伪造正确格式的数据("OK" 2 字节可能不是样本期望的结构)。
@@ -222,7 +225,33 @@ static void apKeychainInstall(void) {
         struct rebinding rb = {"SecItemCopyMatching", (void *)apSecCopyMatchingHook, (void **)&g_origSecCopyMatching};
         int r = rebind_symbols(&rb, 1);
         apLog(@"[keychain] SecItemCopyMatching rebind: %d (orig=%p)", r, g_origSecCopyMatching);
+        // v2.56.7: 样本用 dlsym 动态解析 SecItemCopyMatching(fishhook 只改 GOT, 拦不到
+        //   dlsym 拿到的真函数指针 → consult 0 命中的根因)。补 hook dlsym 本身:
+        //   样本 dlsym("SecItemCopyMatching") 时直接返回我们的 hook(记录 query+恒授权)。
+        struct rebinding rb2 = {"dlsym", (void *)apDlsymHook, (void **)&g_origDlsym};
+        int r2 = rebind_symbols(&rb2, 1);
+        apLog(@"[keychain] dlsym rebind: %d (orig=%p)", r2, g_origDlsym);
     });
+}
+
+// v2.56.7: dlsym hook——样本动态解析授权函数时返我们的实现(绕不过去)
+static int g_apDlsymN = 0;
+static void *apDlsymHook(void *handle, const char *name) {
+    if (name) {
+        if (!strcmp(name, "SecItemCopyMatching") || !strcmp(name, "SecItemCopyMatchingWithAttributes")) {
+            if (g_apDlsymN++ < 16)
+                apLog(@"[dlsym] %s -> KEYCHAIN HOOK (样本要授权函数, 直接给 hook)", name);
+            return (void *)apSecCopyMatchingHook;
+        }
+        if (!strcmp(name, "mach_msg_server")) {
+            if (g_apDlsymN++ < 16)
+                apLog(@"[dlsym] mach_msg_server -> passthrough (记录用)");
+            return g_origDlsym ? g_origDlsym(handle, name) : NULL;
+        }
+        if (g_apDlsymN < 32)
+            apLog(@"[dlsym] %s handle=%p", name, handle);
+    }
+    return g_origDlsym ? g_origDlsym(handle, name) : NULL;
 }
 
 // v2.56.3: CloudKit 授权豁免 —— hook CKContainer fetchUserRecordIDWithCompletionHandler:
