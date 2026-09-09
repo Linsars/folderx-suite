@@ -79,11 +79,12 @@ NSDictionary *mfReconFingerprint(void) {
         NSString *xd = [NSString stringWithContentsOfFile:xp encoding:NSUTF8StringEncoding error:nil];
         if (xd.length) {
             BOOL viaRecon = [xd containsString:@"recon session"];
+            // v2.55: 观察模块独立后, "兼容列表会话"文案过时——统一为"标本观察"(可能来自观察列表或兼容列表, 以观察模块为准)
             NSRange sr = [xd rangeOfString:@"SUMMARY cnt:" options:NSBackwardsSearch];
             if (sr.location != NSNotFound) {
                 NSString *summ = [xd substringFromIndex:sr.location];
                 [lines addObject:[NSString stringWithFormat:@"Xray 标本观察在场(%@): %@",
-                    viaRecon ? @"侦查会话" : @"兼容列表会话",
+                    viaRecon ? @"侦查会话" : @"观察模块",
                     [[summ componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] firstObject] ?: summ]];
                 if ([summ containsString:@"mach=1"]) {
                     mach = YES;   // 许可服务器已实测上线——mach 协议型直接实锤(比端口推断强)

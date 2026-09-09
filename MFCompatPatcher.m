@@ -650,15 +650,49 @@ static void mfXraySweepMethods(void) {
               g_fcCnt[5], g_fcCnt[6], g_fcCnt[7], g_fcCnt[8], g_fcCnt[9]);
 }
 
+// ---- 观察模块门控(v2.55: 独立于兼容列表, 不再绑架 mfCompatAppList) ----
+// 三层门控, 任一层不过即 return(零损耗):
+//   mfObserveEnabled  = 模块总开关(默认 OFF) —— OFF=完全静止, 不 dlopen/不注册 add_image/零日志
+//   mfObserveAppList  = 观察列表(哪些 app 装标本)
+//   mfObserveSelect   = 标本清单(含"不装载任何"选项, 默认不装载=无标本不观察)
+// 与兼容列表彻底解耦: 兼容列表只管兼容补丁, 标本装载只看观察模块三开关。
+static BOOL mfObserveNeeded(NSString *bid) {
+    if (bid.length == 0) return NO;
+    NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
+    // 总开关: OFF=完全静止(即使观察列表/标本清单都选好也不跑, 零损耗调试后止损)
+    if (![pf[@"mfObserveEnabled"] boolValue]) return NO;
+    // 观察列表: 不在列表的 app 不观察
+    NSArray *apps = pf[@"mfObserveAppList"];
+    if (![apps isKindOfClass:[NSArray class]] || apps.count == 0) return NO;
+    if (![apps containsObject:bid]) return NO;
+    // 标本清单: "不装载任何"(空) = 无标本可观察, 直接 return
+    NSArray *sel = pf[@"mfObserveSelect"];
+    if (![sel isKindOfClass:[NSArray class]] || sel.count == 0) return NO;
+    return YES;
+}
+
 // 标本装载(dlopen 由我们掌控: 诊断模式先布钩再让 ctor 跑)
-static void mfFixcrashStage(BOOL xray) {
+static void mfFixcrashStage(BOOL xray, BOOL observeOn) {
+    // 观察门控: 不满足三层门控直接 return, 不 dlopen/不注册 add_image/零日志
+    if (!observeOn) return;
     // v2.53: 目录枚举——/var/jb/usr/lib/MinisFix/*.dylib 全部作为标本逐个装载
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dir = @"/var/jb/usr/lib/MinisFix";
+    // v2.55: 目录可配(mfObserveDir), 默认 /var/jb/usr/lib/MinisFix
+    NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
+    NSString *cfg = pf[@"mfObserveDir"];
+    if ([cfg isKindOfClass:[NSString class]] && cfg.length > 0) dir = cfg;
+    // 标本清单过滤: 只装 mfObserveSelect 勾选的 dylib
+    NSArray *sel = pf[@"mfObserveSelect"];
+    NSSet *selSet = nil;
+    if ([sel isKindOfClass:[NSArray class]]) selSet = [NSSet setWithArray:sel];
     NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil] ?: @[];
     BOOL any = NO;
     for (NSString *f in [files sortedArrayUsingSelector:@selector(compare)]) {
         if (![f.pathExtension isEqualToString:@"dylib"]) continue;
+        // v2.55: 标本清单过滤——selSet 含文件名才装; selSet 空("不装载任何")全部 skip
+        if (selSet && selSet.count == 0) continue;      // "不装载任何" → 跳过全部
+        if (selSet && ![selSet containsObject:f]) continue;  // 不在勾选清单 → 跳过
         any = YES;
         NSString *full = [dir stringByAppendingPathComponent:f];
         g_xrayOn = xray;
@@ -675,7 +709,7 @@ static void mfFixcrashStage(BOOL xray) {
             (void)mh;
         }
     }
-    if (!any) mfXrayLog("[xray] sample dir empty %s", dir.UTF8String);
+    if (!any) mfXrayLog("[xray] no selected sample (dir=%s)", dir.UTF8String);
 }
 
 // ==================== v2.52 CK-SANITIZER: iOS17×新SDK CloudKit 兼容引擎 ====================
@@ -775,19 +809,23 @@ __attribute__((constructor)) static void CompatPatcherCtor(void) {
         NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
         // 系统进程守卫(与 IAPtools 同律): 只服务用户 app
         if (bid.length == 0 || [bid.lowercaseString hasPrefix:@"com.apple."]) return;
+        // v2.55: 观察模块门控独立于兼容列表——先判标本装载, 不写 diag(省 plist 全量重写)
+        BOOL observeOn = mfObserveNeeded(bid);
         // v2.17.3: 非目标 app 直接走, 不写 diag(省一次 plist 全量重写, 写多必脏)
         BOOL needed = mfCompatNeeded();
-        if (!needed) return;
-        mfCompatDiag(@"ctor", [NSString stringWithFormat:@"pid=%d bid=%@", getpid(), bid ?: @"NIL"]);
-        mfCompatDiag(@"needed", @"YES");
-        mfCompatPatchMainBinary();
+        if (!needed && !observeOn) return;
+        if (needed) {
+            mfCompatDiag(@"ctor", [NSString stringWithFormat:@"pid=%d bid=%@", getpid(), bid ?: @"NIL"]);
+            mfCompatDiag(@"needed", @"YES");
+            mfCompatPatchMainBinary();
+        }
         // v2.51 probe: 标本装载 + 观察机(mfXray 缺省 ON, 显式 NO 关闭)
-        NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
-        BOOL xray = pf[@"mfXray"] ? [pf[@"mfXray"] boolValue] : YES;
-        // v2.54.0: 标本装载只走 mfCompatAppList 白名单门控(勾了谁就装谁)。
-        //   2.53.8 的 mfXrayRecon(全局键)绕过白名单导致 Filza 无关 app 冷启动崩, 已永久移除。
-        BOOL viaList = mfCompatNeededRaw();
-        if (viaList) mfFixcrashStage(xray);
-        mfCKInstall();   // v2.52: 通用 CK 兼容引擎(门控同 mfCompatAppList)
+        // v2.55: 标本装载独立观察模块门控(不再认兼容列表)——只在观察列表+选了标本+总开关开时跑
+        if (observeOn) {
+            NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
+            BOOL xray = pf[@"mfXray"] ? [pf[@"mfXray"] boolValue] : YES;
+            mfFixcrashStage(xray, YES);
+        }
+        if (needed) mfCKInstall();   // v2.52: 通用 CK 兼容引擎(门控同 mfCompatAppList)
     }
 }
