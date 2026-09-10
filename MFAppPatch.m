@@ -486,7 +486,7 @@ void mfAppPatchEntDumpSetOn(NSString *sym, BOOL on) {
     apEntDumpsSave();
 }
 // 冷启动/热触发: 重打所有 on=YES 点位(持久化执行核心)
-static void apEntDumpsApply(void) {
+void apEntDumpsApply(void) {
     apEntDumpsLoad();
     if (!g_entDumps.count) return;
     for (NSDictionary *d in g_entDumps) {
@@ -719,7 +719,7 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPKeychainStub;
 @end
 
-static void apEntDumpsApply(void);   // fwd: Boot 在定义前调用(持久化点位重打)
+void apEntDumpsApply(void);   // fwd: Boot 在定义前调用(持久化点位重打)
 
 static UITextView *g_apEditor = nil;
 @implementation MFPanelCtrl (AppPatch)
