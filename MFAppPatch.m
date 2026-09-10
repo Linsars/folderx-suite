@@ -137,15 +137,12 @@ static uintptr_t apMainImageBase(void) {
 }
 
 // ====== text patch: vm_protect 三步 (ReflixPatch 同款) ======
-static BOOL apTextPatch(uintptr_t fileOffAddr, NSData *expectOld, NSData *newBytes, NSString **err) {
-    // off 是相对主程序加载基址的 vm offset
-    uintptr_t base = apMainImageBase();
-    if (!base) { *err = @"no main image"; return NO; }
-    volatile uintptr_t target = base + fileOffAddr;
+// v2.57: 抽出 apTextPatchAt(绝对地址) — 主程序(text 规则)与框架(swifttext 规则)共用执行核
+static BOOL apTextPatchAt(uintptr_t target, NSData *expectOld, NSData *newBytes, NSString **err) {
     if (expectOld.length) {
         NSData *cur = [NSData dataWithBytes:(void*)target length:expectOld.length];
         if (![cur isEqualToData:expectOld]) {
-            *err = [NSString stringWithFormat:@"old mismatch @0x%lx: cur=%@ want=%@", (unsigned long)fileOffAddr, apBytesToHex(cur.bytes, cur.length), apBytesToHex(expectOld.bytes, expectOld.length)];
+            *err = [NSString stringWithFormat:@"old mismatch @%p: cur=%@ want=%@", (void*)target, apBytesToHex(cur.bytes, cur.length), apBytesToHex(expectOld.bytes, expectOld.length)];
             return NO;
         }
     }
@@ -162,6 +159,77 @@ static BOOL apTextPatch(uintptr_t fileOffAddr, NSData *expectOld, NSData *newByt
         return NO; // 字节已写, 权限没恢复 — 仍算半成功
     }
     return YES;
+}
+static BOOL apTextPatch(uintptr_t fileOffAddr, NSData *expectOld, NSData *newBytes, NSString **err) {
+    // off 是相对主程序加载基址的 vm offset
+    uintptr_t base = apMainImageBase();
+    if (!base) { *err = @"no main image"; return NO; }
+    return apTextPatchAt(base + fileOffAddr, expectOld, newBytes, err);
+}
+
+// ====== v2.57: 框架符号解析 + swifttext patch (链B交卷能力) ======
+// 镜像内符号表解析: LC_SYMTAB + __LINKEDIT slide 换算, 返回符号 vmaddr(镜像偏移)。
+// 侦查卡(F8)与 swifttext 执行器共用 — 定位能力单一实现。
+uintptr_t mfApSymVMAddr(const void *mh, const char *symName) {
+    if (!mh || !symName) return 0;
+    const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+    if (h->magic != MH_MAGIC_64) return 0;
+    const struct load_command *lc = (const struct load_command *)((const uint8_t *)h + sizeof(struct mach_header_64));
+    uint32_t symoff = 0, nsyms = 0, stroff = 0;
+    int64_t linkeditDelta = 0;   // vmaddr - fileoff: 文件偏移 → vmaddr 的换算常数
+    for (uint32_t c = 0; c < h->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
+        if (lc->cmd == LC_SYMTAB) {
+            const struct symtab_command *st = (const struct symtab_command *)lc;
+            symoff = st->symoff; nsyms = st->nsyms; stroff = st->stroff;
+        } else if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+            if (!strcmp(sg->segname, "__LINKEDIT"))
+                linkeditDelta = (int64_t)sg->vmaddr - (int64_t)sg->fileoff;
+        }
+    }
+    if (!nsyms || !symoff) return 0;
+    // 符号表在内存 = _dyld 已把整个 LINKEDIT 按文件布局映射: fileoff X 处的字节
+    // 落在 vmaddr = X + linkeditDelta, 再加 slide。这里返回 vmaddr(不含 slide)由调用方组合。
+    const struct nlist_64 *syms = (const struct nlist_64 *)((const uint8_t *)h + symoff + linkeditDelta);
+    const char *strtab = (const char *)((const uint8_t *)h + stroff + linkeditDelta);
+    // n_value 是镜像内 vmaddr — 对 __TEXT vmaddr=0 的标准 dylib 直接可用
+    for (uint32_t i = 0; i < nsyms; i++) {
+        if (!(syms[i].n_type & N_SECT) || !syms[i].n_value) continue;
+        const char *nm = strtab + syms[i].n_un.n_strx;
+        if (nm && !strcmp(nm, symName)) return (uintptr_t)syms[i].n_value;
+    }
+    return 0;
+}
+
+// swifttext 执行器: 按镜像名+符号名定位函数 → vm_protect 三步 patch 函数头
+// 规则: {"kind":"swifttext","img":"ScriptingKit","sym":"_$s12...hasValidD5Token...","new":"20008052c0035fd6"}
+//   old 可选(带 = 字节验证双保险; 不带 = 符号定位唯一保险)
+// patch 目标必须是 Swift 直呼函数(class method 非动态派发, bl 直达函数地址 —
+// hasValidToken/hasPro 均为此类, PurchaseManager.isProEnabled 直接 bl 汇聚点已实锤)
+static BOOL apSwiftTextPatch(NSString *imgName, NSString *symName, NSData *oldBytes, NSData *newBytes, NSString **err) {
+    if (imgName.length < 3 || symName.length < 4 || newBytes.length < 4) { *err = @"bad swifttext args"; return NO; }
+    // 1. 找镜像(名字 contains — ScriptingKit 匹配 "…/Scripting.app/Frameworks/ScriptingKit.framework/ScriptingKit")
+    const struct mach_header *mh = NULL;
+    intptr_t slide = 0;
+    const char *want = imgName.UTF8String;
+    uint32_t ic = _dyld_image_count();
+    for (uint32_t i = 0; i < ic; i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, want)) {
+            mh = _dyld_get_image_header(i);
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
+    }
+    if (!mh) { *err = [NSString stringWithFormat:@"image %@ not loaded", imgName]; return NO; }
+    // 2. 符号解析 → 绝对地址
+    uintptr_t vmAddr = mfApSymVMAddr(mh, symName.UTF8String);
+    if (!vmAddr) { *err = [NSString stringWithFormat:@"symbol not in %@", imgName]; return NO; }
+    uintptr_t abs = vmAddr + (uintptr_t)slide;
+    // 3. 执行 patch
+    BOOL ok = apTextPatchAt(abs, oldBytes, newBytes, err);
+    if (ok) apLog(@"[swifttext] %@ %@ vmaddr=%#lx abs=%#lx → patch OK", imgName, symName.lastPathComponent, (unsigned long)vmAddr, (unsigned long)abs);
+    return ok;
 }
 
 // ====== objc hook: 把方法 IMP 换成常量返回 ======
@@ -337,6 +405,12 @@ static void apApplyRules(void) {
                     NSData *new = apHexToBytes(p[@"new"] ?: @"");
                     if (!new.length) err = @"empty new bytes";
                     else ok = apTextPatch((uintptr_t)off, old, new, &err);
+                } else if ([kind isEqualToString:@"swifttext"]) {
+                    // v2.57: 框架内 Swift 符号定位 patch(链B能力: 扫描→定位→patch→持久化)
+                    NSData *old = apHexToBytes(p[@"old"] ?: @"");
+                    NSData *new = apHexToBytes(p[@"new"] ?: @"");
+                    if (!new.length) err = @"empty new bytes";
+                    else ok = apSwiftTextPatch(p[@"img"] ?: @"", p[@"sym"] ?: @"", old, new, &err);
                 } else if ([kind isEqualToString:@"keychain"]) {
                     // v2.56: Keychain 授权豁免(样本判定链数据源)
                     apKeychainInstall();
@@ -699,12 +773,12 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     [btnLog addTarget:g_mfCtrl action:@selector(mfAPShowLog) forControlEvents:UIControlEventTouchUpInside];
     [page addSubview:btnLog];
     y += 44;
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 60)];
-    note.text = @"规则: bid+ver 匹配 → method(swizzle) / text(vm_protect 写 __TEXT)。\n采集器: 周期快照 __TEXT 全段, 有外部写入即落盘 mf_patch_capture.json。\n引擎冷启动生效; 「立即应用」热触发。";
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 84)];
+    note.text = @"规则: bid+ver 匹配 → method(swizzle) / text(vm_protect) / swifttext(框架符号定位+patch)。\nswifttext = 侦查卡点位数据: 镜像符号解析 → vm_protect 三步 → 函数恒真。\n持久化: 引擎开启后每次冷启动自动重打(无 keychain 依赖); 「立即应用」热触发。";
     note.numberOfLines = 0;
     note.font = [UIFont systemFontOfSize:11];
     note.textColor = [UIColor secondaryLabelColor];
     [page addSubview:note];
-    y += 66;
+    y += 88;
     *yio = y;
 }

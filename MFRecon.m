@@ -11,6 +11,9 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <string.h>
 #import "MFPanel.h"
 
@@ -187,6 +190,65 @@ NSDictionary *mfReconFingerprint(void) {
         [lines addObject:[NSString stringWithFormat:@"SK 形态: %@ · 本地校验策略: %@", skType, validator]];
     }
 
+    // ---- F8 entitlement 判定点位扫描(v2.57 链B: 扫描→定位, 产出可 patch 数据) ----
+    // 对已加载的全部非系统框架(dylib, 非主程序)做符号表扫描, 找权益判定函数:
+    //   Swift: *ProAccess*/*Entitlement*/*hasPro*/*hasValid*Token* 类的 Sb 返回值方法
+    // 产出: {img, sym, vmaddr} 列表 — 供实验模拟页 AppPatch 引擎 swifttext 规则直接消费
+    NSMutableArray *entFuncs = [NSMutableArray array];
+    {
+        uint32_t ic = _dyld_image_count();
+        for (uint32_t i = 0; i < ic && entFuncs.count < 24; i++) {
+            const char *n = _dyld_get_image_name(i);
+            if (!n) continue;
+            NSString *full = [NSString stringWithUTF8String:n];
+            // 只扫 app 自带框架(Containers/Bundle 路径), 排除系统库噪音
+            if (![full containsString:@".app/Frameworks/"]) continue;
+            const struct mach_header *mh = _dyld_get_image_header(i);
+            intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+            // 符号表扫描: entitlement 判定模式
+            const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
+            if (!h || h->magic != MH_MAGIC_64) continue;
+            const struct load_command *lc = (const struct load_command *)((const uint8_t *)h + sizeof(struct mach_header_64));
+            uint32_t symoff = 0, nsyms = 0, stroff = 0; int64_t lDelta = 0;
+            for (uint32_t c = 0; c < h->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
+                if (lc->cmd == LC_SYMTAB) { const struct symtab_command *st = (const struct symtab_command *)lc; symoff = st->symoff; nsyms = st->nsyms; stroff = st->stroff; }
+                else if (lc->cmd == LC_SEGMENT_64) { const struct segment_command_64 *sg = (const struct segment_command_64 *)lc; if (!strcmp(sg->segname, "__LINKEDIT")) lDelta = (int64_t)sg->vmaddr - (int64_t)sg->fileoff; }
+            }
+            if (!nsyms || !symoff) continue;
+            const struct nlist_64 *syms = (const struct nlist_64 *)((const uint8_t *)h + symoff + lDelta);
+            const char *strtab = (const char *)((const uint8_t *)h + stroff + lDelta);
+            static NSArray *kEntPats; static dispatch_once_t o;
+            dispatch_once(&o, ^{ kEntPats = @[@"ProAccessGuard", @"EntitlementOracle", @"hasValidD5Token",
+                                              @"03hascD03now", @"hasProAccess"]; });
+            unsigned imgHits = 0;
+            for (uint32_t k = 0; k < nsyms && imgHits < 8; k++) {
+                if (!(syms[k].n_type & N_SECT) || !syms[k].n_value) continue;
+                const char *nm = strtab + syms[k].n_un.n_strx;
+                if (!nm || !(nm[0] == '_' && nm[1] == '$')) continue;   // Swift mangled only
+                for (NSString *pat in kEntPats) {
+                    if (strstr(nm, pat.UTF8String)) {
+                        [entFuncs addObject:@{
+                            @"img": full.lastPathComponent,
+                            @"sym": [NSString stringWithUTF8String:nm],
+                            @"vmaddr": @((unsigned long)syms[k].n_value),
+                            @"slide": @((long)slide),
+                        }];
+                        imgHits++;
+                        break;
+                    }
+                }
+            }
+        }
+        if (entFuncs.count) {
+            [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(可 patch) — 见实验模拟页", (unsigned long)entFuncs.count]];
+            for (NSDictionary *f in [entFuncs subarrayWithRange:NSMakeRange(0, MIN(4, entFuncs.count))]) {
+                NSString *s = f[@"sym"] ?: @"";
+                NSString *tail = s.length > 46 ? [s substringFromIndex:s.length - 46] : s;
+                [lines addObject:[NSString stringWithFormat:@"  %@:%#lx …%@", f[@"img"], [f[@"vmaddr"] unsignedLongValue], tail]];
+            }
+        } else [lines addObject:@"entitlement 判定点位: 未发现(已加载框架符号表无 Pro/Entitlement 判定函数)"];
+    }
+
     // ---- 判定(动态拼接, 可叠加: Reflix = 云+mach 双面) ----
     BOOL cloud = cloudBrands.count > 0;
     // F7 服务器权益型(2026-09-06 mailnow 案定案): 无云 SDK + 纯 SK + WebView 权益标志(FlexCall/loadSuccess
@@ -220,7 +282,8 @@ NSDictionary *mfReconFingerprint(void) {
 
     return @{@"verdict": verdict, @"lines": lines,
              @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide),
-             @"sktype": skType, @"validator": validator};
+             @"sktype": skType, @"validator": validator,
+             @"entFuncs": entFuncs};
 }
 
 // ===== 详情页(面板导航, 可滚动可长按选中复制) =====
@@ -240,6 +303,66 @@ static void mfReconShowDetailPage(NSDictionary *recon);   // 前置
     mfPopPage();
     mfShowNetAnalyzerPage();   // v2.50.0: 实时捕获开关在网络分析页(原误跳捕获列表)
 }
+// v2.57 链B交卷: 侦查卡点位 → swifttext 规则(JSON) → 实验模拟页 AppPatch 引擎
+// patch 字节 = mov w0,#1; ret (20008052 c0035fd6) — Sb 返回值判定函数恒 true
+- (void)mfReconGenEntPatch {
+    NSArray *entFuncs = objc_getAssociatedObject(self, "reconEntFuncs");
+    if (![entFuncs isKindOfClass:[NSArray class]] || !entFuncs.count) { mfToast(@"无点位数据"); return; }
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    // 现规则表 → 追加/更新本 bid 的 swifttext 条目
+    extern NSString *mfAppPatchRulesJSON(void);
+    extern void mfAppPatchSetRulesJSON(NSString *);
+    NSArray *rules = nil;
+    {
+        NSData *rd = [mfAppPatchRulesJSON() dataUsingEncoding:NSUTF8StringEncoding];
+        rules = [NSJSONSerialization JSONObjectWithData:rd options:0 error:nil];
+        if (![rules isKindOfClass:[NSArray class]]) rules = @[];
+    }
+    // 目标只挑返回值型判定函数(hasValidToken/hasPro 型), 排除 getter/构造器噪音
+    NSMutableArray *patches = [NSMutableArray array];
+    for (NSDictionary *f in entFuncs) {
+        NSString *sym = f[@"sym"] ?: @"";
+        if (![sym hasPrefix:@"_$s"]) continue;
+        if ([sym containsString:@"cfC"] || [sym containsString:@"Ma"] || [sym containsString:@"vpMV"] ||
+            [sym containsString:@"vpfi"] || [sym containsString:@"WOh"] || [sym containsString:@"WOe"]) continue;
+        // 只要 Sb 返回值的判定型(tF 结尾 = throws-free func)
+        if (![sym hasSuffix:@"tF"] && ![sym hasSuffix:@"tFTu"]) continue;
+        [patches addObject:@{
+            @"kind": @"swifttext",
+            @"img": f[@"img"] ?: @"",
+            @"sym": sym,
+            @"new": @"20008052c0035fd6",   // mov w0,#1; ret
+            @"note": @"ent恒真",
+        }];
+    }
+    if (!patches.count) { mfToast(@"点位里无可 patch 判定函数(需 tF 返回值型)"); return; }
+    // 更新 bid 规则
+    NSMutableArray *newRules = [rules mutableCopy];
+    NSUInteger found = NSNotFound;
+    for (NSUInteger i = 0; i < newRules.count; i++)
+        if ([[newRules[i] objectForKey:@"bid"] isEqualToString:bid]) { found = i; break; }
+    NSDictionary *rule = @{@"bid": bid, @"ver": @"", @"note": @"侦查卡生成的 entitlement 判定 patch",
+                           @"patches": patches};
+    if (found != NSNotFound) {
+        // 合并: 保留原 patches 里非 swifttext 的
+        NSMutableArray *merged = [[newRules[found] objectForKey:@"patches"] mutableCopy] ?: [NSMutableArray array];
+        for (NSDictionary *p in merged.copy) if ([p[@"kind"] isEqualToString:@"swifttext"]) [merged removeObject:p];
+        [merged addObjectsFromArray:patches];
+        newRules[found] = @{@"bid": bid, @"ver": @"", @"note": @"侦查卡生成的 entitlement 判定 patch",
+                            @"patches": merged};
+    } else [newRules addObject:rule];
+    NSData *out = [NSJSONSerialization dataWithJSONObject:newRules options:NSJSONWritingPrettyPrinted error:nil];
+    mfAppPatchSetRulesJSON([[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding]);
+    // 开引擎 + 立即应用
+    extern BOOL mfPrefBool(NSString *, BOOL);
+    extern void mfSetBoolPref(NSString *, BOOL);
+    extern void mfAppPatchBoot(void);
+    NSString *pk = [NSString stringWithFormat:@"mfAppPatchEnabled_%@", bid];
+    if (!mfPrefBool(pk, NO)) mfSetBoolPref(pk, YES);
+    mfAppPatchBoot();
+    mfToast([NSString stringWithFormat:@"已生成 %lu 条判定 patch + 引擎开启(冷启动自动重打)", (unsigned long)patches.count]);
+    [self mfReconGoLab];
+}
 @end
 static void mfReconShowDetailPage(NSDictionary *recon) {
     UIView *page = mfMakePage(@"侦查详情", YES);
@@ -252,6 +375,21 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
     [page addSubview:v];
 
     CGFloat tvY = 96;
+    NSArray *entFuncs = recon[@"entFuncs"];
+    if ([entFuncs isKindOfClass:[NSArray class]] && entFuncs.count) {
+        // v2.57 链B: 发现 entitlement 判定点位 → 一键生成 swifttext 规则进实验模拟页
+        UIButton *gen = [UIButton buttonWithType:UIButtonTypeSystem];
+        gen.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
+        gen.backgroundColor = [UIColor systemOrangeColor];
+        gen.layer.cornerRadius = 9;
+        [gen setTitle:[NSString stringWithFormat:@"🎯 生成判定点位 patch 规则(%lu 个)", (unsigned long)entFuncs.count] forState:UIControlStateNormal];
+        [gen setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        gen.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        [gen addTarget:page action:NSSelectorFromString(@"mfReconGenEntPatch") forControlEvents:UIControlEventTouchUpInside];
+        objc_setAssociatedObject(page, "reconEntFuncs", entFuncs, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [page addSubview:gen];
+        tvY = 142;
+    }
     if ([recon[@"cloud"] boolValue]) {
         UIButton *lab = [UIButton buttonWithType:UIButtonTypeSystem];
         lab.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
