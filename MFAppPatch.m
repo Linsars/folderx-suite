@@ -24,13 +24,14 @@
 #import <mach/vm_map.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
-#import <dlfcn.h>
+#import <mach-o/nlist.h>   // v2.57: nlist_64/N_SECT(swifttext 符号解析) — 必须在 dyld.h 后
 #import <objc/runtime.h>
 #import <libkern/OSCacheControl.h>
 #import <Security/Security.h>   // v2.56: SecItemCopyMatching hook(样本授权判定数据源)
 #import "fishhook.h"            // v2.56: fishhook rebind(样本判定链解锁)
 #import <objc/message.h>        // v2.56.3: objc_msgSend(CloudKit hook 运行时构造 CKRecordID)
 #include <sys/sysctl.h>
+#include <dlfcn.h>              // v2.57: dlfcn 补回(上一步 edit 误删)
 
 #import "MFPanel.h"
 
