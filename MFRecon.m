@@ -164,18 +164,43 @@ NSDictionary *mfReconFingerprint(void) {
         NSMutableArray *scanBlobs = [NSMutableArray array];
         if (d.length) [scanBlobs addObject:d];   // 主二进制(p/n 可能截断, 用原 d)
         {
+            // v2.58.5: 框架扫描改内存直读(__objc_methname + strtab) — v2.58.4 磁盘整文件 mmap 两条死路:
+            //   ① Python 型 app(Scripting) 框架数百个(stdlib 全独立打包), 6-blob 配额被 stdlib 链占满,
+            //      ScriptingKit 进不了扫描集 → SK 形态永远"未知"(实测设备日志实锤: F8 同刻已命中 ScriptingKit)
+            //   ② 115MB 大文件磁盘 mmap 在部分环境返回 nil。
+            //   特征串实际住处: SK1 selector 在 __TEXT.__objc_methname; SK2 Swift 符号/C import 在
+            //   __LINKEDIT strtab — 两区每框架共几十 KB, 全量扫无配额; 内存地址算法与 F8 符号扫描同源(已实证)。
             uint32_t ic = _dyld_image_count();
-            for (uint32_t i = 0; i < ic; i++) {
+            NSUInteger blobBytes = 0;
+            for (uint32_t i = 0; i < ic && blobBytes < 96u * 1024 * 1024; i++) {
                 const char *nmI = _dyld_get_image_name(i);
                 if (!nmI) continue;
                 NSString *full = [NSString stringWithUTF8String:nmI];
                 if (![full containsString:@".app/Frameworks/"]) continue;
-                // v2.58.1 修复: SK 特征串(如 currentEntitlements)在 Swift 符号表里 = __LINKEDIT,
-                //   不在 __TEXT — ScriptingKit 实测 currentEntitlements 在文件偏移 47.8MB,
-                //   __TEXT 只到 43.9MB。改用磁盘整文件 mmap(与主二进制同款读法), 覆盖 LINKEDIT。
-                NSData *fd = [NSData dataWithContentsOfFile:full options:NSDataReadingMappedIfSafe error:nil];
-                if (fd.length > 0x10000) [scanBlobs addObject:fd];
-                if (scanBlobs.count >= 6) break;   // 大 app 框架多, 限 6 个
+                const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
+                if (!h || h->magic != MH_MAGIC_64) continue;
+                intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+                const struct load_command *lc = (const struct load_command *)((const uint8_t *)h + sizeof(struct mach_header_64));
+                int64_t lDelta = 0; uint32_t strsize = 0;
+                for (uint32_t c = 0; c < h->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
+                    if (lc->cmd == LC_SEGMENT_64) {
+                        const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+                        if (!strcmp(sg->segname, "__LINKEDIT")) lDelta = (int64_t)sg->vmaddr - (int64_t)sg->fileoff;
+                        else if (!strcmp(sg->segname, "__TEXT")) {
+                            const struct section_64 *sects = (const struct section_64 *)((const uint8_t *)sg + sizeof(struct segment_command_64));
+                            for (uint32_t s = 0; s < sg->nsects; s++) {
+                                if (!strcmp(sects[s].sectname, "__objc_methname") && sects[s].size) {
+                                    [scanBlobs addObject:[NSData dataWithBytes:(const void *)(uintptr_t)(sects[s].addr + (uint64_t)slide) length:(NSUInteger)sects[s].size]];
+                                    blobBytes += sects[s].size;
+                                }
+                            }
+                        }
+                    } else if (lc->cmd == LC_SYMTAB) {
+                        strsize = ((const struct symtab_command *)lc)->strsize;
+                        if (strsize) [scanBlobs addObject:[NSData dataWithBytes:(const void *)((const uint8_t *)h + ((const struct symtab_command *)lc)->stroff + lDelta) length:strsize]];
+                        blobBytes += strsize;
+                    }
+                }
             }
         }
         // runtime 类扫描(主二进制): 收据验证库指纹
