@@ -451,7 +451,7 @@ static void apEntDumpsLoad(void) {
     dispatch_once(&once, ^{
         id raw = mfReadPrefObj([NSString stringWithFormat:@"mfEntDumps_%@", apCurBundleID()]);
         if ([raw isKindOfClass:[NSString class]]) {
-            NSArray *a = [NSJSONSerialization JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+            NSArray *a = [NSJSONSerialization JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding] options:NSJSONReadingMutableContainers error:nil];
             if ([a isKindOfClass:[NSArray class]]) g_entDumps = [a mutableCopy];
         }
         if (!g_entDumps) g_entDumps = [NSMutableArray new];

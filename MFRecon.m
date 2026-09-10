@@ -170,21 +170,11 @@ NSDictionary *mfReconFingerprint(void) {
                 if (!nmI) continue;
                 NSString *full = [NSString stringWithUTF8String:nmI];
                 if (![full containsString:@".app/Frameworks/"]) continue;
-                const struct mach_header *mh = _dyld_get_image_header(i);
-                if (!mh || ((const struct mach_header_64 *)mh)->magic != MH_MAGIC_64) continue;
-                // __TEXT 已映射在内存: 段头给 vmsize, 直接按 (mh + vmaddr) 取数据 —
-                //   vmaddr 从 0 起(dylib 标准), 起点就是 mach_header 本身
-                const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
-                for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
-                    if (lc->cmd == LC_SEGMENT_64) {
-                        const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-                        if (!strcmp(sg->segname, "__TEXT")) {
-                            NSData *fd = [NSData dataWithBytes:(const void *)mh length:sg->filesize];
-                            if (fd.length > 0x10000) [scanBlobs addObject:fd];
-                            break;
-                        }
-                    }
-                }
+                // v2.58.1 修复: SK 特征串(如 currentEntitlements)在 Swift 符号表里 = __LINKEDIT,
+                //   不在 __TEXT — ScriptingKit 实测 currentEntitlements 在文件偏移 47.8MB,
+                //   __TEXT 只到 43.9MB。改用磁盘整文件 mmap(与主二进制同款读法), 覆盖 LINKEDIT。
+                NSData *fd = [NSData dataWithContentsOfFile:full options:NSDataReadingMappedIfSafe error:nil];
+                if (fd.length > 0x10000) [scanBlobs addObject:fd];
                 if (scanBlobs.count >= 6) break;   // 大 app 框架多, 限 6 个
             }
         }
