@@ -709,11 +709,17 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPRulesEditorSave;
 - (void)mfAPApplyNow;
 - (void)mfAPShowLog;
+@end
+
+// v2.58: 判定点操作方法在独立 category(列表类需文件作用域)
+@interface MFPanelCtrl (AppPatchEnt)
 - (void)mfAPShowEntDumps;
 - (void)mfAPEntPatchNow:(NSString *)sym;
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
 - (void)mfAPKeychainStub;
 @end
+
+static void apEntDumpsApply(void);   // fwd: Boot 在定义前调用(持久化点位重打)
 
 static UITextView *g_apEditor = nil;
 @implementation MFPanelCtrl (AppPatch)
@@ -771,7 +777,10 @@ static UITextView *g_apEditor = nil;
     mfPushPage(page);
 }
 // ====== v2.58: 判定点卡片页(productID 捕获列表同款: UITableView + 左划) ======
+@end
+
 // 独立列表类(对标 MFScanList): items = mfAppPatchEntDumps() 的 {img,sym,vmaddr,on}
+// (v2.58 修复: 独立 @implementation 不能嵌在 category 内 — 移到文件作用域)
 @interface MFAPEntList : NSObject <UITableViewDataSource, UITableViewDelegate>
 @property (copy) NSArray *items;
 @end
@@ -803,9 +812,10 @@ static UITextView *g_apEditor = nil;
     st.frame = CGRectMake(16, 39, w - 16, 15);
     // 函数名显示: mangled 尾段人类可读化(_$s 前缀剥掉, 取后 44 字符)
     NSString *sym = d[@"sym"] ?: @"";
+    NSString *img = d[@"img"] ?: @"";
     NSString *pretty = sym;
     if ([sym hasPrefix:@"_$s"]) {
-        NSArray *parts = [sym componentsSeparatedByString:@"9ScriptingKit"];
+        NSArray *parts = [sym componentsSeparatedByString:[img length] ? img : @"9NoMatchFramework"];
         pretty = parts.count > 1 ? [NSString stringWithFormat:@"SDK%@", parts.lastObject] : sym;
     }
     fn.text = pretty.length > 52 ? [NSString stringWithFormat:@"…%@", [pretty substringFromIndex:pretty.length - 52]] : pretty;
@@ -838,6 +848,9 @@ static UITextView *g_apEditor = nil;
     return [UISwipeActionsConfiguration configurationWithActions:@[patch, persist]];
 }
 @end
+
+// category 续: 判定点操作方法(列表类之后重新开)
+@implementation MFPanelCtrl (AppPatchEnt)
 static MFAPEntList *g_apEntList = nil;
 - (void)mfAPShowEntDumps {
     UIView *page = mfMakePage(@"🎯 判定点", YES);
@@ -860,7 +873,7 @@ static MFAPEntList *g_apEntList = nil;
         NSData *newBytes = apHexToBytes(@"20008052c0035fd6");
         if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
             g_apHits++;
-            apLog(@"[entdump] ⚡ %@ 立即 patch OK", sym.lastPathComponent ?: sym);
+            apLog(@"[entdump] ⚡ %@ 立即 patch OK", sym);
             mfToast(@"⚡ 已 patch");
         } else mfToast(err ?: @"patch 失败");
         return;
