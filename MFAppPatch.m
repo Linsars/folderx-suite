@@ -431,16 +431,13 @@ static void apApplyRules(void) {
 }
 
 // 引擎拉起: 主线程延迟执行 (dyld 阶段 ObjC 类未注册完, 太早 hook 会 miss)
-// v2.56.4: keychain+cloudkit 豁免双腿 = 引擎 ON 即装(立即, 不等 1.5s):
-//   ★经验教训: 规则表只写 keychain → cloudkit 腿漏装 → 判定链缺腿不亮。
-//   豁免是进程级全局行为, 与规则表(bid/ver 定向 method/text)解耦, 不依赖规则条目。
-//   立即装也避免样本在 1.5s 窗口内先调 fetchUserRecordID(拿到真 cloudid 后缓存, 不再调)。
+// v2.57.1: 拆除 keychain/cloudkit 豁免双腿自动安装——样本退役后它们只剩污染:
+//   ScriptingKit 自己读 kcp.ent.snapshot.v1 会被喂假数据 "OK" → 票据解码必失败。
+//   豁免 hook 仍保留实现, 规则表显式写 kind=keychain/cloudkit 才装(向后兼容)。
 void mfAppPatchBoot(void) {
     if (!mfAppPatchIsOn()) return;
-    apKeychainInstall();       // v2.56.0: Keychain 豁免(样本判定链数据源)
-    apCloudKitInstall();       // v2.56.3: CloudKit 豁免(样本判定链另一腿: 云端身份)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        apApplyRules();        // 规则表只管 method/text 定向补丁(类注册齐后)
+        apApplyRules();        // 规则表: method/text/swifttext 定向补丁(类注册齐后)
     });
     apInstallCollectors(); // 采集器顺带装上 (内部自判开关)
 }
@@ -731,11 +728,11 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         sw.on = mfAppPatchIsOn();
         [sw addTarget:g_mfCtrl action:@selector(mfAPSwitchChanged:) forControlEvents:UIControlEventValueChanged];
         [bar addSubview:sw];
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(72, 6, g_mfCardW - 96 - 10, 22)];
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(72, 5, g_mfCardW - 84, 22)];
         l.text = @"⚙️ patch 引擎";
         l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         [bar addSubview:l];
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(72, 28, g_mfCardW - 96 - 10, 18)];
+        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(72, 27, g_mfCardW - 84, 22)];
         st.text = [NSString stringWithFormat:@"objc swizzle + vm_protect · 命中 %ld", g_apHits];
         st.font = [UIFont systemFontOfSize:11];
         st.textColor = [UIColor secondaryLabelColor];
@@ -751,11 +748,11 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         sw.on = mfAppPatchCollIsOn();
         [sw addTarget:g_mfCtrl action:@selector(mfAPCollSwitchChanged:) forControlEvents:UIControlEventValueChanged];
         [bar addSubview:sw];
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(72, 6, g_mfCardW - 96 - 10, 22)];
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(72, 5, g_mfCardW - 84, 22)];
         l.text = @"📡 补丁点位采集器";
         l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         [bar addSubview:l];
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(72, 28, g_mfCardW - 96 - 10, 18)];
+        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(72, 27, g_mfCardW - 84, 22)];
         st.text = [NSString stringWithFormat:@"被动快照 diff · 采集 %ld", g_apCollHits];
         st.font = [UIFont systemFontOfSize:11];
         st.textColor = [UIColor secondaryLabelColor];

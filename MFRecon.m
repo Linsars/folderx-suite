@@ -221,10 +221,21 @@ NSDictionary *mfReconFingerprint(void) {
             dispatch_once(&o, ^{ kEntPats = @[@"ProAccessGuard", @"EntitlementOracle", @"hasValidD5Token",
                                               @"03hascD03now", @"hasProAccess"]; });
             unsigned imgHits = 0;
-            for (uint32_t k = 0; k < nsyms && imgHits < 8; k++) {
+            for (uint32_t k = 0; k < nsyms && imgHits < 12; k++) {
                 if (!(syms[k].n_type & N_SECT) || !syms[k].n_value) continue;
                 const char *nm = strtab + syms[k].n_un.n_strx;
                 if (!nm || !(nm[0] == '_' && nm[1] == '$')) continue;   // Swift mangled only
+                // v2.57.1 正向过滤(只收真判定函数): Sb(Bool)返回 + tF(函数)/vg(getter)结尾。
+                //   首版 8 个配额被 refreshStoreD0 闭包 thunk(yyYacfU_TATQ0_)占满, hasValidToken 没进表。
+                size_t nl = strlen(nm);
+                if (nl < 8) continue;
+                BOOL endF = !strcmp(nm + nl - 2, "tF");
+                BOOL endG = !strcmp(nm + nl - 2, "vg");
+                if (!endF && !endG) continue;          // thunk(TQ0_/TA/yyYacfU)/async(tYaF)/metadata 全排除
+                if (!strstr(nm, "Sb")) continue;        // 非 Bool 返回不打
+                // v2.57.1: 返回类型是 y(void)开头的多参函数不打 — "ySb_S2b"(refreshFromPurchaseState)
+                //   含 "Sb" 字样但是参数不是返回值, 打恒真会破坏正常购买流程
+                if (endF && strstr(nm, "ySb")) continue;
                 for (NSString *pat in kEntPats) {
                     if (strstr(nm, pat.UTF8String)) {
                         [entFuncs addObject:@{
@@ -318,15 +329,20 @@ static void mfReconShowDetailPage(NSDictionary *recon);   // 前置
         rules = [NSJSONSerialization JSONObjectWithData:rd options:0 error:nil];
         if (![rules isKindOfClass:[NSArray class]]) rules = @[];
     }
-    // 目标只挑返回值型判定函数(hasValidToken/hasPro 型), 排除 getter/构造器噪音
+    // 目标 = F8 同款正向过滤(Sb 返回 + tF/vg 真函数; thunk/metadata 排除)
     NSMutableArray *patches = [NSMutableArray array];
     for (NSDictionary *f in entFuncs) {
         NSString *sym = f[@"sym"] ?: @"";
         if (![sym hasPrefix:@"_$s"]) continue;
-        if ([sym containsString:@"cfC"] || [sym containsString:@"Ma"] || [sym containsString:@"vpMV"] ||
-            [sym containsString:@"vpfi"] || [sym containsString:@"WOh"] || [sym containsString:@"WOe"]) continue;
-        // 只要 Sb 返回值的判定型(tF 结尾 = throws-free func)
-        if (![sym hasSuffix:@"tF"] && ![sym hasSuffix:@"tFTu"]) continue;
+        // thunk/async/特殊段后缀全排除(TQ0_/TA/Tu/yyYacfU/fA_/vpMV/Wl 等)
+        if ([sym containsString:@"yyYacfU"] || [sym containsString:@"_fU_"] ||
+            [sym containsString:@"cfC"] || [sym containsString:@"vpMV"] ||
+            [sym containsString:@"vpfi"] || [sym containsString:@"WOh"] ||
+            [sym containsString:@"WOe"] || [sym containsString:@"fA_"] ||
+            [sym containsString:@"TQ"] || [sym hasSuffix:@"Tu"]) continue;
+        if (![sym hasSuffix:@"tF"] && ![sym hasSuffix:@"vg"]) continue;   // 真函数本体
+        if (![sym containsString:@"Sb"]) continue;                        // Bool 返回值型
+        if ([sym containsString:@"ySb"]) continue;                        // v2.57.1: void 返回多参函数不打(refreshFromPurchaseState)
         [patches addObject:@{
             @"kind": @"swifttext",
             @"img": f[@"img"] ?: @"",

@@ -1477,19 +1477,9 @@ void mfShowLabPage(void) {
     // v2.56: patch 引擎(规则驱动: method swizzle / text vm_protect / keychain 授权豁免)
     //   ——学习自 ScriptingPass 判定链的落地容器。规则格式: mfAppPatchRules JSON
     //   [{"bid":"com.scripting.ios","ver":"","patches":[{"kind":"keychain"}]}]
-    CGFloat apY = 368;
+    CGFloat apY = 304;   // v2.57.1: L1 行(296 结束)+8 — 原mach应答器删除留下的 72px 死区收回
     extern void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio);
     mfAppPatchSectionInLabPage(page, &apY);
-
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, apY + 8, g_mfCardW - 32, 80)];
-    note.text = @"patch 规则: bid+ver 匹配 → method(swizzle)/text(vm_protect)/keychain(授权豁免)。\n规则 JSON 在 mfAppPatchRules(设置页/手动写入)。\n冷启动生效(重开 app)。";
-    note.numberOfLines = 0;
-    note.font = [UIFont systemFontOfSize:12];
-    note.textColor = [UIColor secondaryLabelColor];
-    [page addSubview:note];
-
-
-
 
     mfPushPage(page);
 }
