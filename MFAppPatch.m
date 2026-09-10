@@ -430,20 +430,77 @@ static void apApplyRules(void) {
     }
 }
 
-// 引擎拉起: 主线程延迟执行 (dyld 阶段 ObjC 类未注册完, 太早 hook 会 miss)
-// v2.57.1: 拆除 keychain/cloudkit 豁免双腿自动安装——样本退役后它们只剩污染:
-//   ScriptingKit 自己读 kcp.ent.snapshot.v1 会被喂假数据 "OK" → 票据解码必失败。
-//   豁免 hook 仍保留实现, 规则表显式写 kind=keychain/cloudkit 才装(向后兼容)。
+// 引擎拉起: v2.58 判定点驱动 — 无开关: 有持久化点位(mfEntDumps)即自动重打。
+//   扫描(F8) → 点卡片左划[patch+持久化] → 存 mfEntDumps_<bid> → 冷启动走这里自动重打。
+//   keychain/cloudkit 豁免已退役(v2.57.1 拆除, 样本退役后只剩污染)。
 void mfAppPatchBoot(void) {
-    if (!mfAppPatchIsOn()) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        apApplyRules();        // 规则表: method/text/swifttext 定向补丁(类注册齐后)
+        apEntDumpsApply();     // 持久化点位重打(核心)
+        apApplyRules();        // 规则表(text/method 手工高级用法, 判定点主流程不依赖)
     });
-    apInstallCollectors(); // 采集器顺带装上 (内部自判开关)
 }
 
-// ==================================================================
-// 采集器 v2.22: 磁盘文件基线 + 内存对照 (被动, 零 hook)
+// ====== v2.58: 判定点持久化(替代规则表 JSON 手编) ======
+// 存储格式: prefs mfEntDumps_<bid> = [{img,sym,note,on}] — 点位数据由侦查卡 F8 扫描产出,
+// 用户在实验模拟页判定点卡片上左划 [patch] / [持久化开关], 冷启动 Boot 自动重打已开启项。
+// 规则表 mfAppPatchRules 仍保留(text/method 手工高级用法), 但判定点主流程不再依赖它。
+static NSMutableArray *g_entDumps = nil;
+static void apEntDumpsLoad(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        id raw = mfReadPrefObj([NSString stringWithFormat:@"mfEntDumps_%@", apCurBundleID()]);
+        if ([raw isKindOfClass:[NSString class]]) {
+            NSArray *a = [NSJSONSerialization JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+            if ([a isKindOfClass:[NSArray class]]) g_entDumps = [a mutableCopy];
+        }
+        if (!g_entDumps) g_entDumps = [NSMutableArray new];
+    });
+}
+static void apEntDumpsSave(void) {
+    NSData *d = [NSJSONSerialization dataWithJSONObject:g_entDumps options:0 error:nil];
+    if (d) mfWritePrefObj([NSString stringWithFormat:@"mfEntDumps_%@", apCurBundleID()],
+                          [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]);
+}
+NSArray *mfAppPatchEntDumps(void) { apEntDumpsLoad(); return g_entDumps; }
+// F8 扫描点位合并进持久存储(去重: img+sym 相同视为同点)
+void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
+    if (![newOnes isKindOfClass:[NSArray class]]) return;
+    apEntDumpsLoad();
+    for (NSDictionary *n in newOnes) {
+        if (![n isKindOfClass:[NSDictionary class]]) continue;
+        BOOL dup = NO;
+        for (NSDictionary *o in g_entDumps)
+            if ([o[@"img"] isEqualToString:n[@"img"]] && [o[@"sym"] isEqualToString:n[@"sym"]]) { dup = YES; break; }
+        if (!dup) {
+            NSMutableDictionary *m = [n mutableCopy];
+            m[@"on"] = @NO;                       // 新点位默认未开启(用户左划持久化才开)
+            [g_entDumps addObject:m];
+        }
+    }
+    apEntDumpsSave();
+}
+void mfAppPatchEntDumpSetOn(NSString *sym, BOOL on) {
+    apEntDumpsLoad();
+    for (NSMutableDictionary *m in g_entDumps)
+        if ([m[@"sym"] isEqualToString:sym]) { m[@"on"] = @(on); break; }
+    apEntDumpsSave();
+}
+// 冷启动/热触发: 重打所有 on=YES 点位(持久化执行核心)
+static void apEntDumpsApply(void) {
+    apEntDumpsLoad();
+    if (!g_entDumps.count) return;
+    for (NSDictionary *d in g_entDumps) {
+        if (![d[@"on"] boolValue]) continue;
+        NSString *err = nil;
+        NSData *newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
+        if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
+            g_apHits++;
+            apLog(@"[entdump] ✓ %@ 持久化 patch 重打", [d[@"sym"] lastPathComponent]);
+        } else apLog(@"[entdump] ✗ %@: %@", d[@"sym"], err);
+    }
+}
+long mfAppPatchEntDumpCount(void) { apEntDumpsLoad(); return g_entDumps.count; }
+
 // v2.21 教训: 内存首拍在 ctor 才拍, 而 TrollFools 注入的补丁 dylib
 // 初始化更早 — patch 在基线之前就打完了, 内存 diff 永远是 0 (假阴性)
 // 破法: ReflixiOS 二进制文件 = 原始字节 (主程序 vmaddr偏移==文件偏移),
@@ -652,6 +709,10 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPRulesEditorSave;
 - (void)mfAPApplyNow;
 - (void)mfAPShowLog;
+- (void)mfAPShowEntDumps;
+- (void)mfAPEntPatchNow:(NSString *)sym;
+- (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
+- (void)mfAPKeychainStub;
 @end
 
 static UITextView *g_apEditor = nil;
@@ -709,74 +770,174 @@ static UITextView *g_apEditor = nil;
     [page addSubview:tv];
     mfPushPage(page);
 }
+// ====== v2.58: 判定点卡片页(productID 捕获列表同款: UITableView + 左划) ======
+// 独立列表类(对标 MFScanList): items = mfAppPatchEntDumps() 的 {img,sym,vmaddr,on}
+@interface MFAPEntList : NSObject <UITableViewDataSource, UITableViewDelegate>
+@property (copy) NSArray *items;
+@end
+@implementation MFAPEntList
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s { return self.items.count; }
+- (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip { return 64; }
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    static NSString *idt = @"mfEntRow";
+    UITableViewCell *c = [tv dequeueReusableCellWithIdentifier:idt];
+    if (!c) {
+        c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:idt];
+        c.backgroundColor = UIColor.clearColor;
+        c.selectionStyle = UITableViewCellSelectionStyleNone;
+        UILabel *fn = [UILabel new]; fn.tag = 201;
+        fn.font = [UIFont fontWithName:@"Menlo" size:11]; fn.textColor = [UIColor labelColor];
+        fn.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        UILabel *loc = [UILabel new]; loc.tag = 202;
+        loc.font = [UIFont fontWithName:@"Menlo" size:9.5]; loc.textColor = [UIColor secondaryLabelColor];
+        loc.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        UILabel *st = [UILabel new]; st.tag = 203;
+        st.font = [UIFont systemFontOfSize:10]; st.textColor = [UIColor tertiaryLabelColor];
+        [c.contentView addSubview:fn]; [c.contentView addSubview:loc]; [c.contentView addSubview:st];
+    }
+    NSDictionary *d = self.items[ip.row];
+    CGFloat w = g_mfCardW - 32;
+    UILabel *fn = [c.contentView viewWithTag:201], *loc = [c.contentView viewWithTag:202], *st = [c.contentView viewWithTag:203];
+    fn.frame = CGRectMake(16, 5, w - 16, 17);
+    loc.frame = CGRectMake(16, 22, w - 16, 15);
+    st.frame = CGRectMake(16, 39, w - 16, 15);
+    // 函数名显示: mangled 尾段人类可读化(_$s 前缀剥掉, 取后 44 字符)
+    NSString *sym = d[@"sym"] ?: @"";
+    NSString *pretty = sym;
+    if ([sym hasPrefix:@"_$s"]) {
+        NSArray *parts = [sym componentsSeparatedByString:@"9ScriptingKit"];
+        pretty = parts.count > 1 ? [NSString stringWithFormat:@"SDK%@", parts.lastObject] : sym;
+    }
+    fn.text = pretty.length > 52 ? [NSString stringWithFormat:@"…%@", [pretty substringFromIndex:pretty.length - 52]] : pretty;
+    loc.text = [NSString stringWithFormat:@"%@:%@+%@", d[@"img"] ?: @"?", [d[@"vmaddr"] stringValue], @([d[@"slide"] longValue])];
+    BOOL on = [d[@"on"] boolValue];
+    st.text = on ? @"💾 已持久化 — 冷启动自动重打" : @"未开启 — 左划操作";
+    st.textColor = on ? [UIColor systemGreenColor] : [UIColor tertiaryLabelColor];
+    return c;
+}
+// 左划: ⚡立即patch(橙) / 💾持久化开关(绿/灰)
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tv trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
+    NSDictionary *d = self.items[ip.row];
+    NSString *sym = d[@"sym"] ?: @"";
+    BOOL on = [d[@"on"] boolValue];
+    UIContextualAction *patch = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+        title:@"⚡patch" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+            [(id)g_mfCtrl mfAPEntPatchNow:sym];
+            done(YES);
+        }];
+    patch.backgroundColor = [UIColor systemOrangeColor];
+    UIContextualAction *persist = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+        title:on ? @"💾取消" : @"💾持久" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+            [(id)g_mfCtrl mfAPEntSetOn:sym on:!on];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [tv reloadData];
+            });
+            done(YES);
+        }];
+    persist.backgroundColor = on ? [UIColor systemGrayColor] : [UIColor systemGreenColor];
+    return [UISwipeActionsConfiguration configurationWithActions:@[patch, persist]];
+}
+@end
+static MFAPEntList *g_apEntList = nil;
+- (void)mfAPShowEntDumps {
+    UIView *page = mfMakePage(@"🎯 判定点", YES);
+    g_apEntList = [[MFAPEntList alloc] init];
+    g_apEntList.items = mfAppPatchEntDumps();
+    UITableView *tv = [[UITableView alloc] initWithFrame:CGRectMake(0, 46, g_mfCardW, g_mfCardH - 46)
+                                                    style:UITableViewStylePlain];
+    tv.dataSource = g_apEntList;
+    tv.delegate = g_apEntList;
+    tv.rowHeight = 64;
+    tv.separatorStyle = UITableViewCellSeparatorStyleNone;
+    [page addSubview:tv];
+    mfPushPage(page);
+}
+- (void)mfAPEntPatchNow:(NSString *)sym {
+    // 立即单点 patch: 从 entDumps 找该 sym 打 mov w0,#1; ret
+    for (NSDictionary *d in mfAppPatchEntDumps()) {
+        if (![d[@"sym"] isEqualToString:sym]) continue;
+        NSString *err = nil;
+        NSData *newBytes = apHexToBytes(@"20008052c0035fd6");
+        if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
+            g_apHits++;
+            apLog(@"[entdump] ⚡ %@ 立即 patch OK", sym.lastPathComponent ?: sym);
+            mfToast(@"⚡ 已 patch");
+        } else mfToast(err ?: @"patch 失败");
+        return;
+    }
+    mfToast(@"点位不存在(重扫一次)");
+}
+- (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on {
+    mfAppPatchEntDumpSetOn(sym, on);
+    mfToast(on ? @"💾 已持久化 — 冷启动自动重打" : @"已取消持久化");
+}
+// v2.58 占位: 自签票据写 app keychain(链B) — 实现为占位, 参数已逆向齐待落地
+- (void)mfAPKeychainStub {
+    mfToast(@"🔐 链B票据写入开发中 — 参数已逆向(LZFSE+HMAC/psc.dv.s1)");
+    apLog(@"[entdump] keychain 票据入口被点击(占位) — 自签 Envelope: LZFSE 压缩 + HMAC-SHA256(DeviceSecret, psc.dv.s1) → kcp.ent.snapshot.v1");
+}
 @end
 
 // ====== 实验模拟页嵌入块 (由 MFPanel.m 的 mfShowLabPage 调用) ======
 void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     CGFloat y = *yio;
     UILabel *grp = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 20)];
-    grp.text = @"AppPatch 进程层引擎";
+    grp.text = @"AppPatch 判定点引擎";
     grp.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     grp.textColor = [UIColor secondaryLabelColor];
     [page addSubview:grp];
     y += 24;
+    // v2.58 重构(用户六点清单): 引擎开关退役 — 有持久化点位(mfEntDumps)冷启动自动重打;
+    //   采集器迁观察模块(MFCompatPatcher 同路); 规则表保留为 text/method 手工高级用法。
     {
         UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
         bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
         bar.layer.cornerRadius = 10;
-        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(10, 10, 51, 31)];
-        sw.on = mfAppPatchIsOn();
-        [sw addTarget:g_mfCtrl action:@selector(mfAPSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-        [bar addSubview:sw];
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(72, 5, g_mfCardW - 84, 22)];
-        l.text = @"⚙️ patch 引擎";
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 5, g_mfCardW - 46, 22)];
+        l.text = @"🎯 判定点卡片";
         l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         [bar addSubview:l];
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(72, 27, g_mfCardW - 84, 22)];
-        st.text = [NSString stringWithFormat:@"objc swizzle + vm_protect · 命中 %ld", g_apHits];
-        st.font = [UIFont systemFontOfSize:11];
+        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
+        st.numberOfLines = 2;
+        st.minimumScaleFactor = 0.7;
+        st.text = [NSString stringWithFormat:@"侦查→卡片→左划[⚡patch][💾持久化] · 已存 %ld 点(%ld 持久)",
+                   mfAppPatchEntDumpCount(), (long)[[mfAppPatchEntDumps() filteredArrayUsingPredicate:
+                        [NSPredicate predicateWithFormat:@"on == YES"]] count]];
+        st.font = [UIFont systemFontOfSize:10.5];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
         [page addSubview:bar];
         y += 56;
     }
-    {
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
-        bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-        bar.layer.cornerRadius = 10;
-        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(10, 10, 51, 31)];
-        sw.on = mfAppPatchCollIsOn();
-        [sw addTarget:g_mfCtrl action:@selector(mfAPCollSwitchChanged:) forControlEvents:UIControlEventValueChanged];
-        [bar addSubview:sw];
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(72, 5, g_mfCardW - 84, 22)];
-        l.text = @"📡 补丁点位采集器";
-        l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        [bar addSubview:l];
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(72, 27, g_mfCardW - 84, 22)];
-        st.text = [NSString stringWithFormat:@"被动快照 diff · 采集 %ld", g_apCollHits];
-        st.font = [UIFont systemFontOfSize:11];
-        st.textColor = [UIColor secondaryLabelColor];
-        [bar addSubview:st];
-        [page addSubview:bar];
-        y += 56;
-    }
+    UIButton *btnDumps = [UIButton buttonWithType:UIButtonTypeSystem];
+    btnDumps.frame = CGRectMake(16, y, (g_mfCardW - 40) / 2, 38);
+    [btnDumps setTitle:@"🎯 判定点" forState:UIControlStateNormal];
+    [btnDumps addTarget:g_mfCtrl action:@selector(mfAPShowEntDumps) forControlEvents:UIControlEventTouchUpInside];
+    [page addSubview:btnDumps];
     UIButton *btnRules = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnRules.frame = CGRectMake(16, y, (g_mfCardW - 40) / 2, 38);
-    [btnRules setTitle:@"📜 规则表" forState:UIControlStateNormal];
+    btnRules.frame = CGRectMake(16 + (g_mfCardW - 40) / 2 + 8, y, (g_mfCardW - 40) / 2, 38);
+    [btnRules setTitle:@"📜 规则表(高级)" forState:UIControlStateNormal];
     [btnRules addTarget:g_mfCtrl action:@selector(mfAPShowRulesEditor) forControlEvents:UIControlEventTouchUpInside];
     [page addSubview:btnRules];
-    UIButton *btnLog = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnLog.frame = CGRectMake(16 + (g_mfCardW - 40) / 2 + 8, y, (g_mfCardW - 40) / 2, 38);
-    [btnLog setTitle:@"📋 日志" forState:UIControlStateNormal];
-    [btnLog addTarget:g_mfCtrl action:@selector(mfAPShowLog) forControlEvents:UIControlEventTouchUpInside];
-    [page addSubview:btnLog];
     y += 44;
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 84)];
-    note.text = @"规则: bid+ver 匹配 → method(swizzle) / text(vm_protect) / swifttext(框架符号定位+patch)。\nswifttext = 侦查卡点位数据: 镜像符号解析 → vm_protect 三步 → 函数恒真。\n持久化: 引擎开启后每次冷启动自动重打(无 keychain 依赖); 「立即应用」热触发。";
+    // v2.58 占位: 自签票据写入 app keychain(样本链B手法 — 无插件也亮)
+    //   参数已逆向齐: kcp.ent.snapshot.v1 / DeviceSecret kcp.v3.nx7.p0.7f1a / LZFSE+HMAC-SHA256(psc.dv.s1)
+    UIButton *btnKC = [UIButton buttonWithType:UIButtonTypeSystem];
+    btnKC.frame = CGRectMake(16, y, g_mfCardW - 32, 38);
+    btnKC.backgroundColor = [UIColor systemTealColor];
+    btnKC.layer.cornerRadius = 9;
+    [btnKC setTitle:@"🔐 keychain 票据持久化(链B · 开发中)" forState:UIControlStateNormal];
+    [btnKC setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    btnKC.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    [btnKC addTarget:g_mfCtrl action:@selector(mfAPKeychainStub) forControlEvents:UIControlEventTouchUpInside];
+    [page addSubview:btnKC];
+    y += 44;
+    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 64)];
+    note.text = @"冷启动: 有持久化点位自动重打(mov w0,#1; ret), 无开关依赖。\n规则表 = text/method 手工高级用法, 判定点主流程不依赖。\n日志已并入 mf_debug.log。";
     note.numberOfLines = 0;
     note.font = [UIFont systemFontOfSize:11];
     note.textColor = [UIColor secondaryLabelColor];
     [page addSubview:note];
-    y += 88;
+    y += 68;
     *yio = y;
 }

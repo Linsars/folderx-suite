@@ -127,6 +127,8 @@ NSDictionary *mfReconFingerprint(void) {
             }
             if (!found) [lines addObject:@"EXCPORTS: 全空(无异常端口注册者)"];
         }
+        // v2.58 定位修正(用户判定): EXCPORTS=检测"别家 mach 许可服务器"的观察判据(样本/Reflix 型),
+        //   不是本插件 patch 流程的一环 — 只在 mach 命中时作为旁证输出, 不再当主判定展示。
     }
 
     // ---- F4 网络捕获域命中(自家探针流量剔除 — mfprobe offerings 是我们发的, 算自证) ----
@@ -159,6 +161,33 @@ NSDictionary *mfReconFingerprint(void) {
 
     // ---- F6 SK 形态/本地校验策略(纯 SK 型的攻击层推荐依据) ----
     {
+        NSMutableArray *scanBlobs = [NSMutableArray array];
+        if (d.length) [scanBlobs addObject:d];   // 主二进制(p/n 可能截断, 用原 d)
+        {
+            uint32_t ic = _dyld_image_count();
+            for (uint32_t i = 0; i < ic; i++) {
+                const char *nmI = _dyld_get_image_name(i);
+                if (!nmI) continue;
+                NSString *full = [NSString stringWithUTF8String:nmI];
+                if (![full containsString:@".app/Frameworks/"]) continue;
+                const struct mach_header *mh = _dyld_get_image_header(i);
+                if (!mh || ((const struct mach_header_64 *)mh)->magic != MH_MAGIC_64) continue;
+                // __TEXT 已映射在内存: 段头给 vmsize, 直接按 (mh + vmaddr) 取数据 —
+                //   vmaddr 从 0 起(dylib 标准), 起点就是 mach_header 本身
+                const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
+                for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
+                    if (lc->cmd == LC_SEGMENT_64) {
+                        const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+                        if (!strcmp(sg->segname, "__TEXT")) {
+                            NSData *fd = [NSData dataWithBytes:(const void *)mh length:sg->filesize];
+                            if (fd.length > 0x10000) [scanBlobs addObject:fd];
+                            break;
+                        }
+                    }
+                }
+                if (scanBlobs.count >= 6) break;   // 大 app 框架多, 限 6 个
+            }
+        }
         // runtime 类扫描(主二进制): 收据验证库指纹
         NSMutableArray *libHits = [NSMutableArray array];
         const char **clsNames = NULL;
@@ -177,11 +206,16 @@ NSDictionary *mfReconFingerprint(void) {
         }
         free(clsNames);
         // 二进制串: SK1 selector(__objc_methname 里必留) / SK2 / CMS-OpenSSL 验签 import
+        // v2.58: 扫描源 = 主二进制 + app 框架(scanBlobs) — SK2 特征常在自带框架里
         BOOL sk1 = NO, sk2 = NO, cms = NO;
-        if (mfRecFind(p, n, "addPayment:") || mfRecFind(p, n, "updatedTransactions:") ||
-            mfRecFind(p, n, "restoreCompletedTransactions")) sk1 = YES;
-        if (mfRecFind(p, n, "currentEntitlements") || mfRecFind(p, n, "AppTransaction")) sk2 = YES;
-        if (mfRecFind(p, n, "CMSDecoder") || mfRecFind(p, n, "d2i_PKCS7") || mfRecFind(p, n, "EVP_VerifyFinal")) cms = YES;
+        for (NSData *blob in scanBlobs) {
+            const uint8_t *bp = blob.bytes; NSUInteger bn = blob.length;
+            if (!sk1 && (mfRecFind(bp, bn, "addPayment:") || mfRecFind(bp, bn, "updatedTransactions:") ||
+                         mfRecFind(bp, bn, "restoreCompletedTransactions"))) sk1 = YES;
+            if (!sk2 && (mfRecFind(bp, bn, "currentEntitlements") || mfRecFind(bp, bn, "AppTransaction"))) sk2 = YES;
+            if (!cms && (mfRecFind(bp, bn, "CMSDecoder") || mfRecFind(bp, bn, "d2i_PKCS7") || mfRecFind(bp, bn, "EVP_VerifyFinal"))) cms = YES;
+            if (sk1 && sk2 && cms) break;
+        }
         if (sk1 && sk2) skType = @"SK1+SK2 混合";
         else if (sk2) skType = @"SK2(JWS)";
         else if (sk1) skType = @"SK1(队列)";
@@ -249,6 +283,12 @@ NSDictionary *mfReconFingerprint(void) {
                     }
                 }
             }
+        }
+        // v2.58 接线: 侦查→实验模拟页数据通道 — 扫到的点位直接合并进 mfEntDumps_<bid>
+        // 持久存储, 实验模拟页判定点卡片从这读(不再依赖规则表/橙色生成按钮)
+        if (entFuncs.count) {
+            extern void mfAppPatchEntDumpsMerge(NSArray *);
+            mfAppPatchEntDumpsMerge(entFuncs);
         }
         if (entFuncs.count) {
             [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(可 patch) — 见实验模拟页", (unsigned long)entFuncs.count]];
@@ -394,24 +434,27 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
     NSArray *entFuncs = recon[@"entFuncs"];
     if ([entFuncs isKindOfClass:[NSArray class]] && entFuncs.count) {
         // v2.57 链B: 发现 entitlement 判定点位 → 一键生成 swifttext 规则进实验模拟页
+        // v2.58: 扫描时已自动 merge 进 mfEntDumps, 此按钮退役 — 换为直通判定点卡片
         UIButton *gen = [UIButton buttonWithType:UIButtonTypeSystem];
         gen.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
         gen.backgroundColor = [UIColor systemOrangeColor];
         gen.layer.cornerRadius = 9;
-        [gen setTitle:[NSString stringWithFormat:@"🎯 生成判定点位 patch 规则(%lu 个)", (unsigned long)entFuncs.count] forState:UIControlStateNormal];
+        [gen setTitle:[NSString stringWithFormat:@"🎯 判定点已入库(%lu) — 去实验模拟左划 patch", (unsigned long)entFuncs.count] forState:UIControlStateNormal];
         [gen setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         gen.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-        [gen addTarget:page action:NSSelectorFromString(@"mfReconGenEntPatch") forControlEvents:UIControlEventTouchUpInside];
+        [gen addTarget:page action:NSSelectorFromString(@"mfReconGoLab") forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(page, "reconEntFuncs", entFuncs, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [page addSubview:gen];
         tvY = 142;
     }
     if ([recon[@"cloud"] boolValue]) {
+        // v2.58: 云验证型也带判定点时补 patch 直通文案(链路不再断在按钮文案上)
         UIButton *lab = [UIButton buttonWithType:UIButtonTypeSystem];
         lab.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
         lab.backgroundColor = [UIColor systemGreenColor];
         lab.layer.cornerRadius = 9;
-        [lab setTitle:@"🧪 去实验模拟（云验证 mock）" forState:UIControlStateNormal];
+        [lab setTitle:[NSString stringWithFormat:@"🧪 去实验模拟（云验证 mock%@）",
+            [entFuncs count] ? @" + 判定点 patch" : @""] forState:UIControlStateNormal];
         [lab setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         lab.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
         [lab addTarget:page action:NSSelectorFromString(@"mfReconGoLab") forControlEvents:UIControlEventTouchUpInside];
