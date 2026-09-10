@@ -40,6 +40,19 @@ static const uint8_t *mfRecFind(const uint8_t *hay, size_t hn, const char *ndl) 
     return (const uint8_t *)memmem(hay, hn, ndl, nl);
 }
 
+// v2.58.6: 命中点是否落在 SPM 依赖清单 URL 里("https://github.com/<org>/<repo>")
+// 判据: 从命中点向左回退到 C 串头, 串以 "https://github.com/" 开头即 SPM URL(工具库依赖, 非订阅 SDK)
+static BOOL mfRecIsSPMURL(const uint8_t *base, const uint8_t *hit) {
+    if (!base || hit < base) return NO;
+    size_t back = 0, maxb = 128;
+    while (hit - back > base && back < maxb && hit[-back - 1] != 0) back++;
+    const uint8_t *strStart = hit - back;
+    static const char *kGH = "https://github.com/";
+    size_t gl = strlen(kGH);
+    // 串头在 base 内且完整出现前缀
+    return (size_t)(hit - back - base) >= gl && !memcmp(strStart, kGH, gl);
+}
+
 NSDictionary *mfReconFingerprint(void) {
     NSMutableArray *lines = [NSMutableArray array];
     NSMutableSet *cloudBrands = [NSMutableSet set];
@@ -54,12 +67,29 @@ NSDictionary *mfReconFingerprint(void) {
     if (n > 320u * 1024 * 1024) { n = 320u * 1024 * 1024; [lines addObject:@"(二进制超 320MB, 指纹只扫前段)"]; }
     unsigned binHits = 0;
     for (NSDictionary *b in mfRecCloudBrands()) {
+        BOOL brandHit = NO, spmOnly = NO;
         for (NSString *pat in b[@"pats"]) {
-            if (mfRecFind(p, n, pat.UTF8String)) {
-                [cloudBrands addObject:b[@"name"]];
-                binHits++;
-                if (binHits <= 6) [lines addObject:[NSString stringWithFormat:@"二进制含订阅 SDK 串: %@ → %@", pat, b[@"name"]]];
+            // v2.58.6: 逐命中点检查 — SPM 依赖清单 URL(github.com/<org>/<repo>) 是误报大户:
+            //   Scripting 案: superwall 小写串只出现在 "https://github.com/superwall/iOS-Backports"
+            //   (工具库依赖, 非订阅 SDK), 真特征 SuperwallKit/api.superwall.com 全 0。
+            //   策略: 命中点所在 C 串若以 https://github.com/ 开头 → 剔除该命中; 全部命中均 SPM 才判负。
+            const uint8_t *cand = p;
+            size_t rem = n;
+            const char *pc = pat.UTF8String;
+            while ((cand = mfRecFind(cand, rem, pc)) != NULL) {
+                if (!mfRecIsSPMURL(p, cand)) { brandHit = YES; break; }
+                spmOnly = YES;
+                size_t adv = strlen(pc);
+                cand += adv; rem = n - (size_t)(cand - p);
             }
+            if (brandHit) break;
+        }
+        if (brandHit) {
+            [cloudBrands addObject:b[@"name"]];
+            binHits++;
+            if (binHits <= 6) [lines addObject:[NSString stringWithFormat:@"二进制含订阅 SDK 串: %@ → %@", b[@"pats"][0], b[@"name"]]];
+        } else if (spmOnly) {
+            [lines addObject:[NSString stringWithFormat:@"剔除 %@ 串命中: 仅存在于 SPM 依赖清单 URL(github.com/…) — 工具库依赖, 非订阅 SDK", b[@"name"]]];
         }
     }
     if (binHits) [lines addObject:@"（二进制串 = 静态指纹, 不受任何开关影响 — 判定以此为准）"];
@@ -287,6 +317,11 @@ NSDictionary *mfReconFingerprint(void) {
                 if (endF && strstr(nm, "ySb")) continue;
                 for (NSString *pat in kEntPats) {
                     if (strstr(nm, pat.UTF8String)) {
+                        // v2.58.6: 同名符号 local/global 双 nlist 条目去重(否则计数翻倍, 与 merge 端 img+sym 去重口径不一致)
+                        BOOL dupSym = NO;
+                        for (NSDictionary *e in entFuncs)
+                            if ([e[@"img"] isEqualToString:full.lastPathComponent] && [e[@"sym"] isEqualToString:[NSString stringWithUTF8String:nm]]) { dupSym = YES; break; }
+                        if (dupSym) break;
                         [entFuncs addObject:@{
                             @"img": full.lastPathComponent,
                             @"sym": [NSString stringWithUTF8String:nm],
@@ -464,18 +499,20 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
     }
     if ([recon[@"cloud"] boolValue]) {
         // v2.58: 云验证型也带判定点时补 patch 直通文案(链路不再断在按钮文案上)
+        // v2.58.6: 修与橙按钮 y=92 叠放 — 双按钮纵向排布(橙在上, 绿在下)
         UIButton *lab = [UIButton buttonWithType:UIButtonTypeSystem];
-        lab.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
+        BOOL hasEnt = [entFuncs isKindOfClass:[NSArray class]] && entFuncs.count;
+        lab.frame = CGRectMake(16, hasEnt ? 134 : 92, g_mfCardW - 32, 38);
         lab.backgroundColor = [UIColor systemGreenColor];
         lab.layer.cornerRadius = 9;
         [lab setTitle:[NSString stringWithFormat:@"🧪 去实验模拟（云验证 mock%@）",
-            [entFuncs count] ? @" + 判定点 patch" : @""] forState:UIControlStateNormal];
+            hasEnt ? @" + 判定点 patch" : @""] forState:UIControlStateNormal];
         [lab setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         lab.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
         [lab addTarget:page action:NSSelectorFromString(@"mfReconGoLab") forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(page, "reconGoLab", @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [page addSubview:lab];
-        tvY = 142;
+        tvY = hasEnt ? 184 : 142;
     } else if ([recon[@"mach"] boolValue]) {
         // v2.54.0: mach 型(本地许可服务器, Reflix/ScriptingPass 同族) → 引导去开 EXCPROBE 应答器
         UIButton *exc = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -534,7 +571,7 @@ void mfReconApplySKResult(NSDictionary *recon, UIView *page, NSString *topPid, B
     NSString *sk = recon[@"sktype"] ?: @"未知";
     NSString *rec, *verdict;
     if ([sk containsString:@"SK2"] && ![sk containsString:@"SK1"]) {
-        rec = @"SK2 JWS 型 — 独立战线(暂缓), 先点按购买看回调";
+        rec = @"SK2 JWS 型 — 判定点已入库(实验模拟页左划 patch 即恒真)";
         verdict = [NSString stringWithFormat:@"纯 StoreKit(SK2 JWS) — %@", topPid];
     } else if ([val containsString:@"TPInAppReceipt"] || [val containsString:@"CMS"]) {
         rec = @"收据验证型 → 推荐 L1 收据伪造 + L2 Sec 放行(2.50)";
