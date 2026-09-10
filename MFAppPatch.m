@@ -433,6 +433,7 @@ static void apApplyRules(void) {
 // 引擎拉起: v2.58 判定点驱动 — 无开关: 有持久化点位(mfEntDumps)即自动重打。
 //   扫描(F8) → 点卡片左划[patch+持久化] → 存 mfEntDumps_<bid> → 冷启动走这里自动重打。
 //   keychain/cloudkit 豁免已退役(v2.57.1 拆除, 样本退役后只剩污染)。
+void apEntDumpsApply(void);   // fwd: 定义在采集器区块之后, Boot 前置声明
 void mfAppPatchBoot(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         apEntDumpsApply();     // 持久化点位重打(核心)
@@ -718,8 +719,6 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
 - (void)mfAPKeychainStub;
 @end
-
-void apEntDumpsApply(void);   // fwd: Boot 在定义前调用(持久化点位重打)
 
 static UITextView *g_apEditor = nil;
 @implementation MFPanelCtrl (AppPatch)
