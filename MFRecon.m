@@ -355,6 +355,7 @@ NSDictionary *mfReconFingerprint(void) {
     // F7 服务器权益型(2026-09-06 mailnow 案定案): 无云 SDK + 纯 SK + WebView 权益标志(FlexCall/loadSuccess
     // /premium/no_ad/vip 类 JS 桥字段) → 权益本体在服务端会话, 本地解锁无意义
     BOOL serverSide = NO;
+    BOOL skLocal = (BOOL)strstr(skType.UTF8String ?: "", "SK");   // v2.58.7: 提升作用域, verdict 链要用
     {
         static NSArray *kSrvPats;
         static dispatch_once_t once;
@@ -366,7 +367,6 @@ NSDictionary *mfReconFingerprint(void) {
         for (NSString *pat in kSrvPats)
             if (mfRecFind(p, n, pat.UTF8String)) srvHits++;
         // SK 本地形态 + 无云验证 + JS 桥权益字段 → 服务器权益型
-        BOOL skLocal = (BOOL)strstr(skType.UTF8String ?: "", "SK");
         if (srvHits >= 2 && !cloud && !mach && skLocal) serverSide = YES;
     }
     NSString *verdict;
@@ -374,6 +374,8 @@ NSDictionary *mfReconFingerprint(void) {
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 可直达", cloudBrands.allObjects.firstObject];
     else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, Reflix/ScriptingPass 同族) — EXCPROBE 应答器可复刻";
     else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
+    // v2.58.7: 纯 StoreKit 本地校验型分支(2.58.6 缺失 — SK2 明明已判定却显示"未发现订阅验证 SDK"兜底文案)
+    else if (skLocal)       verdict = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@ · %@) — 判定点已入库, 实验模拟页左划 patch", skType, validator];
     else                    verdict = @"未发现订阅验证 SDK";
     if (cloudBrands.count > 1) {
         NSString *names = [[cloudBrands.allObjects sortedArrayUsingSelector:@selector(compare)] componentsJoinedByString:@"/"];
@@ -382,7 +384,7 @@ NSDictionary *mfReconFingerprint(void) {
     }
 
     return @{@"verdict": verdict, @"lines": lines,
-             @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide),
+             @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide), @"sk": @(skLocal),
              @"sktype": skType, @"validator": validator,
              @"entFuncs": entFuncs};
 }
@@ -477,16 +479,19 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
     v.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
     v.numberOfLines = 0;
     v.textColor = [recon[@"cloud"] boolValue] ? [UIColor systemGreenColor] :
-                  [recon[@"mach"] boolValue] ? [UIColor systemPurpleColor] : [UIColor secondaryLabelColor];
+                  [recon[@"mach"] boolValue] ? [UIColor systemPurpleColor] :
+                  [recon[@"sk"] boolValue] ? [UIColor systemBlueColor] : [UIColor secondaryLabelColor];
     [page addSubview:v];
 
     CGFloat tvY = 96;
     NSArray *entFuncs = recon[@"entFuncs"];
-    if ([entFuncs isKindOfClass:[NSArray class]] && entFuncs.count) {
+    CGFloat btnY = 92;   // v2.58.7: 按钮纵向游标 — 修 y=92 多按钮叠放(2.58.6 只修了 cloud 分支, else-if 链换分支就复现)
+    BOOL hasEnt = [entFuncs isKindOfClass:[NSArray class]] && entFuncs.count;
+    if (hasEnt) {
         // v2.57 链B: 发现 entitlement 判定点位 → 一键生成 swifttext 规则进实验模拟页
         // v2.58: 扫描时已自动 merge 进 mfEntDumps, 此按钮退役 — 换为直通判定点卡片
         UIButton *gen = [UIButton buttonWithType:UIButtonTypeSystem];
-        gen.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
+        gen.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
         gen.backgroundColor = [UIColor systemOrangeColor];
         gen.layer.cornerRadius = 9;
         [gen setTitle:[NSString stringWithFormat:@"🎯 判定点已入库(%lu) — 去实验模拟左划 patch", (unsigned long)entFuncs.count] forState:UIControlStateNormal];
@@ -495,14 +500,12 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
         [gen addTarget:page action:NSSelectorFromString(@"mfReconGoLab") forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(page, "reconEntFuncs", entFuncs, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [page addSubview:gen];
-        tvY = 142;
+        btnY += 44;
     }
     if ([recon[@"cloud"] boolValue]) {
         // v2.58: 云验证型也带判定点时补 patch 直通文案(链路不再断在按钮文案上)
-        // v2.58.6: 修与橙按钮 y=92 叠放 — 双按钮纵向排布(橙在上, 绿在下)
         UIButton *lab = [UIButton buttonWithType:UIButtonTypeSystem];
-        BOOL hasEnt = [entFuncs isKindOfClass:[NSArray class]] && entFuncs.count;
-        lab.frame = CGRectMake(16, hasEnt ? 134 : 92, g_mfCardW - 32, 38);
+        lab.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
         lab.backgroundColor = [UIColor systemGreenColor];
         lab.layer.cornerRadius = 9;
         [lab setTitle:[NSString stringWithFormat:@"🧪 去实验模拟（云验证 mock%@）",
@@ -512,11 +515,11 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
         [lab addTarget:page action:NSSelectorFromString(@"mfReconGoLab") forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(page, "reconGoLab", @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [page addSubview:lab];
-        tvY = hasEnt ? 184 : 142;
+        btnY += 44;
     } else if ([recon[@"mach"] boolValue]) {
         // v2.54.0: mach 型(本地许可服务器, Reflix/ScriptingPass 同族) → 引导去开 EXCPROBE 应答器
         UIButton *exc = [UIButton buttonWithType:UIButtonTypeSystem];
-        exc.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
+        exc.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
         exc.backgroundColor = [UIColor systemPurpleColor];
         exc.layer.cornerRadius = 9;
         [exc setTitle:@"⏯ 去 IAP工具箱开 EXCPROBE 应答器" forState:UIControlStateNormal];
@@ -525,10 +528,11 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
         [exc addTarget:page action:NSSelectorFromString(@"mfReconGoExc") forControlEvents:UIControlEventTouchUpInside];
         objc_setAssociatedObject(page, "reconGoExc", @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [page addSubview:exc];
-        tvY = 142;
-    } else if (![recon[@"mach"] boolValue]) {
+        btnY += 44;
+    } else if (![recon[@"mach"] boolValue] && ![recon[@"sk"] boolValue]) {
+        // v2.58.7: 纯兜底引导 — cloud/mach/SK 全空才显示(Scripting 类纯 SK 型已由 verdict+橙按钮覆盖, 不再误出)
         UIButton *cap = [UIButton buttonWithType:UIButtonTypeSystem];
-        cap.frame = CGRectMake(16, 92, g_mfCardW - 32, 38);
+        cap.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
         cap.backgroundColor = [UIColor systemBlueColor];
         cap.layer.cornerRadius = 9;
         [cap setTitle:@"🌐 去网络分析开实时捕获 → 逛购买页 → 重扫" forState:UIControlStateNormal];
@@ -536,8 +540,9 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
         cap.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
         [cap addTarget:page action:NSSelectorFromString(@"mfReconGoCapture") forControlEvents:UIControlEventTouchUpInside];
         [page addSubview:cap];
-        tvY = 142;
+        btnY += 44;
     }
+    tvY = btnY;
     UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(12, tvY, g_mfCardW - 24, g_mfCardH - tvY - 12)];
     tv.backgroundColor = UIColor.clearColor;
     tv.editable = NO;
@@ -585,6 +590,7 @@ void mfReconApplySKResult(NSDictionary *recon, UIView *page, NSString *topPid, B
     upd[@"lines"] = lines;
     recon = upd;
     objc_setAssociatedObject(card, "recon", recon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(page, "reconCard", card, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UILabel *v = [card viewWithTag:901], *sub = [card viewWithTag:902];
     v.text = [NSString stringWithFormat:@"侦查: %@", verdict];
     v.textColor = [UIColor systemBlueColor];
@@ -597,13 +603,13 @@ UIView *mfReconMakeCard(NSDictionary *recon) {
     card.frame = CGRectMake(16, 46, g_mfCardW - 32, 52);
     card.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     card.layer.cornerRadius = 10;
-    BOOL c = [recon[@"cloud"] boolValue], m = [recon[@"mach"] boolValue];
+    BOOL c = [recon[@"cloud"] boolValue], m = [recon[@"mach"] boolValue], sk = [recon[@"sk"] boolValue];
     UILabel *v = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, (g_mfCardW - 32) - 24, 18)];
     v.tag = 901;
     v.text = [NSString stringWithFormat:@"侦查: %@", recon[@"verdict"]];
     v.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
     v.textColor = (c && m) ? [UIColor systemIndigoColor] : c ? [UIColor systemGreenColor] :
-                  m ? [UIColor systemPurpleColor] : [UIColor secondaryLabelColor];
+                  m ? [UIColor systemPurpleColor] : sk ? [UIColor systemBlueColor] : [UIColor secondaryLabelColor];
     UILabel *sub = [[UILabel alloc] initWithFrame:CGRectMake(12, 28, (g_mfCardW - 32) - 24, 16)];
     sub.tag = 902;
     sub.text = [NSString stringWithFormat:@"%lu 条证据 · 点看详情", (unsigned long)[recon[@"lines"] count]];

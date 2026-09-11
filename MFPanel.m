@@ -1121,8 +1121,25 @@ void mfShowScanPage(void) {
     UIView *page = mfMakePage(@"扫描购买", YES);
     // 启动即捕获开关(v2.0.0):下次启动生效——解决"App 先启动、后开捕获截不到老会话"
 
-    UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, g_mfCardH/2 - 20, g_mfCardW - 32, 40)];
-    st.text = @"正在扫描产品ID…（侦查卡先行）";
+    // v2.58.7: 灰占位卡(不可点) — 全链路(指纹+产品SK verify)跑完才换成真侦查卡。
+    //   用户定案: 产品ID先行(本地候选即时上屏), 侦查工作没跑完不给看详情(半吊子详情没意义)
+    UIView *ph = [[UIView alloc] initWithFrame:CGRectMake(16, 46, g_mfCardW - 32, 52)];
+    ph.backgroundColor = [UIColor tertiarySystemFillColor];
+    ph.layer.cornerRadius = 10;
+    UILabel *phT = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, ph.width - 24, 18)];
+    phT.text = @"侦查: 正在分析二进制/框架/网络…";
+    phT.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
+    phT.textColor = [UIColor tertiaryLabelColor];
+    [ph addSubview:phT];
+    UILabel *phS = [[UILabel alloc] initWithFrame:CGRectMake(12, 28, ph.width - 24, 16)];
+    phS.text = @"跑完自动替换为可点详情卡";
+    phS.font = [UIFont systemFontOfSize:10.5];
+    phS.textColor = [UIColor tertiaryLabelColor];
+    [ph addSubview:phS];
+    [page addSubview:ph];
+
+    UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(16, 106, g_mfCardW - 32, 40)];
+    st.text = @"正在扫描产品ID…";
     st.textAlignment = NSTextAlignmentCenter;
     st.font = [UIFont systemFontOfSize:14];
     st.textColor = [UIColor secondaryLabelColor];
@@ -1133,14 +1150,6 @@ void mfShowScanPage(void) {
         // v2.47.0: 内购模式一次性侦查(零 hook 纯读, 判据沉淀自 Reflix 战役终案) — 结果进置顶卡
         NSDictionary *recon = mfReconFingerprint();
         for (NSString *rl in recon[@"lines"]) mfLog(@"[recon] %@", rl);
-        // v2.58.6: recon 指纹秒级完成 → 占位卡立即上屏点亮可点(判定点数据流此刻已 merge 完),
-        //   SK verify(本地+网络+Apple 裁判, 数十秒)继续后台跑, 跑完回填产品列表
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (![st.superview isKindOfClass:[UIView class]]) return;   // 页面已被关
-            UIView *reconCard = mfReconMakeCard(recon);
-            objc_setAssociatedObject(page, "reconCard", reconCard, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [page addSubview:reconCard];   // v2.47.0: 置顶侦查卡(指纹阶段即出, 不等产品扫描)
-        });
         // 1.0 运行时截获回流(v2.6.11): SK1 hook 历史截获的 app 自查 ID——app 亲口报的,最高优先级
         // 依据: 任何 app 要展示/购买商品必发 SKProductsRequest(init 参数含全部 ID),打开一次购买页即现形
         NSArray *hookedPIDs = [[NSUserDefaults standardUserDefaults] objectForKey:@"SavedIAPIDs"] ?: @[];
@@ -1254,11 +1263,13 @@ void mfShowScanPage(void) {
             mfContributeToArchive(ctid, verifiedPrices.allKeys);
             dispatch_async(dispatch_get_main_queue(), ^{
                 [st removeFromSuperview];
-                // v2.58.6: 卡片已在指纹阶段上屏(上方 dispatch_async), 这里只补产品数据; 若页面被重建(极端)则兜底再挂
-                if (!objc_getAssociatedObject(page, "reconCard"))
-                    { UIView *reconCard = mfReconMakeCard(recon);
-                      objc_setAssociatedObject(page, "reconCard", reconCard, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                      [page addSubview:reconCard]; }
+                // v2.58.7: 全链路(SK verify 含)跑完 — 灰占位卡换真侦查卡(此刻详情才完整, 可点)
+                if ([ph.superview isKindOfClass:[UIView class]]) {
+                    [ph removeFromSuperview];
+                    UIView *reconCard = mfReconMakeCard(recon);
+                    objc_setAssociatedObject(page, "reconCard", reconCard, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    [page addSubview:reconCard];
+                }
 
                 NSMutableArray *merged = [NSMutableArray array];
                 NSSet *hookSet = [NSSet setWithArray:hookedPIDs];
@@ -1298,7 +1309,7 @@ void mfShowScanPage(void) {
                     return;
                 }
 
-                // 卡片占位(指纹阶段已上屏, y=46) → 产品区从 106 起; 保留原布局坐标兼容
+                // v2.58.7: 卡区(占位卡→真卡)y=46, 产品区 106 起 — 布局恒定
                 UILabel *countLb = [[UILabel alloc] initWithFrame:CGRectMake(16, 106, g_mfCardW - 32, 20)];
                 countLb.text = [NSString stringWithFormat:@"验证通过 %lu / 候选 %lu（左划复制 · 点按购买）",
                     (unsigned long)merged.count, (unsigned long)toVerify.count];
