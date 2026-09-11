@@ -19,7 +19,6 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <dlfcn.h>
 #import <string.h>
 
@@ -235,9 +234,11 @@ static NSString *chainAWriteField(NSString *clsName, NSString *ivName, id target
 }
 
 #pragma mark - 持久化(mfChainAWrites_<bid>: [{cls,fld,on}] 冷启动重打)
+// ★ ARC 规则: 函数名含 Copy/New/Retain/Create 才享受隐式命名桥接, "Key" 返回 OC 指针被判
+//   非桥接指针 — 改 cast 链写法, 不依赖命名约定。
 static NSString *chainAWritesKey(void) {
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
-    return [NSString stringWithFormat:@"mfChainAWrites_%@", bid ?: @"unknown"];
+    NSString *bid = [NSBundle mainBundle].bundleIdentifier;
+    return [NSString stringWithFormat:@"mfChainAWrites_%@", (NSString *)(bid ?: @"unknown")];
 }
 static NSString *MFPrefsPathC(void) {
     return @"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist";
