@@ -341,44 +341,13 @@ NSDictionary *mfReconFingerprint(void) {
             mfAppPatchEntDumpsMerge(entFuncs);
         }
         if (entFuncs.count) {
-            [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(可 patch) — B 链, 实验模拟页左划 patch", (unsigned long)entFuncs.count]];
+            [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(可 patch) — 见实验模拟页", (unsigned long)entFuncs.count]];
             for (NSDictionary *f in [entFuncs subarrayWithRange:NSMakeRange(0, MIN(4, entFuncs.count))]) {
                 NSString *s = f[@"sym"] ?: @"";
                 NSString *tail = s.length > 46 ? [s substringFromIndex:s.length - 46] : s;
                 [lines addObject:[NSString stringWithFormat:@"  %@:%#lx …%@", f[@"img"], [f[@"vmaddr"] unsignedLongValue], tail]];
             }
-        } else {
-            // v2.59.3 双链分流升级: 点位 0 + SK2 形态 → **当场自动跑 A 链探测**(不再让用户手动二次点),
-            //   结果(权益类名单+bool 字段)直接进证据行 — 侦查一次给全分流结论
-            BOOL sk2Shape = [skType containsString:@"SK2"] || [skType containsString:@"SK1+SK2"];
-            if (sk2Shape) {
-                extern void mfChainAProbe(void);
-                extern unsigned long mfChainAClassCount(void);
-                extern NSArray *mfChainARowsSnapshot(void);
-                mfChainAProbe();
-                unsigned long nA = mfChainAClassCount();
-                if (nA) {
-                    [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: 0 — 典型 SK2 型(主二进制符号 strip) → 🅰️A链权益类 %lu 个:", nA]];
-                    for (NSDictionary *d in [mfChainARowsSnapshot() subarrayWithRange:NSMakeRange(0, MIN(4ul, nA))]) {
-                        // v2.59.8: 名单过滤同 chainAScan 日志行 — 只列名字命中启发式的
-                        NSMutableArray *bools = [NSMutableArray array];
-                        for (NSString *iv in (NSArray *)d[@"ivars"])
-                            if ([iv hasPrefix:@"bool "]) {
-                                NSString *nm = [iv substringFromIndex:5];
-                                NSRange sp = [nm rangeOfString:@" ("];
-                                if (sp.length) nm = [nm substringToIndex:sp.location];
-                                if (chainABoolNameHitExt(nm)) [bools addObject:nm];
-                            }
-                        [lines addObject:[NSString stringWithFormat:@"  %@%@",
-                            d[@"name"], bools.count ? [NSString stringWithFormat:@" (bool: %@)", [bools componentsJoinedByString:@"/"]] : @""]];
-                    }
-                } else {
-                    [lines addObject:@"entitlement 判定点位: 0 · A链探测 0 命中 — 类名无权益语义, 待 fixup 重绑(开发中)"];
-                }
-            } else {
-                [lines addObject:@"entitlement 判定点位: 未发现(已加载框架符号表无 Pro/Entitlement 判定函数)"];
-            }
-        }
+        } else [lines addObject:@"entitlement 判定点位: 未发现(已加载框架符号表无 Pro/Entitlement 判定函数)"];
     }
 
     // ---- 判定(动态拼接, 可叠加: Reflix = 云+mach 双面) ----
