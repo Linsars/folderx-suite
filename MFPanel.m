@@ -1126,12 +1126,13 @@ void mfShowScanPage(void) {
     UIView *ph = [[UIView alloc] initWithFrame:CGRectMake(16, 46, g_mfCardW - 32, 52)];
     ph.backgroundColor = [UIColor tertiarySystemFillColor];
     ph.layer.cornerRadius = 10;
-    UILabel *phT = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, ph.width - 24, 18)];
+    CGFloat phW = g_mfCardW - 32;
+    UILabel *phT = [[UILabel alloc] initWithFrame:CGRectMake(12, 8, phW - 24, 18)];
     phT.text = @"侦查: 正在分析二进制/框架/网络…";
     phT.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
     phT.textColor = [UIColor tertiaryLabelColor];
     [ph addSubview:phT];
-    UILabel *phS = [[UILabel alloc] initWithFrame:CGRectMake(12, 28, ph.width - 24, 16)];
+    UILabel *phS = [[UILabel alloc] initWithFrame:CGRectMake(12, 28, phW - 24, 16)];
     phS.text = @"跑完自动替换为可点详情卡";
     phS.font = [UIFont systemFontOfSize:10.5];
     phS.textColor = [UIColor tertiaryLabelColor];
