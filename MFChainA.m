@@ -48,7 +48,8 @@ static BOOL chainAClassIsCandidate(const char *cname) {
     NSString *cn = [NSString stringWithUTF8String:cname];
     if (cn.length < 4) return NO;
     if ([cn hasPrefix:@"SK"] || [cn hasPrefix:@"NS"] || [cn hasPrefix:@"UI"]) return NO;
-    for (NSString *p in chainACandidatePats())
+    NSArray *patsL = chainACandidatePats();
+    for (NSString *p in patsL)
         if ([cn rangeOfString:p options:NSCaseInsensitiveSearch].length) return YES;
     return NO;
 }
@@ -65,7 +66,8 @@ static NSArray *chainABoolNamePats(void) {
 }
 static BOOL chainABoolNameHit(NSString *ivName) {
     NSString *low = ivName.lowercaseString;
-    for (NSString *p in chainABoolNamePats())
+    NSArray *bPatsL = chainABoolNamePats();
+    for (NSString *p in bPatsL)
         if ([low rangeOfString:p].length) return YES;
     return NO;
 }
@@ -170,10 +172,12 @@ static NSArray *chainAFindInstances(NSString *clsName) {
     if (!target) return nil;
     NSMutableArray *out = [NSMutableArray new];
     // L1a: 目标类镜像
-    for (NSDictionary *row in chainARowsSnapshotInternal()) {
+    NSArray *rowsV1 = chainARowsSnapshotInternal();
+    for (NSDictionary *row in rowsV1) {
         NSString *imgP = row[@"imgPath"];
         if (![imgP isKindOfClass:[NSString class]] || imgP.length == 0) continue;
-        for (id inst in chainAScanDataSegFor(target, imgP.UTF8String))
+        NSArray *hitsV1 = chainAScanDataSegFor(target, imgP.UTF8String);
+        for (id inst in hitsV1)
             if (object_getClass(inst) == target) {
                 BOOL dup = NO; for (id e in out) if (e == inst) { dup = YES; break; }
                 if (!dup) [out addObject:inst];
@@ -182,10 +186,12 @@ static NSArray *chainAFindInstances(NSString *clsName) {
     // L2: 供体 = 任何候选类实例, 扫其内存找目标 isa
     if (out.count < 8) {
         NSMutableArray *donors = [NSMutableArray new];
-        for (NSDictionary *row in chainARowsSnapshotInternal()) {
+        NSArray *rowsV2 = chainARowsSnapshotInternal();
+        for (NSDictionary *row in rowsV2) {
             Class dc = objc_getClass([row[@"name"] UTF8String]);
             if (!dc) continue;
-            for (id inst in chainAScanDataSegFor(dc, [row[@"imgPath"] UTF8String])) {
+            NSArray *hitsV2 = chainAScanDataSegFor(dc, [row[@"imgPath"] UTF8String]);
+            for (id inst in hitsV2) {
                 BOOL dup = NO; for (id e in donors) if (e == inst) { dup = YES; break; }
                 if (!dup) [donors addObject:inst];
             }
@@ -240,11 +246,14 @@ static NSString *chainAWritesKey(void) {
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     return [NSString stringWithFormat:@"mfChainAWrites_%@", (NSString *)(bid ?: @"unknown")];
 }
+// ★ 同类 ARC 坑: 名字不带 Copy/New/Retain/Create 的 OC 返回函数在 writeToFile: 参数位
+//   也被判非桥接指针 — 干脆改成返回值 + 局部变量写法, 全函数只此一处。
 static NSString *MFPrefsPathC(void) {
     return @"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist";
 }
 static NSMutableArray *chainAWritesLoad(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:MFPrefsPathC()];
+    NSString *pp = MFPrefsPathC();
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:pp];
     id raw = d[chainAWritesKey()];
     if ([raw isKindOfClass:[NSString class]]) {
         NSArray *a = [NSJSONSerialization JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding]
@@ -256,9 +265,10 @@ static NSMutableArray *chainAWritesLoad(void) {
 static void chainAWritesSave(NSMutableArray *arr) {
     NSData *jd = [NSJSONSerialization dataWithJSONObject:arr options:0 error:nil];
     if (!jd) return;
-    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:MFPrefsPathC()] mutableCopy] ?: [NSMutableDictionary new];
+    NSString *pp = MFPrefsPathC();
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:pp] mutableCopy] ?: [NSMutableDictionary new];
     d[chainAWritesKey()] = [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
-    [d writeToFile:MFPrefsPathC atomically:YES];
+    [d writeToFile:pp atomically:YES];
 }
 static void chainAWritesAdd(NSString *cls, NSString *fld) {
     if (cls.length == 0 || fld.length == 0) return;
