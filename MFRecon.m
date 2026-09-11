@@ -341,13 +341,20 @@ NSDictionary *mfReconFingerprint(void) {
             mfAppPatchEntDumpsMerge(entFuncs);
         }
         if (entFuncs.count) {
-            [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(可 patch) — 见实验模拟页", (unsigned long)entFuncs.count]];
+            [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(可 patch) — B 链, 实验模拟页左划 patch", (unsigned long)entFuncs.count]];
             for (NSDictionary *f in [entFuncs subarrayWithRange:NSMakeRange(0, MIN(4, entFuncs.count))]) {
                 NSString *s = f[@"sym"] ?: @"";
                 NSString *tail = s.length > 46 ? [s substringFromIndex:s.length - 46] : s;
                 [lines addObject:[NSString stringWithFormat:@"  %@:%#lx …%@", f[@"img"], [f[@"vmaddr"] unsignedLongValue], tail]];
             }
-        } else [lines addObject:@"entitlement 判定点位: 未发现(已加载框架符号表无 Pro/Entitlement 判定函数)"];
+        } else {
+            // v2.59.0 双链分流提示: 点位 0 + SK2 形态 → A 链(典型 SK2 app 主二进制符号被 App Store strip,
+            //   判定函数无点位可打; 权益状态落在 @objc 类字段 — 运行时 KVC 探测可达)
+            BOOL sk2Shape = [skType containsString:@"SK2"] || [skType containsString:@"SK1+SK2"];
+            [lines addObject: sk2Shape ?
+                @"entitlement 判定点位: 0 — 典型 SK2 型(主二进制符号 strip), 走 🅰️A链: 实验模拟页→权益类探测" :
+                @"entitlement 判定点位: 未发现(已加载框架符号表无 Pro/Entitlement 判定函数)"];
+        }
     }
 
     // ---- 判定(动态拼接, 可叠加: Reflix = 云+mach 双面) ----

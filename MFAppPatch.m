@@ -932,15 +932,16 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     [btnRules addTarget:g_mfCtrl action:@selector(mfAPShowRulesEditor) forControlEvents:UIControlEventTouchUpInside];
     [page addSubview:btnRules];
     y += 44;
-    // v2.58 占位: 自签票据写入 app keychain(样本链B手法 — 无插件也亮)
-    //   参数已逆向齐: kcp.ent.snapshot.v1 / DeviceSecret kcp.v3.nx7.p0.7f1a / LZFSE+HMAC-SHA256(psc.dv.s1)
+    // v2.59.0 链A(通用层): 点位=0 的典型 SK2 app(strip 型) — 运行时权益类探测 + KVC 直写候选
+    //   双链分流: F8 点位≥1 走 B 链(判定点卡片); =0 走本链。探测版先上, 写点下一版。
+    UIButton *btnA = [UIButton buttonWithType:UIButtonTypeSystem];
+    btnA.frame = CGRectMake(16, y, (g_mfCardW - 40) / 2, 38);
+    [btnA setTitle:@"🅰️ A链·权益类探测" forState:UIControlStateNormal];
+    [btnA addTarget:g_mfCtrl action:@selector(mfChainAShowPage) forControlEvents:UIControlEventTouchUpInside];
+    [page addSubview:btnA];
     UIButton *btnKC = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnKC.frame = CGRectMake(16, y, g_mfCardW - 32, 38);
-    btnKC.backgroundColor = [UIColor systemTealColor];
-    btnKC.layer.cornerRadius = 9;
-    [btnKC setTitle:@"🔐 keychain 票据持久化(链B · 开发中)" forState:UIControlStateNormal];
-    [btnKC setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btnKC.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    btnKC.frame = CGRectMake(16 + (g_mfCardW - 40) / 2 + 8, y, (g_mfCardW - 40) / 2, 38);
+    [btnKC setTitle:@"🔐 链B票据" forState:UIControlStateNormal];
     [btnKC addTarget:g_mfCtrl action:@selector(mfAPKeychainStub) forControlEvents:UIControlEventTouchUpInside];
     [page addSubview:btnKC];
     y += 44;
