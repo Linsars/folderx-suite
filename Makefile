@@ -13,7 +13,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = FolderX AppHooks IAPtools CompatPatcher
 
 # FolderX(SpringBoard: 文件夹变色 + 系统增强[充电限制/Wi-Fi永连])
-FolderX_FILES = $(filter-out MFPanel.m MFNetworkCapture.m MFAppStoreSpoof.m MFTestFlightHooks.m MFKeychainManager.m MFClassDump.m MFDiagnostics.m MFNetAnalyzer.m MFCryptoToolbox.m MFCryptoHooks.m MFObjCHook.m MFHostLogCapture.m MFBatteryInfo.m MFDiagnosticCleaner.m MFSubInject.m MFReceiptForge.m MFReflixOracle.m MFAppPatch.m MFProcCapture.m MFRecon.m MFSKQueueForge.m, $(wildcard *.xm *.m *.mm))
+FolderX_FILES = $(filter-out MFChainA.m MFPanel.m MFNetworkCapture.m MFAppStoreSpoof.m MFTestFlightHooks.m MFKeychainManager.m MFClassDump.m MFDiagnostics.m MFNetAnalyzer.m MFCryptoToolbox.m MFCryptoHooks.m MFObjCHook.m MFHostLogCapture.m MFBatteryInfo.m MFDiagnosticCleaner.m MFSubInject.m MFReceiptForge.m MFReflixOracle.m MFAppPatch.m MFProcCapture.m MFRecon.m MFSKQueueForge.m, $(wildcard *.xm *.m *.mm))
 FolderX_FRAMEWORKS = UIKit Foundation SpringBoardServices
 FolderX_CFLAGS = -fno-objc-arc -fmodules
 MFSystemEnhance.m_CFLAGS = -fobjc-arc
@@ -24,7 +24,7 @@ FolderX_INSTALL_PATH = /usr/lib/TweakInject
 IAPtools_FILES = MFChainA.m MFSKQueueForge.m MFRecon.m MFPanel.m MFNetworkCapture.m MFDiagnosticCleaner.m MFKeychainManager.m MFClassDump.m MFDiagnostics.m MFNetAnalyzer.m MFCryptoToolbox.m MFCryptoHooks.m MFObjCHook.m MFHostLogCapture.m MFBatteryInfo.m MFSubInject.m MFReceiptForge.m MFReflixOracle.m MFProcCapture.m MFAppPatch.m fishhook.c
 IAPtools_FRAMEWORKS = UIKit Foundation Security
 IAPtools_LDFLAGS = -weak_framework UIKit -weak_framework StoreKit -weak_framework JavaScriptCore -lz
-IAPtools_CFLAGS = -fobjc-arc -Wno-everything -DMF_BUILD_VER_S='"2.59.1"'
+IAPtools_CFLAGS = -fobjc-arc -Wno-everything -DMF_BUILD_VER_S='"2.59.2"'
 IAPtools_ARCHS = arm64 arm64e
 IAPtools_INSTALL_PATH = /usr/lib/TweakInject
 
