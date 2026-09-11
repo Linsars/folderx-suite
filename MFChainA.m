@@ -20,6 +20,10 @@ extern void mfPopPage(void);
 extern void mfToast(NSString *s);
 extern void mfLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 @class MFPanelCtrl;   // category 挂点在 MFPanel.m 定义, 此处只声明
+// v2.59.0: category 实现需完整 @interface(前置 @class 只够指针引用)
+@interface MFPanelCtrl : NSObject
+- (void)mfChainAShowPage;
+@end
 
 #pragma mark - 权益类识别: 名称启发式
 // 判定维度: 类名含权益语义。白名单词对齐已实证样本(PremiumStore/PaywallPresenter/
