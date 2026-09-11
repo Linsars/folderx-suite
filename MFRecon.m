@@ -360,9 +360,15 @@ NSDictionary *mfReconFingerprint(void) {
                 if (nA) {
                     [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: 0 — 典型 SK2 型(主二进制符号 strip) → 🅰️A链权益类 %lu 个:", nA]];
                     for (NSDictionary *d in [mfChainARowsSnapshot() subarrayWithRange:NSMakeRange(0, MIN(4ul, nA))]) {
+                        // v2.59.8: 名单过滤同 chainAScan 日志行 — 只列名字命中启发式的
                         NSMutableArray *bools = [NSMutableArray array];
                         for (NSString *iv in (NSArray *)d[@"ivars"])
-                            if ([iv hasPrefix:@"bool "]) [bools addObject:[iv substringFromIndex:5]];
+                            if ([iv hasPrefix:@"bool "]) {
+                                NSString *nm = [iv substringFromIndex:5];
+                                NSRange sp = [nm rangeOfString:@" ("];
+                                if (sp.length) nm = [nm substringToIndex:sp.location];
+                                if (chainABoolNameHitExt(nm)) [bools addObject:nm];
+                            }
                         [lines addObject:[NSString stringWithFormat:@"  %@%@",
                             d[@"name"], bools.count ? [NSString stringWithFormat:@" (bool: %@)", [bools componentsJoinedByString:@"/"]] : @""]];
                     }

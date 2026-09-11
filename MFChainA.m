@@ -71,6 +71,8 @@ static BOOL chainABoolNameHit(NSString *ivName) {
         if ([low rangeOfString:p].length) return YES;
     return NO;
 }
+// MFRecon 侦查行复用(跨文件 — 非 static 导出)
+BOOL chainABoolNameHitExt(NSString *ivName) { return chainABoolNameHit(ivName); }
 
 #pragma mark - 安全读(vm_read_overwrite probe — 候选 qword 解引用可能落未映射页)
 // SDK 14.5 的 mach_vm.h 带 #error, 用 MFProcCapture 同款 vm_read_overwrite(vm_address_t 32 位截断无虞 — iOS 用户态地址 < 32G)
@@ -95,16 +97,19 @@ static NSArray *chainAScanDataSegFor(Class target, const char *imgPath) {
     if (!target || !imgPath) return nil;
     uint32_t n = _dyld_image_count();
     const struct mach_header_64 *hdr = NULL;
-    for (uint32_t i = 0; i < n; i++) {
-        const char *nm = _dyld_get_image_name(i);
-        if (nm && !strcmp(nm, imgPath)) { hdr = (const void *)_dyld_get_image_header(i); break; }
-    }
-    if (!hdr) return nil;
     intptr_t slide = 0;
     for (uint32_t i = 0; i < n; i++) {
         const char *nm = _dyld_get_image_name(i);
-        if (nm && !strcmp(nm, imgPath)) { slide = _dyld_get_image_slide(i); break; }
+        if (nm && !strcmp(nm, imgPath)) {
+            hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            // ★ v2.59.8 崩溃修复: _dyld_get_image_slide() 收 mach_header* 而非索引
+            //   (dyld4 签名 — 传索引=把整数当指针解引用, 读 0x1 直接 SIGSEGV,
+            //    160804.ips 等连崩 7 次实锤)。索引版是 _dyld_get_image_vmaddr_slide(i)。
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
     }
+    if (!hdr) return nil;
     uintptr_t targetMasked = (uintptr_t)target & CHAINA_ISA_MASK;
     NSMutableArray *found = [NSMutableArray new];
     const struct load_command *lc = (const char *)hdr + sizeof(*hdr);
@@ -115,7 +120,9 @@ static NSArray *chainAScanDataSegFor(Class target, const char *imgPath) {
             && strcmp(seg->segname, "__DATA_DIRTY") && strcmp(seg->segname, "__DATA_CONST_DIRTY")) continue;
         uintptr_t start = (uintptr_t)slide + seg->vmaddr, end = start + seg->vmsize;
         for (uintptr_t p = start; p + 8 <= end; p += 8) {
-            uint64_t q = *(uint64_t *)p;                 // 数据段已映射可读, 直接读
+            uint64_t q = 0;
+            // v2.59.8: 数据段直读改安全读 — 崩溃日志显示段内也有读失败页(prot 位不含 READ 的页)
+            if (!chainASafeReadQ((uint64_t)p, &q)) continue;
             if (!chainALooksHeapPtr(q)) continue;
             uint64_t isaQ = 0;
             if (!chainASafeReadQ(q, &isaQ)) continue;
@@ -377,9 +384,16 @@ static void chainAScan(void) {
         free(safe);
         mfLog(@"[chainA] 探测: %u 个权益类(bool 字段候选见详情)", clsFound);
         for (NSDictionary *d in g_chainARows) {
+            // v2.59.8: bool 名单只列名字命中的(encoding 三态放宽后 String/Decimal 也带"bool "前缀,
+            //   日志行不做过滤会把 _billTitle/_totalAmount 全印出来 — 判定噪声)
             NSMutableArray *bools = [NSMutableArray array];
             for (NSString *iv in (NSArray *)d[@"ivars"])
-                if ([iv hasPrefix:@"bool "]) [bools addObject:[iv substringFromIndex:5]];
+                if ([iv hasPrefix:@"bool "]) {
+                    NSString *nm = [iv substringFromIndex:5];
+                    NSRange sp = [nm rangeOfString:@" ("];
+                    if (sp.length) nm = [nm substringToIndex:sp.location];
+                    if (chainABoolNameHit(nm)) [bools addObject:nm];
+                }
             mfLog(@"[chainA]   %@ · ivars %lu · methods %lu%@",
                 d[@"name"], (unsigned long)[(NSArray *)d[@"ivars"] count],
                 (unsigned long)[(NSArray *)d[@"methods"] count],
