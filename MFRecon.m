@@ -348,12 +348,30 @@ NSDictionary *mfReconFingerprint(void) {
                 [lines addObject:[NSString stringWithFormat:@"  %@:%#lx …%@", f[@"img"], [f[@"vmaddr"] unsignedLongValue], tail]];
             }
         } else {
-            // v2.59.0 双链分流提示: 点位 0 + SK2 形态 → A 链(典型 SK2 app 主二进制符号被 App Store strip,
-            //   判定函数无点位可打; 权益状态落在 @objc 类字段 — 运行时 KVC 探测可达)
+            // v2.59.3 双链分流升级: 点位 0 + SK2 形态 → **当场自动跑 A 链探测**(不再让用户手动二次点),
+            //   结果(权益类名单+bool 字段)直接进证据行 — 侦查一次给全分流结论
             BOOL sk2Shape = [skType containsString:@"SK2"] || [skType containsString:@"SK1+SK2"];
-            [lines addObject: sk2Shape ?
-                @"entitlement 判定点位: 0 — 典型 SK2 型(主二进制符号 strip), 走 🅰️A链: 实验模拟页→权益类探测" :
-                @"entitlement 判定点位: 未发现(已加载框架符号表无 Pro/Entitlement 判定函数)"];
+            if (sk2Shape) {
+                extern void mfChainAProbe(void);
+                extern unsigned long mfChainAClassCount(void);
+                extern NSArray *mfChainARowsSnapshot(void);
+                mfChainAProbe();
+                unsigned long nA = mfChainAClassCount();
+                if (nA) {
+                    [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: 0 — 典型 SK2 型(主二进制符号 strip) → 🅰️A链权益类 %lu 个:", nA]];
+                    for (NSDictionary *d in [mfChainARowsSnapshot() subarrayWithRange:NSMakeRange(0, MIN(4ul, nA))]) {
+                        NSMutableArray *bools = [NSMutableArray array];
+                        for (NSString *iv in (NSArray *)d[@"ivars"])
+                            if ([iv hasPrefix:@"bool "]) [bools addObject:[iv substringFromIndex:5]];
+                        [lines addObject:[NSString stringWithFormat:@"  %@%@",
+                            d[@"name"], bools.count ? [NSString stringWithFormat:@" (bool: %@)", [bools componentsJoinedByString:@"/"]] : @""]];
+                    }
+                } else {
+                    [lines addObject:@"entitlement 判定点位: 0 · A链探测 0 命中 — 类名无权益语义, 待 fixup 重绑(开发中)"];
+                }
+            } else {
+                [lines addObject:@"entitlement 判定点位: 未发现(已加载框架符号表无 Pro/Entitlement 判定函数)"];
+            }
         }
     }
 

@@ -134,6 +134,16 @@ static void chainAScan(void) {
         for (unsigned i = 0; i < nSafe; i++) free(safe[i]);
         free(safe);
         mfLog(@"[chainA] 探测: %u 个权益类(bool 字段候选见详情)", clsFound);
+        // v2.59.3: 探测结果完整进日志(验收/debug 不靠截屏 — 每类一行: 名字 + bool 字段名单)
+        for (NSDictionary *d in g_chainARows) {
+            NSMutableArray *bools = [NSMutableArray array];
+            for (NSString *iv in (NSArray *)d[@"ivars"])
+                if ([iv hasPrefix:@"bool "]) [bools addObject:[iv substringFromIndex:5]];
+            mfLog(@"[chainA]   %@ · ivars %lu · methods %lu%@",
+                d[@"name"], (unsigned long)[(NSArray *)d[@"ivars"] count],
+                (unsigned long)[(NSArray *)d[@"methods"] count],
+                bools.count ? [NSString stringWithFormat:@" · bool: %@", [bools componentsJoinedByString:@"/"]] : @"");
+        }
     }
 }
 
@@ -141,6 +151,12 @@ static void chainAScan(void) {
 unsigned long mfChainAClassCount(void) {
     @synchronized (g_chainALock ?: (g_chainALock = [NSObject new])) {
         return g_chainARows.count;
+    }
+}
+void mfChainAProbe(void);   // fwd: 扫描入口(侦查自动触发用), 定义在下方
+NSArray *mfChainARowsSnapshot(void) {   // v2.59.3: 侦查读取探测行(只读快照)
+    @synchronized (g_chainALock ?: (g_chainALock = [NSObject new])) {
+        return g_chainARows ?: @[];
     }
 }
 
@@ -203,6 +219,12 @@ unsigned long mfChainAClassCount(void) {
 }
 @end
 static MFChainAList *g_chainAList = nil;
+
+// v2.59.3: 侦查自动触发入口 — F8 点位=0 且 SK2 形态时由 mfReconFingerprint 调用(后台线程安全:
+//   chainAScan 全程无 UI 调用; dispatch_once 语义靠 g_chainAScanned + @synchronized 保证)
+void mfChainAProbe(void) {
+    chainAScan();
+}
 
 @implementation MFPanelCtrl (ChainA)
 // A 链探测入口: 实验模拟页按钮 → 扫描 + 列表
