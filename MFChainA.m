@@ -1,14 +1,25 @@
-// MFChainA.m — 链A 探测模块(v2.59.0 第一版: 只探测展示, 不写)
+// MFChainA.m — 链A 模块(v2.59.4 直写版)
 // 架构定位(2026-09-11 定案): SK2 双链设计
 //   A 链(通用层): F8 点位数=0 且 SK 形态=SK2 → 启用 — 典型 SK2 app(gongju 型, 单二进制,
 //     App Store strip 主二进制符号) 无点位可打; 但权益状态必落 @objc 可见层(PremiumStore 类
 //     _TtC 单例 + 实例字段), 我们注入在目标进程内, 运行时枚举可达。
 //   B 链(精确层): F8 点位数≥1 → 启用(已有 swifttext 恒真 patch)
-// 本版 = 探测: 类枚举 + 权益类识别 + ivar/method dump 上屏。写点(直写字段/建持久规则)下一版。
+// v2.59.2-3 = 探测: 类枚举 + 权益类识别 + ivar/method dump + 侦查自动触发。
+// v2.59.4 = 直写:
+//   ★ 实例定位(methods=0 的纯 Swift 类没有 getter/KVC 入口 — 常规死路):
+//     L1 = app __DATA/__DATA_CONST 段 qword 扫描 + isa 匹配(Swift static let 全局指针就在这);
+//     L2 = 已定位的候选类实例, 按其 ivar extent 扫字节找目标类 isa(容器类持有 store 的形态)。
+//   ★ 直写 = ivar_getOffset + 1 字节裸写(写前 8 字节安全读做指针预检 — 疑似包装字段不盲写)
+//     + 回读验证 + 字节级日志(下版展开 @Published box 的判据来源)。
+//   ★ 持久化 mfChainAWrites_<bid> + 冷启动 3s 重打(Sk2 回填时机实测调)。
+// Swift ivar 事实(2.59.3 验收): Bool 存储属性 encoding 非 "B" → 候选判定三态放宽(B/空/?) + 名字启发式。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach/mach.h>
+#import <mach/mach_vm.h>
 #import <dlfcn.h>
 #import <string.h>
 
@@ -19,15 +30,12 @@ extern void mfPushPage(UIView *page);
 extern void mfPopPage(void);
 extern void mfToast(NSString *s);
 extern void mfLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
-@class MFPanelCtrl;   // category 挂点在 MFPanel.m 定义, 此处只声明
-// v2.59.0: category 实现需完整 @interface(前置 @class 只够指针引用)
+@class MFPanelCtrl;
 @interface MFPanelCtrl : NSObject
 - (void)mfChainAShowPage;
 @end
 
 #pragma mark - 权益类识别: 名称启发式
-// 判定维度: 类名含权益语义。白名单词对齐已实证样本(PremiumStore/PaywallPresenter/
-//   AABillStore/ProAccessGuard 家族); 噪声控制: SK/NS/UI 前缀系统类与 SwiftUI 外壳全排除。
 static NSArray *chainACandidatePats(void) {
     static NSArray *pats; static dispatch_once_t o;
     dispatch_once(&o, ^{
@@ -40,25 +48,242 @@ static BOOL chainAClassIsCandidate(const char *cname) {
     if (!cname) return NO;
     NSString *cn = [NSString stringWithUTF8String:cname];
     if (cn.length < 4) return NO;
-    // 系统类排除: SK(StoreKit)/NS/UI 前缀; _TtC(带下划线开头的是嵌套类型外壳) 保留判断在词表
     if ([cn hasPrefix:@"SK"] || [cn hasPrefix:@"NS"] || [cn hasPrefix:@"UI"]) return NO;
     for (NSString *p in chainACandidatePats())
         if ([cn rangeOfString:p options:NSCaseInsensitiveSearch].length) return YES;
     return NO;
 }
 
-#pragma mark - 枚举(安全模式: 对标 mfProbeStoreKit2 v2.52.3 — 原子快照 + strdup 自持)
-// 事故链教训(勿重蹈): 逐索引 _dyld_get_image_name 在动态 dlopen app 上踩悬挂指针(Real Crash #2);
-//   objc_copyClassList 全进程 realize 触发 Swift 泛型 conformance 空指针(Real Crash #1)。
-//   → 只用 objc_copyClassNamesForImage(懒 realize, 只取名字) + objc_getClass(单点)。
-static NSMutableArray *g_chainARows = nil;   // [{name, img, ivars, methods}]
+#pragma mark - bool 候选判定(v2.59.4: encoding 三态放宽 + 字段名启发式)
+static BOOL chainAIsBoolIvar(const char *ty) {
+    if (!ty || !ty[0] || !strcmp(ty, "?")) return YES;   // Swift 存储属性常态: 无 encoding
+    return !strcmp(ty, "B");
+}
+static NSArray *chainABoolNamePats(void) {
+    static NSArray *p; static dispatch_once_t o;
+    dispatch_once(&o, ^{ p = @[@"purchas", @"paid", @"unlock", @"pro", @"premium", @"entitle", @"member", "subscri"]; });
+    return p;
+}
+static BOOL chainABoolNameHit(NSString *ivName) {
+    NSString *low = ivName.lowercaseString;
+    for (NSString *p in chainABoolNamePats())
+        if ([low rangeOfString:p].length) return YES;
+    return NO;
+}
+
+#pragma mark - 安全读(mach_vm probe — 候选 qword 解引用可能落未映射页)
+static BOOL chainASafeReadQ(uint64_t addr, uint64_t *out) {
+    vm_size_t sz = 0;
+    if (mach_vm_read_overwrite(mach_task_self_, (mach_vm_address_t)addr, 8,
+                               (mach_vm_address_t)out, &sz) != KERN_SUCCESS || sz != 8) return NO;
+    return YES;
+}
+// 候选 qword 是否长得像堆指针(高位非全 0/全 F, 落在 iOS 用户堆范围, 8 对齐)
+static BOOL chainALooksHeapPtr(uint64_t q) {
+    if (q < 0x100000000ULL || q > 0x800000000ULL) return NO;   // iOS 用户态堆 ~0x1_0000_0000..0x8_0000_0000(32G 封顶)
+    if (q & 0xFF00000000000000ULL) return NO;
+    return YES;
+}
+#define CHAINA_ISA_MASK 0x7FFFFFFFFFF8ULL
+
+#pragma mark - 实例定位(链A 直写的前提 — methods=0 类没有常规入口)
+// L1: app 镜像可写数据段 qword 扫描, isa 匹配目标类 — Swift "static let store = Store()"
+//     的全局强指针就在 __DATA; static let 是 Swift 单例主流写法。
+static NSArray *chainAScanDataSegFor(Class target, const char *imgPath) {
+    if (!target || !imgPath) return nil;
+    uint32_t n = _dyld_image_count();
+    const struct mach_header_64 *hdr = NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && !strcmp(nm, imgPath)) { hdr = (const void *)_dyld_get_image_header(i); break; }
+    }
+    if (!hdr) return nil;
+    intptr_t slide = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && !strcmp(nm, imgPath)) { slide = _dyld_get_image_slide(i); break; }
+    }
+    uintptr_t targetMasked = (uintptr_t)target & CHAINA_ISA_MASK;
+    NSMutableArray *found = [NSMutableArray new];
+    const struct load_command *lc = (const char *)hdr + sizeof(*hdr);
+    for (uint32_t ci = 0; ci < hdr->ncmds; ci++, lc = (const char *)lc + lc->cmdsize) {
+        if (lc->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *seg = (const void *)lc;
+        if (strcmp(seg->segname, "__DATA") && strcmp(seg->segname, "__DATA_CONST")
+            && strcmp(seg->segname, "__DATA_DIRTY") && strcmp(seg->segname, "__DATA_CONST_DIRTY")) continue;
+        uintptr_t start = (uintptr_t)slide + seg->vmaddr, end = start + seg->vmsize;
+        for (uintptr_t p = start; p + 8 <= end; p += 8) {
+            uint64_t q = *(uint64_t *)p;                 // 数据段已映射可读, 直接读
+            if (!chainALooksHeapPtr(q)) continue;
+            uint64_t isaQ = 0;
+            if (!chainASafeReadQ(q, &isaQ)) continue;
+            if ((isaQ & CHAINA_ISA_MASK) != targetMasked) continue;
+            id inst = (__bridge id)(void *)q;
+            if (object_getClass(inst) == target) {       // runtime 二次确认(含子类否决/isa 位处理)
+                BOOL dup = NO;
+                for (id e in found) if (e == inst) { dup = YES; break; }
+                if (!dup) {
+                    [found addObject:inst];
+                    if (found.count >= 8) return found;  // 异常多 = 垃圾误配保护, 截断
+                }
+            }
+        }
+    }
+    return found;
+}
+
+// L2: 供体实例内存(ivar extent 内)找目标类 isa — 容器类/ViewModel 持有 store 的形态。
+//     extent = 供体类最大 ivar offset + 16(末字段读余量), 无 ivar 时跳过。
+static void chainAScanDonorFor(Class target, id donor, NSMutableArray *out) {
+    Class dc = object_getClass(donor);
+    unsigned ivc = 0;
+    Ivar *ivs = class_copyIvarList(dc, &ivc);
+    if (!ivc || !ivs) { if (ivs) free(ivs); return; }
+    uintptr_t extent = 16;
+    for (unsigned k = 0; k < ivc; k++) {
+        uintptr_t o = (uintptr_t)ivar_getOffset(ivs[k]);
+        if (o + 16 > extent) extent = o + 16;
+    }
+    uintptr_t targetMasked = (uintptr_t)target & CHAINA_ISA_MASK;
+    uint8_t *base = (uint8_t *)(__bridge void *)donor;
+    for (uintptr_t p = 16; p + 8 <= extent; p += 8) {    // 前 16 字节是 isa+refcnt, 跳过
+        uint64_t q = *(uint64_t *)(base + p);            // 供体实例内偏移, 已知有效对象范围, 直接读
+        if (!chainALooksHeapPtr(q)) continue;
+        uint64_t isaQ = 0;
+        if (!chainASafeReadQ(q, &isaQ)) continue;
+        if ((isaQ & CHAINA_ISA_MASK) != targetMasked) continue;
+        id inst = (__bridge id)(void *)q;
+        if (object_getClass(inst) == target) {
+            BOOL dup = NO;
+            for (id e in out) if (e == inst) { dup = YES; break; }
+            if (!dup && out.count < 8) [out addObject:inst];
+        }
+    }
+    free(ivs);
+}
+
+// 实例定位总入口: L1(目标类所在镜像全局段) + L1(所有候选类镜像全局段) + L2(供体实例内扫)
+static NSArray *chainAFindInstances(NSString *clsName) {
+    Class target = objc_getClass(clsName.UTF8String);
+    if (!target) return nil;
+    NSMutableArray *out = [NSMutableArray new];
+    // L1a: 目标类镜像
+    for (NSDictionary *row in [mfChainARowsSnapshot() copy]) {
+        const char *img = [row[@"imgPath"] UTF8String];
+        if (!img) continue;
+        for (id inst in chainAScanDataSegFor(target, img))
+            if (object_getClass(inst) == target && ![out containsObject:inst] ) {
+                BOOL dup = NO; for (id e in out) if (e == inst) { dup = YES; break; }
+                if (!dup) [out addObject:inst];
+            }
+    }
+    // L2: 供体 = 上面 L1 找到的任何候选类实例, 扫其内存找目标 isa
+    if (out.count < 8) {
+        NSMutableArray *donors = [NSMutableArray new];
+        for (NSDictionary *row in [mfChainARowsSnapshot() copy]) {
+            Class dc = objc_getClass([row[@"name"] UTF8String]);
+            if (!dc) continue;
+            for (id inst in chainAScanDataSegFor(dc, [row[@"imgPath"] UTF8String]))
+                if (![donors containsObject:inst]) {
+                    BOOL dup = NO; for (id e in donors) if (e == inst) { dup = YES; break; }
+                    if (!dup) [donors addObject:inst];
+                }
+        }
+        for (id donor in donors) chainAScanDonorFor(target, donor, out);
+    }
+    return out;
+}
+
+#pragma mark - 直写核心(ivar 偏移 1 字节裸写 + 字节级日志)
+// 决策树:
+//   1) ivar 不存在 → 报错(computed property, 无存储 — B 链/fixup 域)
+//   2) KVC 先试(@objc 存在 setter 时干净; 纯 Swift 类会抛异常, 接住继续)
+//   3) 裸写: offset 处 8 字节安全读 — 指针形态(疑似 @Published box/对象字段)→ 不盲写, 报
+//      "疑似包装字段"给日志(下版展开 box 的判据); 否则写 1 字节 0x01 + 回读验证。
+// 返回 nil=成功; 非 nil=描述。outDesc 恒有值(进日志/toast 的字节级明细)。
+static NSString *chainAWriteField(NSString *clsName, NSString *ivName, id target,
+                                  NSString **outDesc) {
+    Class c = objc_getClass(clsName.UTF8String);
+    if (!c) { if (outDesc) *outDesc = @"类未找到"; return @"类未找到(已卸载?)"; }
+    if (!target) { if (outDesc) *outDesc = @"实例 nil"; return @"实例为 nil"; }
+    Ivar iv = class_getInstanceVariable(c, ivName.UTF8String);
+    if (!iv) { if (outDesc) *outDesc = @"ivar 不存在"; return @"ivar 不存在(computed? 待 B 链/fixup)"; }
+    ptrdiff_t off = ivar_getOffset(iv);
+    uint8_t *p = (uint8_t *)(__bridge void *)target + off;
+    // 写前 8 字节快照(判定字段形态 + 日志)
+    uint64_t before = 0;
+    BOOL gotQ = chainASafeReadQ((uint64_t)(uintptr_t)p, &before);
+    uint8_t b0 = p[0];
+    if (gotQ && chainALooksHeapPtr(before)) {
+        NSString *msg = [NSString stringWithFormat:@"offset %td 写前 qword=%llx 疑似指针/包装字段 — 不盲写(下版展开 box)", off, before];
+        if (outDesc) *outDesc = msg;
+        return @"疑似包装字段(@Published box?) — 不盲写";
+    }
+    // KVC 机会主义(纯 Swift 无 accessor 会抛 NSUndefinedKey, 接住走裸写)
+    NSString *kvcKey = [ivName copy];
+    BOOL kvcOK = NO;
+    @try { [target setValue:@YES forKey:kvcKey]; kvcOK = (p[0] != 0); } @catch (NSException *e) { kvcOK = NO; }
+    if (!kvcOK) p[0] = 0x01;
+    uint8_t after = p[0];
+    NSString *desc = [NSString stringWithFormat:@"%@.%@ off=%td before=%02x after=%02x%@",
+        clsName, ivName, off, b0, after, kvcOK ? @" (KVC)" : @" (裸写)"];
+    if (outDesc) *outDesc = desc;
+    if (after != 0x01) return @"写后回读不为 1 — 失败";
+    return nil;
+}
+
+#pragma mark - 持久化(mfChainAWrites_<bid>: [{cls,fld,on}] 冷启动重打)
+static NSString *chainAWritesKey(void) {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    return [NSString stringWithFormat:@"mfChainAWrites_%@", bid ?: @"unknown"];
+}
+static NSString *MFPrefsPathC(void) {
+    return @"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist";
+}
+static NSMutableArray *chainAWritesLoad(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:MFPrefsPathC()];
+    id raw = d[chainAWritesKey()];
+    if ([raw isKindOfClass:[NSString class]]) {
+        NSArray *a = [NSJSONSerialization JSONObjectWithData:[raw dataUsingEncoding:NSUTF8StringEncoding]
+                                                    options:NSJSONReadingMutableContainers error:nil];
+        if ([a isKindOfClass:[NSArray class]]) return [a mutableCopy];
+    }
+    return [NSMutableArray new];
+}
+static void chainAWritesSave(NSMutableArray *arr) {
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:arr options:0 error:nil];
+    if (!jd) return;
+    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:MFPrefsPathC()] mutableCopy] ?: [NSMutableDictionary new];
+    d[chainAWritesKey()] = [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding];
+    [d writeToFile:MFPrefsPathC atomically:YES];
+}
+static void chainAWritesAdd(NSString *cls, NSString *fld) {
+    if (cls.length == 0 || fld.length == 0) return;
+    NSMutableArray *arr = chainAWritesLoad();
+    for (NSDictionary *r in arr)
+        if ([r[@"cls"] isEqualToString:cls] && [r[@"fld"] isEqualToString:fld]) return;
+    [arr addObject:@{@"cls": cls, @"fld": fld, @"on": @YES}];
+    chainAWritesSave(arr);
+    mfLog(@"[chainA] 💾 规则入库: %@.%@", cls, fld);
+}
+static void chainAWritesRemove(NSString *cls, NSString *fld) {
+    NSMutableArray *arr = chainAWritesLoad();
+    NSMutableArray *keep = [NSMutableArray new];
+    for (NSDictionary *r in arr)
+        if (!([r[@"cls"] isEqualToString:cls] && [r[@"fld"] isEqualToString:fld])) [keep addObject:r];
+    chainAWritesSave(keep);
+}
+
+#pragma mark - 枚举(安全模式: 原子快照 + strdup 自持; 只扫 .app 自有镜像)
+// 事故链教训(勿重蹈): 逐索引 _dyld_get_image_name 动态 dlopen 悬挂指针(Crash#2);
+//   objc_copyClassList 全进程 realize 触发 Swift 泛型 conformance 空指针(Crash#1)。
+static NSMutableArray *g_chainARows = nil;   // [{name, img, imgPath, ivars, methods, bools}]
 static NSObject *g_chainALock = nil;
 static BOOL g_chainAScanned = NO;
 
-static NSDictionary *chainADumpClass(const char *cname, NSString *imgLeaf) {
+static NSDictionary *chainADumpClass(const char *cname, NSString *imgLeaf, const char *imgPath) {
     Class c = objc_getClass(cname);
     if (!c) return nil;
-    // ivar 枚举: PremiumStore 型单例字段(isPremium/unlocked/paid…)都在这
     unsigned ivc = 0;
     Ivar *ivs = class_copyIvarList(c, &ivc);
     NSMutableArray *ivars = [NSMutableArray array];
@@ -66,12 +291,11 @@ static NSDictionary *chainADumpClass(const char *cname, NSString *imgLeaf) {
         const char *in = ivar_getName(ivs[k]);
         const char *ty = ivar_getTypeEncoding(ivs[k]);
         if (!in) continue;
-        [ivars addObject:[NSString stringWithFormat:@"%s%s%@",
-            (ty && !strcmp(ty, "B")) ? "bool " : "", in,
-            (ty && !strcmp(ty, "B")) ? @"" : [NSString stringWithFormat:@" (%s)", ty ?: "?"]]];
+        BOOL b = chainAIsBoolIvar(ty);
+        [ivars addObject:[NSString stringWithFormat:@"%@%s%@",
+            b ? @"bool " : @"", in, b ? @"" : [NSString stringWithFormat:@" (%s)", ty ?: "?"]]];
     }
     if (ivs) free(ivs);
-    // method 枚举: @objc 可见的 getter(纯 Swift computed property 不进 method list — 探测版如实展示)
     NSMutableArray *methods = [NSMutableArray array];
     for (int meta = 0; meta < 2; meta++) {
         Class cc = meta ? object_getClass(c) : c;
@@ -84,13 +308,18 @@ static NSDictionary *chainADumpClass(const char *cname, NSString *imgLeaf) {
         }
         if (ms) free(ms);
     }
-    // bool 字段探测计数(A 链直写的候选目标)
     unsigned boolCnt = 0;
-    for (NSString *iv in ivars)
-        if ([iv hasPrefix:@"bool "]) boolCnt++;
+    for (NSString *iv in ivars) {
+        if (![iv hasPrefix:@"bool "]) continue;
+        NSString *nm = [iv substringFromIndex:5];
+        NSRange sp = [nm rangeOfString:@" ("];
+        if (sp.length) nm = [nm substringToIndex:sp.location];
+        if (chainABoolNameHit(nm)) boolCnt++;
+    }
     return @{
         @"name": [NSString stringWithUTF8String:cname],
         @"img": imgLeaf,
+        @"imgPath": imgPath ? [NSString stringWithUTF8String:imgPath] : @"",
         @"ivars": ivars,
         @"methods": methods,
         @"bools": @(boolCnt),
@@ -111,7 +340,7 @@ static void chainAScan(void) {
         unsigned nSafe = 0;
         for (unsigned i = 0; i < ic; i++) {
             const char *im = imgs[i];
-            if (!im || !strstr(im, ".app/")) continue;   // 只扫 app 自有镜像, 系统 cache 全排除
+            if (!im || !strstr(im, ".app/")) continue;
             safe[nSafe] = strdup(im);
             nSafe++;
         }
@@ -126,7 +355,7 @@ static void chainAScan(void) {
             NSString *leaf = [[NSString stringWithUTF8String:img] lastPathComponent];
             for (unsigned j = 0; j < cn; j++) {
                 if (!chainAClassIsCandidate(names[j])) continue;
-                NSDictionary *d = chainADumpClass(names[j], leaf);
+                NSDictionary *d = chainADumpClass(names[j], leaf, img);
                 if (d) { [g_chainARows addObject:d]; clsFound++; }
             }
             free(names);
@@ -134,7 +363,6 @@ static void chainAScan(void) {
         for (unsigned i = 0; i < nSafe; i++) free(safe[i]);
         free(safe);
         mfLog(@"[chainA] 探测: %u 个权益类(bool 字段候选见详情)", clsFound);
-        // v2.59.3: 探测结果完整进日志(验收/debug 不靠截屏 — 每类一行: 名字 + bool 字段名单)
         for (NSDictionary *d in g_chainARows) {
             NSMutableArray *bools = [NSMutableArray array];
             for (NSString *iv in (NSArray *)d[@"ivars"])
@@ -147,20 +375,47 @@ static void chainAScan(void) {
     }
 }
 
-// F8/侦查分流判据的对外只读接口
+// 对外只读接口
 unsigned long mfChainAClassCount(void) {
     @synchronized (g_chainALock ?: (g_chainALock = [NSObject new])) {
         return g_chainARows.count;
     }
 }
-void mfChainAProbe(void);   // fwd: 扫描入口(侦查自动触发用), 定义在下方
-NSArray *mfChainARowsSnapshot(void) {   // v2.59.3: 侦查读取探测行(只读快照)
+void mfChainAProbe(void);
+NSArray *mfChainARowsSnapshot(void) {
     @synchronized (g_chainALock ?: (g_chainALock = [NSObject new])) {
         return g_chainARows ?: @[];
     }
 }
+void mfChainAProbe(void) {
+    chainAScan();
+}
 
-#pragma mark - A 链探测列表页(UITableView, 对标 MFAPEntList)
+#pragma mark - 冷启动重打(MFPanel ctor → 延迟 3s; SK2 回填时机实测调)
+void mfChainABootReplay(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSMutableArray *arr = chainAWritesLoad();
+        if (!arr.count) return;
+        // 探测未跑时先补跑(冷启动直接重打场景)
+        chainAScan();
+        unsigned ok = 0, fail = 0;
+        for (NSMutableDictionary *r in arr) {
+            if (![r[@"on"] boolValue]) continue;
+            NSString *cls = r[@"cls"], *fld = r[@"fld"];
+            NSArray *insts = chainAFindInstances(cls);
+            if (!insts.count) { fail++; mfLog(@"[chainA] ✗ 重打 %@.%@ — 实例未定位(L1/L2 均 0)", cls, fld); continue; }
+            for (id inst in insts) {
+                NSString *desc = nil;
+                NSString *err = chainAWriteField(cls, fld, inst, &desc);
+                if (err) { fail++; mfLog(@"[chainA] ✗ 重打 %@ — %@", desc ?: err, err); }
+                else { ok++; mfLog(@"[chainA] ✓ 重打 %@ (inst %p)", desc, inst); }
+            }
+        }
+        mfLog(@"[chainA] Boot 重打完成: ok=%u fail=%u (3s)", ok, fail);
+    });
+}
+
+#pragma mark - A 链列表页
 @interface MFChainAList : NSObject <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) NSArray *rows;
 @end
@@ -192,42 +447,98 @@ NSArray *mfChainARowsSnapshot(void) {   // v2.59.3: 侦查读取探测行(只读
     st.frame = CGRectMake(16, 39, w - 16, 15);
     nm.text = d[@"name"];
     img.text = [NSString stringWithFormat:@"%@ · ivars %lu · methods %lu",
-        d[@"img"], (unsigned long)[(NSArray *)d[@"ivars"] count], (unsigned long)[(NSArray *)d[@"methods"] count]];
+        d[@"img"], (unsigned long)[(NSArray *)d[@"ivars"] count], (unsigned long)[(NSArray *)d[@"methods"] count];
     unsigned bools = [d[@"bools"] unsignedIntValue];
-    st.text = bools ? [NSString stringWithFormat:@"bool 字段 %u 个 — A 链直写候选", bools] : @"无 bool ivar(纯 Swift 判定, 待 B 链/fixup)";
+    st.text = bools ? [NSString stringWithFormat:@"bool 候选 %u 个 — 点行直写", bools] : @"无 bool ivar(纯 Swift 判定, 待 B 链/fixup)";
     st.textColor = bools ? [UIColor systemGreenColor] : [UIColor tertiaryLabelColor];
     return c;
 }
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    // 点行 → 详情: ivar/method 全量 dump(可长按复制文本由 UITextView 自带)
     NSDictionary *d = self.rows[ip.row];
-    UIView *page = mfMakePage([NSString stringWithFormat:@"A链 · %@", d[@"name"]], YES);
-    NSMutableString *txt = [NSMutableString string];
-    [txt appendFormat:@"类: %@\n镜像: %@\n\n== ivars ==\n", d[@"name"], d[@"img"]];
-    for (NSString *iv in (NSArray *)d[@"ivars"]) [txt appendFormat:@"  %@\n", iv];
-    [txt appendString:@"\n== methods(@objc 可见) ==\n"];
-    for (NSString *m in (NSArray *)d[@"methods"]) [txt appendFormat:@"  %@\n", m];
-    UITextView *tv2 = [[UITextView alloc] initWithFrame:CGRectMake(12, 54, g_mfCardW - 24, g_mfCardH - 66)];
-    tv2.text = txt;
-    tv2.font = [UIFont fontWithName:@"Menlo" size:11];
-    tv2.editable = NO;
-    tv2.selectable = YES;
+    NSString *clsName = d[@"name"];
+    UIView *page = mfMakePage([NSString stringWithFormat:@"⚡ %@", clsName], YES);
+
+    // 实例定位(L1 全局段 + L2 供体扫描 — methods=0 类的唯一入口)
+    NSArray *insts = chainAFindInstances(clsName);
+    UILabel *tgt = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, g_mfCardW - 32, 16)];
+    tgt.font = [UIFont fontWithName:@"Menlo" size:10];
+    tgt.textColor = insts.count ? [UIColor systemGreenColor] : [UIColor systemOrangeColor];
+    if (insts.count) {
+        NSMutableString *s = [NSMutableString stringWithFormat:@"实例 %lu 个:", (unsigned long)insts.count];
+        for (id i in insts) [s appendFormat:@" %p", i];
+        tgt.text = s;
+    } else {
+        tgt.text = @"实例 0 个(L1 全局段+L2 供体均 miss) — ⚡ 仍可点(写时报错进日志)";
+    }
+    [page addSubview:tgt];
+
+    __block CGFloat y = 74;
+    for (NSString *ivRaw in (NSArray *)d[@"ivars"]) {
+        BOOL isBool = [ivRaw hasPrefix:@"bool "];
+        NSString *ivName = isBool ? [ivRaw substringFromIndex:5] : ivRaw;
+        NSString *bare = [ivName componentsSeparatedByString:@" ("][0];
+        if (isBool && chainABoolNameHit(bare)) {
+            // ⚡置YES — Swift 存储属性直写候选
+            UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+            btn.frame = CGRectMake(16, y, g_mfCardW - 32, 34);
+            [btn setTitle:[NSString stringWithFormat:@"⚡ %@ = YES", ivName] forState:UIControlStateNormal];
+            btn.titleLabel.font = [UIFont fontWithName:@"Menlo" size:11];
+            btn.backgroundColor = [UIColor systemBlueColor];
+            btn.tintColor = UIColor.whiteColor;
+            btn.layer.cornerRadius = 8;
+            objc_setAssociatedObject(btn, "chainACls", clsName, OBJC_ASSOCIATION_RETAIN);
+            objc_setAssociatedObject(btn, "chainAFld", bare, OBJC_ASSOCIATION_RETAIN);
+            [btn addTarget:self action:@selector(chainAZap:) forControlEvents:UIControlEventTouchUpInside];
+            [page addSubview:btn];
+            y += 42;
+        } else {
+            UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 16)];
+            l.font = [UIFont fontWithName:@"Menlo" size:10];
+            l.textColor = [UIColor secondaryLabelColor];
+            l.text = ivName;
+            [page addSubview:l];
+            y += 22;
+        }
+    }
+    UITextView *tv2 = [[UITextView alloc] initWithFrame:CGRectMake(12, y + 6, g_mfCardW - 24, MAX(60, g_mfCardH - y - 70))];
+    tv2.font = [UIFont fontWithName:@"Menlo" size:10];
+    tv2.editable = NO; tv2.selectable = YES;
     tv2.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
     tv2.layer.cornerRadius = 10;
+    NSMutableString *txt = [NSMutableString stringWithString:@"== methods(@objc) ==\n"];
+    for (NSString *m in (NSArray *)d[@"methods"]) [txt appendFormat:@"  %@\n", m];
+    [tv2 setText:txt];
     [page addSubview:tv2];
     mfPushPage(page);
+}
+- (void)chainAZap:(UIButton *)b {
+    NSString *cls = objc_getAssociatedObject(b, "chainACls");
+    NSString *fld = objc_getAssociatedObject(b, "chainAFld");
+    if (!cls || !fld) { mfToast(@"按钮上下文丢失"); return; }
+    NSArray *insts = chainAFindInstances(cls);
+    if (!insts.count) {
+        mfToast(@"实例未定位 — L1/L2 均 0(下版加 alloc 捕获)");
+        mfLog(@"[chainA] ⚡ %@.%@ ✗ 实例未定位(L1/L2 miss)", cls, fld);
+        return;
+    }
+    unsigned ok = 0;
+    for (id inst in insts) {
+        NSString *desc = nil;
+        NSString *err = chainAWriteField(cls, fld, inst, &desc);
+        if (err) mfLog(@"[chainA] ⚡ ✗ %@ — %@", desc ?: @"", err);
+        else { ok++; mfLog(@"[chainA] ⚡ ✓ %@", desc); }
+    }
+    if (ok) {
+        mfToast([NSString stringWithFormat:@"✓ %@ = YES × %lu 实例 — 已入库自动重打", fld, (unsigned long)ok]);
+        chainAWritesAdd(cls, fld);
+    } else {
+        mfToast(@"✗ 写失败 — 见 mf_debug.log 字节明细");
+    }
 }
 @end
 static MFChainAList *g_chainAList = nil;
 
-// v2.59.3: 侦查自动触发入口 — F8 点位=0 且 SK2 形态时由 mfReconFingerprint 调用(后台线程安全:
-//   chainAScan 全程无 UI 调用; dispatch_once 语义靠 g_chainAScanned + @synchronized 保证)
-void mfChainAProbe(void) {
-    chainAScan();
-}
-
 @implementation MFPanelCtrl (ChainA)
-// A 链探测入口: 实验模拟页按钮 → 扫描 + 列表
 - (void)mfChainAShowPage {
     chainAScan();
     if (!g_chainARows.count) {
@@ -235,9 +546,9 @@ void mfChainAProbe(void) {
         mfLog(@"[chainA] 探测: 0 命中 — 非典型型, 考虑 fixup 重绑(开发中)");
         return;
     }
-    UIView *page = mfMakePage(@"🅰️ A链 · 权益类探测", YES);
+    UIView *page = mfMakePage(@"🅰️ A链 · 权益类直写", YES);
     UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(16, 46, g_mfCardW - 32, 34)];
-    hint.text = @"点位 0 的 SK2 型走此链 — 点行看 ivar/method, bool 字段 = 直写候选";
+    hint.text = @"点行进详情 → ⚡置YES 直写(自动入库, 冷启动 3s 重打); 实例定位: __DATA 扫描+供体扫描";
     hint.numberOfLines = 2;
     hint.font = [UIFont systemFontOfSize:10.5];
     hint.textColor = [UIColor secondaryLabelColor];

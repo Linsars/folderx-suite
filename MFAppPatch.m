@@ -936,7 +936,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     //   双链分流: F8 点位≥1 走 B 链(判定点卡片); =0 走本链。探测版先上, 写点下一版。
     UIButton *btnA = [UIButton buttonWithType:UIButtonTypeSystem];
     btnA.frame = CGRectMake(16, y, (g_mfCardW - 40) / 2, 38);
-    [btnA setTitle:@"🅰️ A链·权益类探测" forState:UIControlStateNormal];
+    [btnA setTitle:@"🅰️ A链·权益类直写" forState:UIControlStateNormal];
     [btnA addTarget:g_mfCtrl action:@selector(mfChainAShowPage) forControlEvents:UIControlEventTouchUpInside];
     [page addSubview:btnA];
     UIButton *btnKC = [UIButton buttonWithType:UIButtonTypeSystem];

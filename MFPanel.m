@@ -2460,6 +2460,8 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
         mfProcCaptureStart();
         extern void mfAppPatchBoot(void);       // v2.58: 判定点引擎(mfEntDumps 自判, 无开关)
         mfAppPatchBoot();
+        extern void mfChainABootReplay(void);   // v2.59.4: 链A 直写规则冷启动重打(3s 延迟)
+        mfChainABootReplay();
         mfObjCHookApplySilent();
         mfSubInjectAutoStart();
         mfReceiptForgeAutoStart();
