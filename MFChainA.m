@@ -141,6 +141,65 @@ static NSArray *chainAScanDataSegFor(Class target, const char *imgPath) {
     return found;
 }
 
+// L3: 全堆扫描(v2.59.9 新增 — L1 的存储位置假设修正)。
+//   ★ 2.59.8 验收实锤: gongju 全 4 类 L1/L2 双 miss。SwiftUI app 的 ObservableObject
+//     (@StateObject/.environmentObject) 强指针在 AttributeGraph 堆结构/UIHostingController
+//     持有链里, __DATA 全局段根本没有(static let 单例形态的假设对 SwiftUI app 不成立)。
+//   做法: vm_region_recurse 64 遍历 RW 匿名堆区(malloc zone), qword 解引用 isa 匹配。
+//   性能: 堆区几十 MB, vm_read_overwrite 逐 qword 太慢 — 按 region 整块读后内存匹配。
+static NSArray *chainAScanHeapFor(NSArray *targets) {
+    if (!targets.count) return nil;
+    NSMutableArray *found = [NSMutableArray new];
+    mach_port_t task = mach_task_self();
+    vm_address_t addr = 0;
+    vm_size_t size = 0;
+    natural_t depth = 0;
+    while (1) {
+        struct vm_region_submap_info_64 info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(task, &addr, &size, &depth,
+                                 (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS) break;
+        if (info.is_submap) { depth++; continue; }   // ★ 进入子映射: depth+1 后重入同 addr(API 语义), 不加 addr
+        {
+            BOOL rw = (info.protection & VM_PROT_READ) && (info.protection & VM_PROT_WRITE);
+            BOOL anon = info.share_mode == SM_PRIVATE;
+            BOOL heapRange = addr >= 0x100000000ULL && (addr + size) <= 0x800000000ULL;
+            BOOL shareModeOK = (info.share_mode == SM_EMPTY || info.share_mode == SM_PRIVATE || info.share_mode == SM_COW);
+            if (rw && anon && heapRange && shareModeOK && size >= 0x1000 && size <= 0x4000000) {
+                // 整块读进本地缓冲再匹配(vm_read 大块单次调用, 避免逐 qword trap 开销)
+                uint64_t nQ = size / 8;
+                uint64_t *buf = malloc(size);
+                vm_size_t got = 0;
+                if (buf && vm_read_overwrite(task, addr, size, (vm_address_t)buf, &got) == KERN_SUCCESS && got >= 16) {
+                    for (uint64_t qi = 0; qi + 1 < nQ && found.count < 24; qi++) {
+                        uint64_t q = buf[qi];
+                        if (!chainALooksHeapPtr(q) || (q & 0xF)) continue;   // 16 对齐过滤 — ObjC 对象全 16 对齐, 砍掉 15/16 解引用量
+                        // 快路径: q 指向的对象头就在本 region 内 → 直接 buf 读(零 trap)
+                        uint64_t iv = 0;
+                        uint64_t off = q - (uint64_t)addr;
+                        if (off + 8 <= got) iv = *(uint64_t *)((uint8_t *)buf + off);
+                        else if (!chainASafeReadQ(q, &iv)) continue;   // 区外对象才走 trap
+                        for (Class t in targets) {
+                            if (((uintptr_t)t & CHAINA_ISA_MASK) != (iv & CHAINA_ISA_MASK)) continue;
+                            id inst = (__bridge id)(void *)q;
+                            if (object_getClass(inst) == t) {
+                                BOOL dup = NO;
+                                for (id e in found) if (e == inst) { dup = YES; break; }
+                                if (!dup) [found addObject:inst];
+                            }
+                        }
+                    }
+                }
+                if (buf) free(buf);
+            }
+        }
+        addr += size;
+        if (addr == 0) break;
+        if (found.count >= 24) break;
+    }
+    return found;
+}
+
 // L2: 供体实例内存(ivar extent 内)找目标类 isa — 容器类/ViewModel 持有 store 的形态。
 //     extent = 供体类最大 ivar offset + 16(末字段读余量), 无 ivar 时跳过。
 static void chainAScanDonorFor(Class target, id donor, NSMutableArray *out) {
@@ -178,7 +237,15 @@ static NSArray *chainAFindInstances(NSString *clsName) {
     Class target = objc_getClass(clsName.UTF8String);
     if (!target) return nil;
     NSMutableArray *out = [NSMutableArray new];
-    // L1a: 目标类镜像
+    // v2.59.9: L3 全堆扫描(SwiftUI @StateObject 形态 — 2.59.8 验收 L1/L2 全 miss 实锤)
+    // ARC 铁律: for-in 内联非 Copy 命名返回函数会判非桥接指针 — 局部变量接住
+    NSArray *heapHits = chainAScanHeapFor(@[target]);
+    for (id inst in heapHits) {
+        BOOL dup = NO; for (id e in out) if (e == inst) { dup = YES; break; }
+        if (!dup && out.count < 8) [out addObject:inst];
+    }
+    if (out.count) return out;
+    // L1a: 目标类镜像(备选路径 — static let 单例形态)
     NSArray *rowsV1 = chainARowsSnapshotInternal();
     for (NSDictionary *row in rowsV1) {
         NSString *imgP = row[@"imgPath"];
