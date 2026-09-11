@@ -61,7 +61,7 @@ static BOOL chainAIsBoolIvar(const char *ty) {
 }
 static NSArray *chainABoolNamePats(void) {
     static NSArray *p; static dispatch_once_t o;
-    dispatch_once(&o, ^{ p = @[@"purchas", @"paid", @"unlock", @"pro", @"premium", @"entitle", @"member", "subscri"]; });
+    dispatch_once(&o, ^{ p = @[@"purchas", @"paid", @"unlock", @"pro", @"premium", @"entitle", @"member", @"subscri"]; });
     return p;
 }
 static BOOL chainABoolNameHit(NSString *ivName) {
@@ -71,11 +71,12 @@ static BOOL chainABoolNameHit(NSString *ivName) {
     return NO;
 }
 
-#pragma mark - 安全读(mach_vm probe — 候选 qword 解引用可能落未映射页)
+#pragma mark - 安全读(vm_read_overwrite probe — 候选 qword 解引用可能落未映射页)
+// SDK 14.5 的 mach_vm.h 带 #error, 用 MFProcCapture 同款 vm_read_overwrite(vm_address_t 32 位截断无虞 — iOS 用户态地址 < 32G)
 static BOOL chainASafeReadQ(uint64_t addr, uint64_t *out) {
     vm_size_t sz = 0;
-    if (mach_vm_read_overwrite(mach_task_self_, (mach_vm_address_t)addr, 8,
-                               (mach_vm_address_t)out, &sz) != KERN_SUCCESS || sz != 8) return NO;
+    if (vm_read_overwrite(mach_task_self(), (vm_address_t)addr, 8,
+                          (vm_address_t)out, &sz) != KERN_SUCCESS || sz != 8) return NO;
     return YES;
 }
 // 候选 qword 是否长得像堆指针(高位非全 0/全 F, 落在 iOS 用户堆范围, 8 对齐)
@@ -163,31 +164,32 @@ static void chainAScanDonorFor(Class target, id donor, NSMutableArray *out) {
 }
 
 // 实例定位总入口: L1(目标类所在镜像全局段) + L1(所有候选类镜像全局段) + L2(供体实例内扫)
+// fwd: g_chainARows 快照(定义在下方枚举区) — 此处在定义之前使用, 提前声明。
+static NSArray *chainARowsSnapshotInternal(void);
 static NSArray *chainAFindInstances(NSString *clsName) {
     Class target = objc_getClass(clsName.UTF8String);
     if (!target) return nil;
     NSMutableArray *out = [NSMutableArray new];
     // L1a: 目标类镜像
-    for (NSDictionary *row in [mfChainARowsSnapshot() copy]) {
-        const char *img = [row[@"imgPath"] UTF8String];
-        if (!img) continue;
-        for (id inst in chainAScanDataSegFor(target, img))
-            if (object_getClass(inst) == target && ![out containsObject:inst] ) {
+    for (NSDictionary *row in chainARowsSnapshotInternal()) {
+        NSString *imgP = row[@"imgPath"];
+        if (![imgP isKindOfClass:[NSString class]] || imgP.length == 0) continue;
+        for (id inst in chainAScanDataSegFor(target, imgP.UTF8String))
+            if (object_getClass(inst) == target) {
                 BOOL dup = NO; for (id e in out) if (e == inst) { dup = YES; break; }
                 if (!dup) [out addObject:inst];
             }
     }
-    // L2: 供体 = 上面 L1 找到的任何候选类实例, 扫其内存找目标 isa
+    // L2: 供体 = 任何候选类实例, 扫其内存找目标 isa
     if (out.count < 8) {
         NSMutableArray *donors = [NSMutableArray new];
-        for (NSDictionary *row in [mfChainARowsSnapshot() copy]) {
+        for (NSDictionary *row in chainARowsSnapshotInternal()) {
             Class dc = objc_getClass([row[@"name"] UTF8String]);
             if (!dc) continue;
-            for (id inst in chainAScanDataSegFor(dc, [row[@"imgPath"] UTF8String]))
-                if (![donors containsObject:inst]) {
-                    BOOL dup = NO; for (id e in donors) if (e == inst) { dup = YES; break; }
-                    if (!dup) [donors addObject:inst];
-                }
+            for (id inst in chainAScanDataSegFor(dc, [row[@"imgPath"] UTF8String])) {
+                BOOL dup = NO; for (id e in donors) if (e == inst) { dup = YES; break; }
+                if (!dup) [donors addObject:inst];
+            }
         }
         for (id donor in donors) chainAScanDonorFor(target, donor, out);
     }
@@ -387,6 +389,10 @@ NSArray *mfChainARowsSnapshot(void) {
         return g_chainARows ?: @[];
     }
 }
+// 内部快照(chainAFindInstances 定义在枚举区之前 — fwd 桥)
+static NSArray *chainARowsSnapshotInternal(void) {
+    return mfChainARowsSnapshot();
+}
 void mfChainAProbe(void) {
     chainAScan();
 }
@@ -447,7 +453,7 @@ void mfChainABootReplay(void) {
     st.frame = CGRectMake(16, 39, w - 16, 15);
     nm.text = d[@"name"];
     img.text = [NSString stringWithFormat:@"%@ · ivars %lu · methods %lu",
-        d[@"img"], (unsigned long)[(NSArray *)d[@"ivars"] count], (unsigned long)[(NSArray *)d[@"methods"] count];
+        d[@"img"], (unsigned long)[(NSArray *)d[@"ivars"] count], (unsigned long)[(NSArray *)d[@"methods"] count]];
     unsigned bools = [d[@"bools"] unsignedIntValue];
     st.text = bools ? [NSString stringWithFormat:@"bool 候选 %u 个 — 点行直写", bools] : @"无 bool ivar(纯 Swift 判定, 待 B 链/fixup)";
     st.textColor = bools ? [UIColor systemGreenColor] : [UIColor tertiaryLabelColor];
