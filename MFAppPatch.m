@@ -207,6 +207,8 @@ uintptr_t mfApSymVMAddr(const void *mh, const char *symName) {
 //   old 可选(带 = 字节验证双保险; 不带 = 符号定位唯一保险)
 // patch 目标必须是 Swift 直呼函数(class method 非动态派发, bl 直达函数地址 —
 // hasValidToken/hasPro 均为此类, PurchaseManager.isProEnabled 直接 bl 汇聚点已实锤)
+// v2.58.9 F8v2: sym 以 "@0x" 开头 = strip 二进制合成名 — 无符号表可查, 直接用
+// dump 内 vmaddr(镜像内偏移)+slide 定位, 与 F8v2 扫描器(链B引擎直打分支)配套
 static BOOL apSwiftTextPatch(NSString *imgName, NSString *symName, NSData *oldBytes, NSData *newBytes, NSString **err) {
     if (imgName.length < 3 || symName.length < 4 || newBytes.length < 4) { *err = @"bad swifttext args"; return NO; }
     // 1. 找镜像(名字 contains — ScriptingKit 匹配 "…/Scripting.app/Frameworks/ScriptingKit.framework/ScriptingKit")
@@ -224,7 +226,13 @@ static BOOL apSwiftTextPatch(NSString *imgName, NSString *symName, NSData *oldBy
     }
     if (!mh) { *err = [NSString stringWithFormat:@"image %@ not loaded", imgName]; return NO; }
     // 2. 符号解析 → 绝对地址
-    uintptr_t vmAddr = mfApSymVMAddr(mh, symName.UTF8String);
+    uintptr_t vmAddr = 0;
+    if ([symName hasPrefix:@"@0x"] || [symName hasPrefix:@"@0X"]) {
+        // F8v2 直打: sym 本身就是 vmaddr(镜像内偏移, 侦查时带 slide 存库)
+        vmAddr = (uintptr_t)strtoull(symName.UTF8String + 1, NULL, 16);
+    } else {
+        vmAddr = mfApSymVMAddr(mh, symName.UTF8String);
+    }
     if (!vmAddr) { *err = [NSString stringWithFormat:@"symbol not in %@", imgName]; return NO; }
     uintptr_t abs = vmAddr + (uintptr_t)slide;
     // 3. 执行 patch
