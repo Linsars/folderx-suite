@@ -142,6 +142,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
     // 的链描述(page_starts/next/ordinal)原样保留 — 静态 Python 版 596/596 全解同款算法
     struct { uint64_t vmaddr, vmsize, fileoff, filesize; const uint8_t *mem; } segs[8];
     int nSegs = 0;
+    lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));   // 重置! 上个循环已走到底(mf_debug_14 fixblob-locate 实锤)
     for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
         if (lc->cmd != LC_SEGMENT_64) continue;
         const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
