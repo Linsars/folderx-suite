@@ -307,7 +307,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
     if (!nCall) F8V2_BAIL("bl-scan");
 
     // ---- prologue 归属 + 评分 ----
-    // 头形态: pacibsp / stp x29,x30 pre / sub sp,sp,#N(Swift async 无帧指针, gongju 实锤)
+    // 头形态: pacibsp / stp 任意对 pre-index(不只 x29,x30 — yimuliaoran 显示层
+    // a9ba6ffc=stp x28,x27,[sp,#-N]! 实锤漏形态) / sub sp,sp,#N(Swift async 无帧指针)
     // + 自家 patch 头(mov w0,#1;ret)识别 — 已 patch 函数真头被毁, 认它保 patch 后重扫稳定
     // 评分: currentEntitlements+5 / productID+3 / updates+2 / TransactionVMa+2 /
     //   products+2 / purchase+1 / finish-requestReview-1; Product 显示系=0
@@ -320,7 +321,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
             uintptr_t ha = (uintptr_t)(pc - back) + (uintptr_t)slide;
             uint32_t q = *(const uint32_t *)ha;
             if (q == 0xD503237F) { head = pc - back; headOK = YES; break; }                     // pacibsp
-            if ((q & 0x7FC07FFF) == 0x29807BFD) { head = pc - back; headOK = YES; break; }       // stp x29,x30 pre
+            if ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) { head = pc - back; headOK = YES; break; } // stp Xt,Xt,[sp,#-N]! pre(任意寄存器对)
             if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) { head = pc - back; headOK = YES; break; } // sub sp,sp,#N
             if (q == 0x52800020 && *(const uint32_t *)(ha + 4) == 0xD65F03C0) { head = pc - back; headOK = YES; break; } // 自家 patch 头
         }
@@ -364,6 +365,217 @@ static NSDictionary *mfReconF8v2Scan(void) {
             @"calls": cands[i][@"calls"] ?: @0,
         }];
     }
+
+    // =====================================================================
+    // F8v3 (2026-09-12): 判定层深挖 — mf_debug_17 全候选⚡不亮定谳:
+    //   SK 消费层与真判定层之间隔 @Published box/async 闭包, bl 图断链(yimuliaoran
+    //   实锤: getter 0x1000a9c18 无 bl 调用者, keypath 间接)。通用算法三步:
+    //   ① 语义串引用: __TEXT 内 adrp+add 落到 __cstring/__objc_methname 里含
+    //      vip/entitle/premium/purchas/member/subscri/unlock 的串 → 引用函数集
+    //   ② SKU 交叉: app 已验证的产品 ID(侦查卡已有, 磁盘扫 com.<bundle 前缀>
+    //      备用) 的串引用函数 → 引用函数集(判定必比较 SKU)
+    //   ③ fan-in 共享 accessor: 被语义串函数集×SKU 函数集**共同 bl 的本地函数**
+    //      = 全 app 共用的判定 accessor(yimuliaoran 0x1000a65f0, 17 个调用者实锤)
+    //      — 恒真它 = 拦截读侧, 不依赖写侧数据流。零 per-app 硬编码, SKU 串动态发现。
+    // =====================================================================
+    @autoreleasepool {
+    // ---- ① 语义串表: 扫 __TEXT 的 cstring 区(LC 内全部只读 const 段) ----
+    // 引用扫一次 __text: adrp+add(±0/4/8/12 窗口) → 目标落段内 → 记 (pc, 目标串)
+    // 需要段表(const 段列表) — 从 segs[](已存)派生: fileoff=0 不可写, size>0, 含 __cstring 类
+    // 简化: 全 segs[] 段里 vmaddr 落在 [imgBase, imgBase+__TEXT vmsize) 外的 const 区都算
+    // 实操: 只扫 __TEXT.__cstring + __objc_methname(引用函数的目标判断用字符串内容)
+    static const char *kSemWords[] = { "vip", "entitle", "premium", "purchas", "member", "subscri", "unlock" };
+    // cstring 区 vmaddr/size(扫描时 LC 循环顺带收集) — 重走 LC 拿 __cstring/__objc_methname
+    uint64_t cstrVM = 0, cstrSize = 0, methVM = 0, methSize = 0;
+    lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
+    for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+        const struct section_64 *sc = (const struct section_64 *)((const uint8_t *)sg + sizeof(struct segment_command_64));
+        for (uint32_t s = 0; s < sg->nsects; s++, sc++) {
+            if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__cstring")) { cstrVM = sc->addr; cstrSize = sc->size; }
+            if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__objc_methname")) { methVM = sc->addr; methSize = sc->size; }
+        }
+    }
+    // SKU 串区: 已验证 ID 从哪来? 侦查卡 SK verify 结果只在 UI; 引擎层不依赖它 —
+    // 改扫 cstring 区找 "com." 开头且含 bundle 主前缀的串(app 自己的 SKU 家族)
+    if (!cstrSize) { /* 无 cstring 区(极端) — 跳过 F8v3 */ }
+    if (cstrSize) {
+        // cstring 区内 SKU 串地址表 + 语义串地址表(一次线性扫)
+        #define F8V3_MAXSTR 192
+        static uint64_t skuStrVM[F8V3_MAXSTR]; static uint64_t semStrVM[F8V3_MAXSTR];
+        int nSku = 0, nSem = 0;
+        const char *bundleId = [[[NSBundle mainBundle] bundleIdentifier] UTF8String];
+        // 主前缀: com.xxx.yyy → "xxx."(取前两段, 第三段起是产品名)
+        char bpre[64] = {0};
+        if (bundleId) { strncpy(bpre, bundleId, 63); char *d2 = strchr(bpre, '.'); if (d2 && (d2 = strchr(d2+1, '.'))) *d2 = 0; else bpre[0] = 0; }
+        const uint8_t *cb = (const uint8_t *)((uintptr_t)cstrVM + (uintptr_t)slide);
+        uint64_t coff = 0;
+        while (coff < cstrSize && (nSku < F8V3_MAXSTR || nSem < F8V3_MAXSTR)) {
+            const char *s = (const char *)(cb + coff);
+            size_t sl = strnlen(s, (size_t)(cstrSize - coff));
+            if (sl >= 4 && sl < 96) {
+                if (nSku < F8V3_MAXSTR && bpre[0] && !strncmp(s, bpre, strlen(bpre)) && s[strlen(s)-1] != '.')
+                    { skuStrVM[nSku++] = cstrVM + coff; }
+                else {
+                    for (int w = 0; w < 7 && nSem < F8V3_MAXSTR; w++)
+                        if (strstr(s, kSemWords[w])) { semStrVM[nSem++] = cstrVM + coff; break; }
+                }
+            }
+            coff += sl + 1;
+        }
+        mfLog(@"[f8v3] 语义串=%d SKU串=%d (前缀%s)", nSem, nSku, bpre[0] ? bpre : "(无)");
+        if (nSem >= 2 || nSku >= 1) {
+            // ---- ② 引用函数集: __text adrp+add 目标命中串地址 → 函数头 ----
+            // 函数头收集(全 __text prologue 扫一次, bsearch 归属)
+            #define F8V3_MAXFN 4096
+            static uint64_t fnHeads[F8V3_MAXFN]; int nFn = 0;
+            for (uint64_t off = 0; off + 4 <= textSize && nFn < F8V3_MAXFN; off += 4) {
+                uintptr_t a = (uintptr_t)textVM + (uintptr_t)slide + off;
+                uint32_t q = *(const uint32_t *)a;
+                if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
+                    ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
+                    (q == 0x52800020 && *(const uint32_t *)(a + 4) == 0xD65F03C0))
+                    fnHeads[nFn++] = textVM + off;
+            }
+            if (!nFn) { mfLog(@"[f8v3] 无函数头 — 跳过"); }
+            else {
+                // bl 全图一次扫: caller头 → 目标头/非头目标(本地函数指针引用是 bl 到非头也记)
+                // 只记: caller ∈ 语义/ SKU 引用函数, 目标 ∈ 本地 __text 内非 stub 区
+                // 语义引用函数集: bl 扫太重 — 用引用扫(adrp+add)直接归属
+                // (每 pc 归属函数头, 集合去重; SKU 集同理)
+                uint64_t semFn[F8V3_MAXFN/2]; int nSemFn = 0;
+                uint64_t skuFn[F8V3_MAXFN/2]; int nSkuFn = 0;
+                for (uint64_t off = 0; off + 16 <= textSize; off += 4) {
+                    uintptr_t a = (uintptr_t)textVM + (uintptr_t)slide + off;
+                    uint32_t ins1 = *(const uint32_t *)a;
+                    if ((ins1 & 0x9F000000) != 0x90000000) continue;
+                    int64_t imm = (int64_t)((((ins1 >> 5) & 0x7FFFF) << 2) | ((ins1 >> 29) & 3));
+                    if (imm & (1 << 20)) imm -= (int64_t)(1 << 21);
+                    uint64_t page = (textVM + off) & ~0xFFFULL;
+                    if (imm >= 0) page += (uint64_t)imm << 12; else page -= (uint64_t)(-imm) << 12;
+                    // ±4/8/12 窗口找 add imm12
+                    uint64_t tgt = 0; BOOL found = NO;
+                    for (int d2 = 4; d2 <= 12 && !found; d2 += 4) {
+                        uint32_t ins2 = *(const uint32_t *)(a + d2);
+                        if ((ins2 & 0xFFC00000) == 0x91000000) {
+                            uint64_t add = ((ins2 >> 10) & 0xFFF) << ((ins2 >> 22) & 3);
+                            tgt = page + add; found = YES;
+                        }
+                    }
+                    if (!found) continue;
+                    BOOL isSem = NO, isSku = NO;
+                    for (int k = 0; k < nSem && !isSem; k++) if (semStrVM[k] == tgt) isSem = YES;
+                    for (int k = 0; k < nSku && !isSku; k++) if (skuStrVM[k] == tgt) isSku = YES;
+                    if (!isSem && !isSku) continue;
+                    // pc 归属函数头(线性回溯到最近 prologue — 从 off 向下扫, 遇 prologue 停)
+                    uint64_t h = 0;
+                    for (int64_t back = 0; back < 0x10000 && off >= (uint64_t)back + 4; back += 4) {
+                        uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back);
+                        if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
+                            ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
+                            (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back + 4) == 0xD65F03C0))
+                            { h = textVM + off - back; break; }
+                    }
+                    if (!h) continue;
+                    if (isSem && nSemFn < F8V3_MAXFN/2) {
+                        BOOL dup = NO;
+                        for (int k = 0; k < nSemFn; k++) if (semFn[k] == h) { dup = YES; break; }
+                        if (!dup) semFn[nSemFn++] = h;
+                    }
+                    if (isSku && nSkuFn < F8V3_MAXFN/2) {
+                        BOOL dup = NO;
+                        for (int k = 0; k < nSkuFn; k++) if (skuFn[k] == h) { dup = YES; break; }
+                        if (!dup) skuFn[nSkuFn++] = h;
+                    }
+                }
+                mfLog(@"[f8v3] 语义引用函数=%d SKU引用函数=%d", nSemFn, nSkuFn);
+                // ---- ③ 判定 accessor: S∪W 2 跳 fan 模型(静态预验证 yimuliaoran 收敛) ----
+                // 结构实测: 语义显示函数 bl 包装器(选择器) → 包装器 bl 真 accessor。
+                // SKU 交叉在数据流单向的 app 上到不了读侧(SKU 写侧独立) — SKU 只当
+                // "确有判定"的确认信号。算法: W = S 的 bl 目标(head 元素); 
+                // fan(t) = W 中 bl 到 t 的函数数; accessor = fan≥2 且非 W(非中间层)。
+                if (nSemFn >= 3 && nSkuFn >= 1) {
+                    // 辅助: 找 h 的下一头(有序表线性搜太慢 — nFn~2000, nSemFn~18, 可受)
+                    int (^idxOf)(uint64_t) = ^int(uint64_t h) {
+                        for (int k = 0; k < nFn; k++) if (fnHeads[k] == h) return k;
+                        return -1;
+                    };
+                    // S 的 bl 目标 → W(只收 head 元素 — 函数内入口不展开, 会爆)
+                    #define F8V3_MAXW 256
+                    static uint64_t W[F8V3_MAXW]; int nW = 0;
+                    for (int i2 = 0; i2 < nSemFn; i2++) {
+                        uint64_t h = semFn[i2];
+                        int hi = idxOf(h);
+                        uint64_t end2 = (hi >= 0 && hi + 1 < nFn) ? fnHeads[hi+1] : textVM + textSize;
+                        for (uint64_t off2 = h - textVM; off2 + 4 <= end2 - textVM; off2 += 4) {
+                            uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off2);
+                            uint32_t op = ins >> 26;
+                            if (op != 0x25 && op != 0x05) continue;
+                            int64_t imm2 = (int64_t)(ins & 0x3FFFFFF);
+                            if (imm2 & (1 << 25)) imm2 -= (int64_t)(1 << 26);
+                            uint64_t t2 = textVM + off2 + ((uint64_t)imm2 << 2);
+                            if (t2 <= textVM || t2 >= textVM + textSize) continue;
+                            if (t2 >= stubVM && t2 < stubVM + stubSize) continue;
+                            if (idxOf(t2) < 0) continue;                    // 只收 head(可展开)
+                            BOOL dup = NO;
+                            for (int k = 0; k < nW && !dup; k++) if (W[k] == t2) dup = YES;
+                            if (!dup && nW < F8V3_MAXW) W[nW++] = t2;
+                        }
+                    }
+                    // 2 跳 fan: W 中每个 w 的 bl 目标计数
+                    #define F8V3_MAXCAND 128
+                    static uint64_t accTgt[F8V3_MAXCAND]; static int accFan[F8V3_MAXCAND]; int nAcc = 0;
+                    for (int iw = 0; iw < nW; iw++) {
+                        uint64_t w = W[iw];
+                        BOOL isSemFn2 = NO;
+                        for (int k = 0; k < nSemFn; k++) if (semFn[k] == w) { isSemFn2 = YES; break; }
+                        if (isSemFn2) continue;                              // W ∩ S 已计过, 跳过防重复
+                        int hi = idxOf(w);
+                        uint64_t end2 = (hi >= 0 && hi + 1 < nFn) ? fnHeads[hi+1] : textVM + textSize;
+                        for (uint64_t off2 = w - textVM; off2 + 4 <= end2 - textVM; off2 += 4) {
+                            uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off2);
+                            uint32_t op = ins >> 26;
+                            if (op != 0x25 && op != 0x05) continue;
+                            int64_t imm2 = (int64_t)(ins & 0x3FFFFFF);
+                            if (imm2 & (1 << 25)) imm2 -= (int64_t)(1 << 26);
+                            uint64_t t2 = textVM + off2 + ((uint64_t)imm2 << 2);
+                            if (t2 <= textVM || t2 >= textVM + textSize) continue;
+                            if (t2 >= stubVM && t2 < stubVM + stubSize) continue;
+                            BOOL inW = NO;
+                            for (int k = 0; k < nW && !inW; k++) if (W[k] == t2) inW = YES;
+                            if (inW) continue;                               // 中间层不收
+                            int slot2 = -1;
+                            for (int k = 0; k < nAcc; k++) if (accTgt[k] == t2) { slot2 = k; break; }
+                            if (slot2 < 0 && nAcc < F8V3_MAXCAND) { accTgt[nAcc] = t2; accFan[nAcc] = 0; slot2 = nAcc++; }
+                            if (slot2 >= 0) accFan[slot2]++;
+                        }
+                    }
+                    // accessor = fan≥2; 排 runtime(取语义函数集最小地址做界 — 
+                    // swift/objc 基础库 fan 目标集中在 __text 前段)
+                    uint64_t textStartHi = UINT64_MAX;
+                    for (int k = 0; k < nSemFn; k++) if (semFn[k] < textStartHi) textStartHi = semFn[k];
+                    int nShared = 0;
+                    for (int k = 0; k < nAcc; k++) {
+                        if (accFan[k] >= 2 && accTgt[k] >= textStartHi) {
+                            nShared++;
+                            mfLog(@"[f8v3] ★判定accessor @%#llx (fan=%d)", (unsigned long long)accTgt[k], accFan[k]);
+                            [out addObject:@{
+                                @"img": imgName,
+                                @"sym": [NSString stringWithFormat:@"@%#llx", (unsigned long long)accTgt[k]],
+                                @"vmaddr": @(accTgt[k]),
+                                @"slide": @((long)slide),
+                                @"score": @90,        // 判定层直通位
+                                @"calls": @(accFan[k]),
+                            }];
+                        }
+                    }
+                    mfLog(@"[f8v3] 判定 accessor=%d 个 (W=%d)", nShared, nW);
+                }
+            }
+        }
+    }
+    } // @autoreleasepool F8v3
     return @{@"cands": out, @"ncalls": @(nCall), @"skstubs": @(nSkStub), @"skimports": @(nSkStub)};
     }
 }
