@@ -107,19 +107,25 @@ static NSDictionary *mfReconF8v2Scan(void) {
     }
     if (!textSize || !stubSize) F8V2_BAIL("lc-parse");
 
-    // ---- stub 步进前探测: 12B 常规 / 16B auth 变体(错位解码=乱匹配, 必须验证) ----
+    // ---- stub 步进探测: 12B 常规 / 16B auth 变体 ----
+    // 探测窗口 = 区内前 32 项滑窗(不止前 4 — yimuliaoran 开头几项形态混杂,
+    // mf_debug_12 stub-probe bail 实锤); 3/32 合法即定步进, 全失败回退 12B
+    // (分类循环有 adrp+ldr 形态过滤, 错位项自然跳过, 只损失覆盖率不误报)
     uint64_t stubStep = 0;
     for (uint64_t st = 12; st <= 16; st += 4) {
-        int wellFormed = 0;
-        for (int k = 0; k < 4; k++) {
-            uintptr_t a = (uintptr_t)stubVM + (uintptr_t)slide + (uint64_t)k * st;
-            if (a + 8 >= (uintptr_t)stubVM + (uintptr_t)slide + stubSize) break;
+        int wellFormed = 0, checked = 0;
+        for (uint64_t off = 0; off + 12 <= stubSize && checked < 32; off += st) {
+            uintptr_t a = (uintptr_t)stubVM + (uintptr_t)slide + off;
             uint32_t i1 = *(const uint32_t *)a, i2 = *(const uint32_t *)(a + 4), i3 = *(const uint32_t *)(a + 8);
-            if ((i1 >> 26) == 0x24 && (i2 & 0xFFC00000) == 0xF9400000 && (i3 & 0xFFFFFC1F) == 0xD61F0000) wellFormed++;
+            checked++;
+            // adrp 完整判定 = (ins & 0x9F000000)==0x90000000 — 0x90/0xb0/0xd0 开头都是 adrp(immlo 在低2位);
+            // v2.58.11 只查 >>26==0x24 漏掉 immlo≠0 形态 → yimuliaoran 前7个stub全BAD → stub-probe bail(mf_debug_12 实锤)
+            if ((i1 & 0x9F000000) == 0x90000000 && (i2 & 0xFFC00000) == 0xF9400000 && (i3 & 0xFFFFFC1F) == 0xD61F0000) wellFormed++;
         }
         if (wellFormed >= 3) { stubStep = st; break; }
     }
-    if (!stubStep) F8V2_BAIL("stub-probe");
+    if (!stubStep) stubStep = 12;   // 探测失败不 bail — 回退常规, 分类循环自滤错位项
+    mfLog(@"[f8v2] stub区=%lluB 步进=%llu", (unsigned long long)stubSize, (unsigned long long)stubStep);
 
     // ---- stub 分类: 槽值 → dladdr → StoreKit 过滤 ----
     // 槽值 = dyld 已 bind 的函数指针(单一地址源); dladdr 拿符号名+所属镜像
@@ -129,7 +135,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
     for (uint64_t off = 0; off + 12 <= stubSize && nSkStub < 128; off += stubStep) {
         uintptr_t a = (uintptr_t)stubVM + (uintptr_t)slide + off;
         uint32_t ins1 = *(const uint32_t *)a, ins2 = *(const uint32_t *)(a + 4);
-        if ((ins1 >> 26) != 0x24) continue;                 // adrp?
+        if ((ins1 & 0x9F000000) != 0x90000000) continue;       // adrp?(含 immlo≠0 形态)
         if ((ins2 & 0xFFC00000) != 0xF9400000) continue;    // ldr x16,[xN,#imm12*8]?
         int64_t imm = (int64_t)((((ins1 >> 5) & 0x7FFFF) << 2) | ((ins1 >> 29) & 3));
         if (imm & (1 << 20)) imm -= (int64_t)(1 << 21);

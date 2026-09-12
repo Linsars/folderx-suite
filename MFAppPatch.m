@@ -494,6 +494,17 @@ void mfAppPatchEntDumpSetOn(NSString *sym, BOOL on) {
         if ([m[@"sym"] isEqualToString:sym]) { m[@"on"] = @(on); break; }
     apEntDumpsSave();
 }
+// v2.58.12: 删除点位 — 左划删除用; 同 sym 去重口径单条删除(扫描 merge 端 img+sym 去重)
+void mfAppPatchEntDumpDelete(NSString *sym) {
+    apEntDumpsLoad();
+    for (NSInteger i = (NSInteger)g_entDumps.count - 1; i >= 0; i--)
+        if ([g_entDumps[i][@"sym"] isEqualToString:sym]) {
+            [g_entDumps removeObjectAtIndex:(NSUInteger)i];
+            apLog(@"[entdump] ✂ 删除点位 %@", sym);
+            break;
+        }
+    apEntDumpsSave();
+}
 // 冷启动/热触发: 重打所有 on=YES 点位(持久化执行核心)
 void apEntDumpsApply(void) {
     apEntDumpsLoad();
@@ -726,6 +737,7 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPEntPatchNow:(NSString *)sym;
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
 - (void)mfAPKeychainStub;
+- (void)mfAPEntDelete:(NSString *)sym;   // v2.58.12: 左划删除 — 假点位手动清理解
 @end
 
 static UITextView *g_apEditor = nil;
@@ -854,6 +866,23 @@ static UITextView *g_apEditor = nil;
     persist.backgroundColor = on ? [UIColor systemGrayColor] : [UIColor systemGreenColor];
     return [UISwipeActionsConfiguration configurationWithActions:@[patch, persist]];
 }
+// v2.58.12: 左划删除(trailing=⚡patch/💾持久, leading=删除 — 分开防误触)
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tv leadingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
+    NSDictionary *d = self.items[ip.row];
+    NSString *sym = d[@"sym"] ?: @"";
+    UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+        title:@"删除" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+            [(id)g_mfCtrl mfAPEntDelete:sym];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [tv reloadData];
+            });
+            done(YES);
+        }];
+    del.backgroundColor = [UIColor systemRedColor];
+    UISwipeActionsConfiguration *lead = [UISwipeActionsConfiguration configurationWithActions:@[del]];
+    lead.performsFirstActionWithFullSwipe = NO;   // 防全划误删
+    return lead;
+}
 @end
 
 // category 续: 判定点操作方法(列表类之后重新开)
@@ -890,6 +919,12 @@ static MFAPEntList *g_apEntList = nil;
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on {
     mfAppPatchEntDumpSetOn(sym, on);
     mfToast(on ? @"💾 已持久化 — 冷启动自动重打" : @"已取消持久化");
+}
+// v2.58.12: 左划删除 — 误扫/假点位清理解
+- (void)mfAPEntDelete:(NSString *)sym {
+    extern void mfAppPatchEntDumpDelete(NSString *);
+    mfAppPatchEntDumpDelete(sym);
+    mfToast(@"✂ 已删除点位");
 }
 // v2.58 占位: 自签票据写 app keychain(链B) — 实现为占位, 参数已逆向齐待落地
 - (void)mfAPKeychainStub {
