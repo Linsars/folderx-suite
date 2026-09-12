@@ -54,7 +54,7 @@ static BOOL mfRecIsSPMURL(const uint8_t *base, const uint8_t *hit) {
 }
 
 // ====================================================================
-// F8v2 rev2 (2026-09-12): SK2 判定点运行时定位 — stub 槽值 dladdr 分类法
+// F8v2 rev3 (2026-09-12): SK2 判定点运行时定位 — bind 链磁盘直读法
 // v1(2.58.9) dlsym 名字语义 bug(带 _ 传名全 miss) → v2(2.58.10) 修复后
 // yimuliaoran 实战(mf_debug_11)暴露三个新问题:
 //   ① dlsym 解析面不全: Product 系符号能解析, Transaction 系 miss →
@@ -62,9 +62,16 @@ static BOOL mfRecIsSPMURL(const uint8_t *base, const uint8_t *hit) {
 //   ② nCall 128 截断: 大 app SK 调用点超限, 排位靠后的判定函数被砍
 //   ③ patch 后重扫污染: 已 patch 函数头(mov w0,#1;ret)不再是 prologue,
 //      回溯越过真头落到前一函数体内 → 两次会话点位漂移 ~0x1A0
-// rev2 抛弃 imports 表+dlsym 双地址源(比对有缝), 直接用 stub 槽内 dyld 已
-// 解析的函数指针(单一地址源) → dladdr() 拿符号名/镜像名 → StoreKit 过滤:
-//   __stubs 逐个解码(步进 12/16 前探测) → slot 值 → dladdr → SK stub 集
+// rev3(2.58.12 后): rev2 的 dladdr 分类法在 iOS17+ 全灭(mf_debug_13 stub-match
+// 实锤) — dyld 源码定谳: dladdr 走 findClosestSymbol(需 local symtab), cache 内
+// image 的 local symbols 在独立 .symbols 文件运行时不可用 → dli_sname 全 null。
+// 回到 bind 链路线(2.58.9 放弃的), 但链改读**磁盘文件**: dyld applyFixups 只重写
+// __DATA 里的 GOT slot 值, 磁盘上链描述(page_starts/next/ordinal)原样保留 —
+// Python 静态版 yimuliaoran 596/596 stub 全解 / gongju 1468/1468 全解实证。
+// fixups blob 仍在内存读(在 __LINKEDIT, dyld 只读不写)。
+//   磁盘链走查 → slot_vmaddr→import ordinal 表(4096 上限)
+//   → __stubs 解码(adrp 完整掩码含 immlo≠0) → slot 查表 → 符号名(imports 池)
+//   → SK 词表(8StoreKit)过滤 → SK stub 集(带名字, 评分用)
 //   → __TEXT bl/b 扫描(上限 1024) → prologue 归属(pacibsp/stp/sub-sp +
 //      自家 patch 头识别, patch 后重扫点位稳定) → 评分 → top6 @0x 点位
 // ====================================================================
@@ -127,9 +134,121 @@ static NSDictionary *mfReconF8v2Scan(void) {
     if (!stubStep) stubStep = 12;   // 探测失败不 bail — 回退常规, 分类循环自滤错位项
     mfLog(@"[f8v2] stub区=%lluB 步进=%llu", (unsigned long long)stubSize, (unsigned long long)stubStep);
 
-    // ---- stub 分类: 槽值 → dladdr → StoreKit 过滤 ----
-    // 槽值 = dyld 已 bind 的函数指针(单一地址源); dladdr 拿符号名+所属镜像
-    // 精确锚定 dli_saddr==槽值(排除 dladdr nearest-below 模糊命中)
+    // ---- stub 分类 rev3: bind 链直读(零符号查询, 纯 LINKEDIT 元数据) ----
+    // dyld 源码定谳: dladdr 走 findClosestSymbol(需 local symtab) — iOS17+ cache
+    // local symbols 在独立 .symbols 文件运行时不可用 → dli_sname 全 null 全灭(mf_debug_13
+    // stub-match 实锤)。dlsym 走 export trie 可用, 但只给一个地址不认 stub。
+    // rev3 = 回 2.58.9 的 bind 链路线: dyld 只改写 GOT slot 的**值**, LINKEDIT 里
+    // 的链描述(page_starts/next/ordinal)原样保留 — 静态 Python 版 596/596 全解同款算法
+    struct { uint64_t vmaddr, vmsize, fileoff, filesize; const uint8_t *mem; } segs[8];
+    int nSegs = 0;
+    for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
+        if (lc->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+        if (nSegs < 8) { segs[nSegs].vmaddr = sg->vmaddr; segs[nSegs].vmsize = sg->vmsize;
+                         segs[nSegs].fileoff = sg->fileoff; segs[nSegs].filesize = sg->filesize;
+                         segs[nSegs].mem = (const uint8_t *)((uintptr_t)sg->vmaddr + (uintptr_t)slide);
+                         nSegs++; }
+    }
+    // fixups blob: LC_DYLD_CHAINED_FIXUPS dataoff → 定位到内存(找覆盖段)
+    uint64_t fixOff = 0, fixSize = 0;
+    lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
+    for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
+        if (lc->cmd == LC_DYLD_CHAINED_FIXUPS || lc->cmd == 0x80000034) {
+            const struct linkedit_data_command *ld = (const struct linkedit_data_command *)lc;
+            fixOff = ld->dataoff; fixSize = ld->datasize;
+        }
+    }
+    if (!fixSize || fixSize < 28) F8V2_BAIL("fixblob-locate");
+    const uint8_t *fixBase = NULL;
+    for (int s = 0; s < nSegs; s++)
+        if (fixOff >= segs[s].fileoff && fixOff < segs[s].fileoff + segs[s].filesize) {
+            fixBase = segs[s].mem + (fixOff - segs[s].fileoff);
+            break;
+        }
+    if (!fixBase) F8V2_BAIL("fixblob-locate");
+    uint32_t startsOff = *(const uint32_t *)(fixBase + 4);
+    uint32_t importsOff = *(const uint32_t *)(fixBase + 8);
+    uint32_t symbolsOff = *(const uint32_t *)(fixBase + 12);
+    uint32_t importsCount = *(const uint32_t *)(fixBase + 16);
+    uint32_t importsFormat = *(const uint32_t *)(fixBase + 20);
+    if (importsFormat != 1 || !importsCount) F8V2_BAIL("imports-format");
+    if (importsOff + 4ull * (uint64_t)importsCount > fixSize) F8V2_BAIL("imports-format");
+    const char *symPool = (const char *)(fixBase + symbolsOff);
+    const char *symPoolEnd = (const char *)fixBase + fixSize;   // 名字池尾部 NUL 兜底(blob 尾 = 池尾)
+
+    // dyld_chained_starts_in_image: seg_count u32 @0, seg_info_offset[seg_count] u32 @4
+    // (相对 startsOff 的偏移, 实测 yimuliaoran: 0,0,0x18,0x38,0 — 后两个是 __DATA_CONST/__DATA)
+    if (startsOff + 4 > fixSize) F8V2_BAIL("fixblob-size");
+    uint32_t segCount = *(const uint32_t *)(fixBase + startsOff);
+    if (segCount > 16 || startsOff + 4 + segCount * 4 > fixSize) F8V2_BAIL("fixblob-size");
+
+    // ---- bind 链走查: 必须读磁盘文件 ----
+    // dyld applyFixups 会把 __DATA/__DATA_CONST 里的链 qword 重写成最终指针(ordinal/next
+    // 位域被毁) — 内存走链读到的全是已 bind 指针, 2.58.9 因此放弃此路。但磁盘文件里
+    // 链描述原样保留(Python 静态版 596/596 全解实证)。fixups blob 本身在 __LINKEDIT
+    // (dyld 只读不写) — 内存读 fixBase 沿用。
+    // 链 qword(arm64): ordinal:24 | addend:8 | reserved:19 | next:12(4B步进) | bind:1(bit63)
+    NSData *bin = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:mainPath]
+                                         options:NSDataReadingMappedIfSafe error:nil];
+    if (!bin.length) F8V2_BAIL("disk-read");
+    const uint8_t *bd = (const uint8_t *)bin.bytes;
+    uint64_t binLen = (uint64_t)bin.length;
+    #define F8V2_MAXSLOT 4096
+    static uint64_t slotVM[F8V2_MAXSLOT]; static uint32_t slotOrd[F8V2_MAXSLOT]; int nSlot = 0;
+    for (uint32_t si = 0; si < segCount && nSlot < F8V2_MAXSLOT; si++) {
+        uint32_t segInfoOff = *(const uint32_t *)(fixBase + startsOff + 4 + si * 4);
+        if (!segInfoOff) continue;                              // 该段无 fixups
+        const uint8_t *sgB = fixBase + startsOff + segInfoOff;
+        // dyld_chained_starts_in_segment: size u32@0, page_size u16@4, format u16@6, segment_offset u64@8, max_valid u32@16, page_count u16@20, page_start[]@22
+        if ((uintptr_t)sgB + 22 > (uintptr_t)fixBase + fixSize) continue;
+        uint16_t pageSize = *(const uint16_t *)(sgB + 4);
+        uint16_t pageCount = *(const uint16_t *)(sgB + 20);
+        uint64_t segVM = *(const uint64_t *)(sgB + 8);
+        // 段的磁盘位置: 查 LC 段表(LC 循环时已存 segs[]) — 用 fileoff 定位磁盘链
+        uint64_t segFO = 0; BOOL segFound = NO;
+        for (int s = 0; s < nSegs; s++)
+            if (segs[s].vmaddr == segVM) { segFO = segs[s].fileoff; segFound = YES; break; }
+        if (!segFound) continue;
+        if ((uintptr_t)sgB + 22 + 2 * (uint64_t)pageCount > (uintptr_t)fixBase + fixSize) continue;
+        const uint16_t *pgStart = (const uint16_t *)(sgB + 22);
+        const uint16_t *multi = pgStart + pageCount;
+        for (uint32_t pi = 0; pi < pageCount && nSlot < F8V2_MAXSLOT; pi++) {
+            uint16_t st = pgStart[pi];
+            if (st == 0xFFFF) continue;
+            uint16_t chainStarts[32]; int nCS = 0;               // multi-entry 链表展开
+            if (st & 0x8000) {
+                uint32_t ci = st & 0x7FFF;
+                while (nCS < 32) {
+                    if ((uintptr_t)multi + 2 * ci + 2 > (uintptr_t)fixBase + fixSize) break;
+                    uint16_t v = multi[ci];
+                    chainStarts[nCS++] = v & 0x7FFF;
+                    if (v & 0x8000) break;
+                    ci++;
+                }
+            } else chainStarts[nCS++] = st;
+            for (int ci2 = 0; ci2 < nCS && nSlot < F8V2_MAXSLOT; ci2++) {
+                uint32_t cur = chainStarts[ci2]; int guard = 0;
+                while (guard++ < 100000 && nSlot < F8V2_MAXSLOT) {
+                    uint64_t fo = segFO + (uint64_t)pi * pageSize + cur;
+                    if (fo + 8 > binLen) break;                  // 越界(段截断/紧凑布局)
+                    uint64_t q = *(const uint64_t *)(bd + fo);    // 磁盘链 qword — bind 元数据原样
+                    if (q >> 63) {                               // bind entry
+                        uint32_t ord = (uint32_t)(q & 0xFFFFFF);
+                        if (ord < importsCount) { slotVM[nSlot] = segVM + (uint64_t)pi * pageSize + cur; slotOrd[nSlot] = ord; nSlot++; }
+                    }
+                    uint32_t nxt = (uint32_t)((q >> 51) & 0xFFF);
+                    if (!nxt) break;
+                    cur += nxt * 4;
+                }
+            }
+        }
+    }
+    mfLog(@"[f8v2] bind链 slot=%d (imports=%u)", nSlot, importsCount);
+    if (!nSlot) F8V2_BAIL("bind-walk");
+
+    // ---- stub → slot 匹配 → SK 词表过滤 ----
+    // slot 查找 O(nSlot)×596 — nSlot~1600 可接受; skStubNames 直接指向 symPool(静态区, 生命周期 OK)
     uint64_t skStubVM[128]; const char *skStubNames[128]; int nSkStub = 0;
     int nCE = 0, nUpd = 0, nPID = 0;
     for (uint64_t off = 0; off + 12 <= stubSize && nSkStub < 128; off += stubStep) {
@@ -141,26 +260,22 @@ static NSDictionary *mfReconF8v2Scan(void) {
         if (imm & (1 << 20)) imm -= (int64_t)(1 << 21);
         uint64_t page = (stubVM + off) & ~0xFFFULL;
         if (imm >= 0) page += (uint64_t)imm << 12; else page -= (uint64_t)(-imm) << 12;
-        uintptr_t slotAbs = (uintptr_t)page + (uintptr_t)slide + ((((ins2 >> 10) & 0xFFF) << 3));
-        uintptr_t slotVal = *(const uintptr_t *)slotAbs;
-        if (!slotVal) continue;
-        Dl_info di;
-        memset(&di, 0, sizeof(di));
-        uintptr_t probeVal = slotVal;
-        if (!dladdr((void *)probeVal, &di)) {
-            // arm64e auth 指针兜底: 高位是 PAC/diversity, 掩码后重试
-            probeVal = slotVal & 0x7FFFFFFFFFFFULL;
-            if (!dladdr((void *)probeVal, &di)) continue;
+        uint64_t slot = page + ((((ins2 >> 10) & 0xFFF) << 3));
+        const char *nm = NULL;
+        for (int k = 0; k < nSlot; k++) if (slotVM[k] == slot) {
+            uint32_t o = slotOrd[k];
+            if (importsOff + 4ull * (o+1) > fixSize) break;
+            const char *cand = symPool + (*(const uint32_t *)(fixBase + importsOff + 4 * (uint64_t)o) >> 9);
+            if (cand < symPool || cand >= symPoolEnd) break;    // 名偏移越界(池尾保护)
+            if (strstr(cand, "8StoreKit")) nm = cand;
+            break;
         }
-        if (!di.dli_sname || (uintptr_t)di.dli_saddr != probeVal) continue;
-        const char *sn = di.dli_sname;
-        BOOL isSK = (strstr(sn, "StoreKit") != NULL) || (di.dli_fname && strstr(di.dli_fname, "StoreKit"));
-        if (!isSK) continue;
-        if (strstr(sn, "currentEntitlements")) nCE++;
-        if (strstr(sn, "7updates")) nUpd++;
-        if (strstr(sn, "9productID")) nPID++;
+        if (!nm) continue;
+        if (strstr(nm, "currentEntitlements")) nCE++;
+        if (strstr(nm, "7updates")) nUpd++;
+        if (strstr(nm, "9productID")) nPID++;
         skStubVM[nSkStub] = stubVM + off;
-        skStubNames[nSkStub] = sn;
+        skStubNames[nSkStub] = nm;
         nSkStub++;
     }
     if (!nSkStub) F8V2_BAIL("stub-match");
