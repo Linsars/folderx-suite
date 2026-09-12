@@ -54,17 +54,19 @@ static BOOL mfRecIsSPMURL(const uint8_t *base, const uint8_t *hit) {
 }
 
 // ====================================================================
-// F8v2 (2026-09-12): chained fixups imports 解析 — strip 主二进制的 SK2 判定点定位
-// 算法(两样本 gongju/ScriptingKit 静态验证闭环; Apple fixup-chains.h 真源):
-//   LC_DYLD_CHAINED_FIXUPS → imports 表(4B/项: [lib_ordinal:8|weak:1|name_offset:23])
-//   → SK 词表过滤(Apple 符号永不 strip) → 拿到 SK 符号名集
-//   → __stubs 逐个解码 slot → dlsym 解析每个 SK 符号的运行时地址
-//   → stub slot 内存值(已 bind 的函数指针)与 dlsym 地址比对 → SK stub 集
-//   → __TEXT bl/b 扫描 → SK 调用点 → prologue 回溯归属函数 → 评分
-// 运行时关键(与静态分析不同): fixup 链条已被 dyld 消费替换, __got/__auth_got
-// slot 里是**已解析的函数指针** — 不再读链, 直接比对值。imports 表在
-// __LINKEDIT 元数据区, dyld 不改, 完好可读。
-// 产出 sym 格式: "@0x<vmaddr>" — apSwiftTextPatch 直打分支(无符号表依赖)
+// F8v2 rev2 (2026-09-12): SK2 判定点运行时定位 — stub 槽值 dladdr 分类法
+// v1(2.58.9) dlsym 名字语义 bug(带 _ 传名全 miss) → v2(2.58.10) 修复后
+// yimuliaoran 实战(mf_debug_11)暴露三个新问题:
+//   ① dlsym 解析面不全: Product 系符号能解析, Transaction 系 miss →
+//      扫到的全是 Product 显示层函数(证据行 score 全 0), 判定函数漏网
+//   ② nCall 128 截断: 大 app SK 调用点超限, 排位靠后的判定函数被砍
+//   ③ patch 后重扫污染: 已 patch 函数头(mov w0,#1;ret)不再是 prologue,
+//      回溯越过真头落到前一函数体内 → 两次会话点位漂移 ~0x1A0
+// rev2 抛弃 imports 表+dlsym 双地址源(比对有缝), 直接用 stub 槽内 dyld 已
+// 解析的函数指针(单一地址源) → dladdr() 拿符号名/镜像名 → StoreKit 过滤:
+//   __stubs 逐个解码(步进 12/16 前探测) → slot 值 → dladdr → SK stub 集
+//   → __TEXT bl/b 扫描(上限 1024) → prologue 归属(pacibsp/stp/sub-sp +
+//      自家 patch 头识别, patch 后重扫点位稳定) → 评分 → top6 @0x 点位
 // ====================================================================
 static NSDictionary *mfReconF8v2Scan(void) {
     @autoreleasepool {
@@ -88,99 +90,43 @@ static NSDictionary *mfReconF8v2Scan(void) {
         break;
     }
     if (!mh) return nil;
+    // 分步日志 — 链条长, 每个断点带步骤名, 验收一次定位
+    #define F8V2_BAIL(tag) do { mfLog(@"[f8v2] ✗ 步骤:%s 中断", tag); return nil; } while (0)
 
-    // v2.58.9b: 分步日志 — F8v2 链条长, 任何一步静默 return nil 都会变成"没找到"谜语
-    // 下面的每个 return nil 都带 [f8v2] 步骤标记, 验收一次定位
-    #define F8V2_BAIL(tag) do { mfLog(@"[f8v2] ✗ 步骤:%s 中断(主二进制解析链无果)", tag); return nil; } while (0)
-
-    // ---- 遍历 LC: fixups cmd / 段表 / __text/__stubs section ----
+    // ---- LC: __text/__stubs section(rev2 不再需要 fixups 表) ----
     const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
-    uint32_t fixOff = 0, fixSize = 0;
     uint64_t textVM = 0, textSize = 0, stubVM = 0, stubSize = 0;
-    struct { uint64_t fileoff, filesize, vmaddr; } segs[8];
-    int nSegs = 0;
     for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
-        if (lc->cmd == LC_DYLD_CHAINED_FIXUPS || lc->cmd == 0x80000034) {   // 0x80000034 = 老SDK无此常量
-            const struct linkedit_data_command *ld = (const struct linkedit_data_command *)lc;
-            fixOff = ld->dataoff; fixSize = ld->datasize;
-        } else if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-            if (nSegs < 8) { segs[nSegs].fileoff = sg->fileoff; segs[nSegs].filesize = sg->filesize; segs[nSegs].vmaddr = sg->vmaddr; nSegs++; }
-            const struct section_64 *sc = (const struct section_64 *)((const uint8_t *)sg + sizeof(struct segment_command_64));
-            for (uint32_t s = 0; s < sg->nsects; s++, sc++) {
-                if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__text")) { textVM = sc->addr; textSize = sc->size; }
-                if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__stubs")) { stubVM = sc->addr; stubSize = sc->size; }
-            }
+        if (lc->cmd != LC_SEGMENT_64) continue;
+        const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+        const struct section_64 *sc = (const struct section_64 *)((const uint8_t *)sg + sizeof(struct segment_command_64));
+        for (uint32_t s = 0; s < sg->nsects; s++, sc++) {
+            if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__text")) { textVM = sc->addr; textSize = sc->size; }
+            if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__stubs")) { stubVM = sc->addr; stubSize = sc->size; }
         }
     }
-    if (!fixSize || !textSize || !stubSize) F8V2_BAIL("lc-parse");
-    // fixups blob 内存地址 = 覆盖段 vmaddr + slide + (dataoff - fileoff)
-    // (__LINKEDIT 元数据区, dyld 只消费 fixup 链本身, 表头/imports 串原样保留)
-    const uint8_t *fixBase = NULL;
-    for (int s = 0; s < nSegs; s++)
-        if (fixOff >= segs[s].fileoff && fixOff < segs[s].fileoff + segs[s].filesize) {
-            fixBase = (const uint8_t *)((uintptr_t)segs[s].vmaddr + (uintptr_t)slide + (fixOff - segs[s].fileoff));
-            break;
-        }
-    if (!fixBase) F8V2_BAIL("fixblob-locate");
+    if (!textSize || !stubSize) F8V2_BAIL("lc-parse");
 
-    // ---- fixups header 7×u32 ----
-    if (fixSize < 28) F8V2_BAIL("fixblob-size");
-    uint32_t startsOff = *(const uint32_t *)(fixBase + 4);
-    uint32_t importsOff = *(const uint32_t *)(fixBase + 8);
-    uint32_t symbolsOff = *(const uint32_t *)(fixBase + 12);
-    uint32_t importsCount = *(const uint32_t *)(fixBase + 16);
-    uint32_t importsFormat = *(const uint32_t *)(fixBase + 20);
-    if (importsFormat != 1 || !importsCount) F8V2_BAIL("imports-format");   // 只支持 plain 4B import
-
-    // ---- 锚点2: imports 表 → SK 符号名集 ----
-    // SK 词表 = StoreKit API 家族(Apple 符号, App Store strip 永不删; 判定必须消费 SK2)
-    static const char *kSKWords[] = { "8StoreKit", "11TransactionV", "currentEntitlements", "7ProductV", "12TransactionsV" };
-    const uint32_t *impArr = (const uint32_t *)(fixBase + importsOff);
-    const char *symPool = (const char *)(fixBase + symbolsOff);
-    // SK 符号名 + 对应运行时地址(dlsym — 系统符号, dyld 已加载)
-    const char *skNames[48]; uintptr_t skAddrs[48]; int nSK = 0;
-    for (uint32_t i = 0; i < importsCount && nSK < 48; i++) {
-        const char *nm = symPool + (impArr[i] >> 9);
-        if (!nm) continue;
-        BOOL isSK = NO;
-        for (int w = 0; w < 5; w++) if (strstr(nm, kSKWords[w])) { isSK = YES; break; }
-        if (!isSK) continue;
-        // 过滤真 metadata(无 stub 槽): Mn(nominal)/Wl(protocol witness); Ma 保留 — metadata
-        // accessor 也是函数有 stub 槽(gongju 17 stub 里 ProductVMa/TransactionVMa 占近半)
-        size_t nl = strlen(nm);
-        if (nl < 8) continue;
-        if (!strcmp(nm + nl - 2, "Mn") || !strcmp(nm + nl - 2, "Wl")) continue;
-        if (strstr(nm, "Tu") && !strstr(nm, "vg")) continue;
-        // dlsym: Darwin dlsym 查找时自动加前导 _ — Mach-O 符号 "_$s8StoreKit…" 必须传 "$s8StoreKit…"
-        // (v2.58.9 首版传原名带 _, 全部 miss → nSK=0 静默断链 — 本次实锤修正)
-        const char *dlsymName = (nm[0] == '_') ? nm + 1 : nm;
-        void *addr = dlsym(RTLD_DEFAULT, dlsymName);
-        if (!addr) continue;
-        skNames[nSK] = nm; skAddrs[nSK] = (uintptr_t)addr; nSK++;
-    }
-    if (!nSK) F8V2_BAIL("sk-dlsym");
-
-    // ---- __stubs 解码 → slot 内存值(已解析函数指针)比对 → SK stub 集 ----
-    // stub 常规 12B(adrp+ldr+br); arm64e 有 16B auth 变体 — 前探测: 12B 连续 4 个形态
-    // 合法则用 12, 否则试 16(错位把数据当指令会乱解, 需验证 adrp/ldr 形态)
+    // ---- stub 步进前探测: 12B 常规 / 16B auth 变体(错位解码=乱匹配, 必须验证) ----
     uint64_t stubStep = 0;
     for (uint64_t st = 12; st <= 16; st += 4) {
         int wellFormed = 0;
         for (int k = 0; k < 4; k++) {
             uintptr_t a = (uintptr_t)stubVM + (uintptr_t)slide + (uint64_t)k * st;
-            if (a + 8 >= (uintptr_t)stubVM + slide + stubSize) break;
-            uint32_t i1 = *(const uint32_t *)a, i2 = *(const uint32_t *)(a + 4);
-            uint32_t i3 = *(const uint32_t *)(a + 8);
+            if (a + 8 >= (uintptr_t)stubVM + (uintptr_t)slide + stubSize) break;
+            uint32_t i1 = *(const uint32_t *)a, i2 = *(const uint32_t *)(a + 4), i3 = *(const uint32_t *)(a + 8);
             if ((i1 >> 26) == 0x24 && (i2 & 0xFFC00000) == 0xF9400000 && (i3 & 0xFFFFFC1F) == 0xD61F0000) wellFormed++;
         }
         if (wellFormed >= 3) { stubStep = st; break; }
     }
-    if (!stubStep) stubStep = 12;   // 探测失败按常规(可能小段/无 stub)
-    // stub 12B: adrp x16,page ; ldr x16,[x16,#off] ; br x16
-    // 运行时 slot 里 = bind 完成的函数地址 — 与 dlsym 地址比对即命中(无需解 fixup 链)
-    uint64_t skStubVM[64]; int skStubSymIdx[64]; int nSkStub = 0;
-    for (uint64_t off = 0; off + 12 <= stubSize && nSkStub < 64; off += stubStep) {
+    if (!stubStep) F8V2_BAIL("stub-probe");
+
+    // ---- stub 分类: 槽值 → dladdr → StoreKit 过滤 ----
+    // 槽值 = dyld 已 bind 的函数指针(单一地址源); dladdr 拿符号名+所属镜像
+    // 精确锚定 dli_saddr==槽值(排除 dladdr nearest-below 模糊命中)
+    uint64_t skStubVM[128]; const char *skStubNames[128]; int nSkStub = 0;
+    int nCE = 0, nUpd = 0, nPID = 0;
+    for (uint64_t off = 0; off + 12 <= stubSize && nSkStub < 128; off += stubStep) {
         uintptr_t a = (uintptr_t)stubVM + (uintptr_t)slide + off;
         uint32_t ins1 = *(const uint32_t *)a, ins2 = *(const uint32_t *)(a + 4);
         if ((ins1 >> 26) != 0x24) continue;                 // adrp?
@@ -190,20 +136,35 @@ static NSDictionary *mfReconF8v2Scan(void) {
         uint64_t page = (stubVM + off) & ~0xFFFULL;
         if (imm >= 0) page += (uint64_t)imm << 12; else page -= (uint64_t)(-imm) << 12;
         uintptr_t slotAbs = (uintptr_t)page + (uintptr_t)slide + ((((ins2 >> 10) & 0xFFF) << 3));
-        uintptr_t slotVal = *(const uintptr_t *)slotAbs;    // 已解析的函数指针
-        for (int k = 0; k < nSK; k++) if (slotVal == skAddrs[k]) {
-            skStubVM[nSkStub] = stubVM + off; skStubSymIdx[nSkStub] = k; nSkStub++;
-            break;
+        uintptr_t slotVal = *(const uintptr_t *)slotAbs;
+        if (!slotVal) continue;
+        Dl_info di;
+        memset(&di, 0, sizeof(di));
+        uintptr_t probeVal = slotVal;
+        if (!dladdr((void *)probeVal, &di)) {
+            // arm64e auth 指针兜底: 高位是 PAC/diversity, 掩码后重试
+            probeVal = slotVal & 0x7FFFFFFFFFFFULL;
+            if (!dladdr((void *)probeVal, &di)) continue;
         }
+        if (!di.dli_sname || (uintptr_t)di.dli_saddr != probeVal) continue;
+        const char *sn = di.dli_sname;
+        BOOL isSK = (strstr(sn, "StoreKit") != NULL) || (di.dli_fname && strstr(di.dli_fname, "StoreKit"));
+        if (!isSK) continue;
+        if (strstr(sn, "currentEntitlements")) nCE++;
+        if (strstr(sn, "7updates")) nUpd++;
+        if (strstr(sn, "9productID")) nPID++;
+        skStubVM[nSkStub] = stubVM + off;
+        skStubNames[nSkStub] = sn;
+        nSkStub++;
     }
     if (!nSkStub) F8V2_BAIL("stub-match");
+    mfLog(@"[f8v2] SK stub=%d (currentEntitlements=%d updates=%d productID=%d)", nSkStub, nCE, nUpd, nPID);
 
-    // ---- __TEXT bl/b 扫描 → SK 调用点 → 归属函数 ----
-    // 评分: currentEntitlements+5 / productID+3 / updates+2 / TransactionVMa+2 / products+2
-    //   purchase+1 / finish/requestReview -1(流程类降权)
-    // 注: 评分用的符号名 = stub 槽值反查 skAddrs
-    uint64_t callPC[128]; int callSKIdx[128]; int nCall = 0;
-    for (uint64_t off = 0; off + 4 <= textSize && nCall < 128; off += 4) {
+    // ---- __TEXT bl/b 扫描 → SK 调用点(上限 1024 — v2 的 128 截断教训) ----
+    enum { kMaxCall = 1024 };
+    static uint64_t callPC[kMaxCall]; static int callSKIdx[kMaxCall];
+    int nCall = 0;
+    for (uint64_t off = 0; off + 4 <= textSize && nCall < kMaxCall; off += 4) {
         uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off);
         uint32_t op = ins >> 26;
         if (op != 0x25 && op != 0x05) continue;       // bl / b
@@ -215,19 +176,23 @@ static NSDictionary *mfReconF8v2Scan(void) {
     }
     if (!nCall) F8V2_BAIL("bl-scan");
 
-    // 归属函数 + 评分(prologue: pacibsp / stp x29,x30 pre / sub sp,sp,#N — gongju 实锤 Swift async 形态)
-    // 评分: currentEntitlements+5 / productID+3 / updates+2 / TransactionVMa+2 / products+2
-    //   purchase+1 / finish/requestReview -1(流程类降权)
+    // ---- prologue 归属 + 评分 ----
+    // 头形态: pacibsp / stp x29,x30 pre / sub sp,sp,#N(Swift async 无帧指针, gongju 实锤)
+    // + 自家 patch 头(mov w0,#1;ret)识别 — 已 patch 函数真头被毁, 认它保 patch 后重扫稳定
+    // 评分: currentEntitlements+5 / productID+3 / updates+2 / TransactionVMa+2 /
+    //   products+2 / purchase+1 / finish-requestReview-1; Product 显示系=0
     NSMutableArray *cands = [NSMutableArray array];
     for (int i = 0; i < nCall; i++) {
         uint64_t pc = callPC[i];
         uint64_t head = 0; BOOL headOK = NO;
         for (uint64_t back = 0; back < 0x10000; back += 4) {
             if (pc < textVM + back) break;
-            uint32_t q = *(const uint32_t *)((uintptr_t)(pc - back) + (uintptr_t)slide);
-            if (q == 0xD503237F) { head = pc - back; headOK = YES; break; }
-            if ((q & 0x7FC07FFF) == 0x29807BFD) { head = pc - back; headOK = YES; break; }
-            if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) { head = pc - back; headOK = YES; break; }
+            uintptr_t ha = (uintptr_t)(pc - back) + (uintptr_t)slide;
+            uint32_t q = *(const uint32_t *)ha;
+            if (q == 0xD503237F) { head = pc - back; headOK = YES; break; }                     // pacibsp
+            if ((q & 0x7FC07FFF) == 0x29807BFD) { head = pc - back; headOK = YES; break; }       // stp x29,x30 pre
+            if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) { head = pc - back; headOK = YES; break; } // sub sp,sp,#N
+            if (q == 0x52800020 && *(const uint32_t *)(ha + 4) == 0xD65F03C0) { head = pc - back; headOK = YES; break; } // 自家 patch 头
         }
         if (!headOK) continue;
         int found = -1;
@@ -235,7 +200,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
         if (found < 0) { [cands addObject:[NSMutableDictionary dictionaryWithDictionary:@{@"vmaddr": @(head), @"score": @0, @"calls": @0}]]; found = (int)cands.count - 1; }
         NSMutableDictionary *cd = cands[found];
         cd[@"calls"] = @([cd[@"calls"] intValue] + 1);
-        const char *s = skNames[skStubSymIdx[callSKIdx[i]]];
+        const char *s = skStubNames[callSKIdx[i]];
         int sc = [cd[@"score"] intValue];
         if (strstr(s, "currentEntitlements")) sc += 5;
         else if (strstr(s, "9productID")) sc += 3;
@@ -256,15 +221,17 @@ static NSDictionary *mfReconF8v2Scan(void) {
     NSMutableArray *out = [NSMutableArray array];
     for (NSUInteger i = 0; i < cands.count && i < 6; i++) {
         uint64_t head = [cands[i][@"vmaddr"] unsignedLongValue];
+        mfLog(@"[f8v2] cand @%#llx score=%d calls=%d", (unsigned long long)head, [cands[i][@"score"] intValue], [cands[i][@"calls"] intValue]);
         [out addObject:@{
             @"img": imgName,
             @"sym": [NSString stringWithFormat:@"@%#llx", (unsigned long long)head],
             @"vmaddr": @(head),
             @"slide": @((long)slide),
             @"score": cands[i][@"score"] ?: @0,
+            @"calls": cands[i][@"calls"] ?: @0,
         }];
     }
-    return @{@"cands": out, @"ncalls": @(nCall), @"skstubs": @(nSkStub), @"skimports": @(nSK)};
+    return @{@"cands": out, @"ncalls": @(nCall), @"skstubs": @(nSkStub), @"skimports": @(nSkStub)};
     }
 }
 
@@ -573,7 +540,7 @@ NSDictionary *mfReconFingerprint(void) {
                 [entFuncs addObjectsFromArray:cands];
                 [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(F8v2 fixups 链, 主二进制无符号可查) — 见实验模拟页", (unsigned long)cands.count]];
                 for (NSDictionary *f in [cands subarrayWithRange:NSMakeRange(0, MIN(4, cands.count))]) {
-                    [lines addObject:[NSString stringWithFormat:@"  %@:%@ calls=%@ · swifttext 直打", f[@"img"], f[@"vmaddr"], f[@"score"] ?: @"?"]];
+                    [lines addObject:[NSString stringWithFormat:@"  %@:%@ score=%@ · swifttext 直打", f[@"img"], f[@"vmaddr"], f[@"score"] ?: @"?"]];
                 }
             } else [lines addObject:@"entitlement 判定点位: 未发现(框架无符号判定函数, 主二进制 fixups 链无 SK 消费候选)"];
         }
