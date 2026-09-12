@@ -205,8 +205,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
         if ((uintptr_t)sgB + 22 > (uintptr_t)fixBase + fixSize) continue;
         uint16_t pageSize = *(const uint16_t *)(sgB + 4);
         uint16_t pageCount = *(const uint16_t *)(sgB + 20);
-        uint64_t segVM = *(const uint64_t *)(sgB + 8);
-        // 段的磁盘位置: 查 LC 段表(LC 循环时已存 segs[]) — 用 fileoff 定位磁盘链
+        // segment_offset 是相对镜像基址的偏移(0x104000), 不是绝对 vmaddr(mf_debug_15 bind-walk 实锤)
+        // 基址 = 第一个 vmaddr≠0 的段(__PAGEZERO 是 0, segs[0] 不能当基址用)
+        uint64_t imgBase = 0;
+        for (int s = 0; s < nSegs; s++) if (segs[s].vmaddr) { imgBase = segs[s].vmaddr; break; }
+        uint64_t segVM = *(const uint64_t *)(sgB + 8) + imgBase;
+        // 段的磁盘位置: 查 LC 段表 — 用 fileoff 定位磁盘链
         uint64_t segFO = 0; BOOL segFound = NO;
         for (int s = 0; s < nSegs; s++)
             if (segs[s].vmaddr == segVM) { segFO = segs[s].fileoff; segFound = YES; break; }
