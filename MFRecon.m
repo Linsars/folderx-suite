@@ -89,6 +89,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
     }
     if (!mh) return nil;
 
+    // v2.58.9b: 分步日志 — F8v2 链条长, 任何一步静默 return nil 都会变成"没找到"谜语
+    // 下面的每个 return nil 都带 [f8v2] 步骤标记, 验收一次定位
+    #define F8V2_BAIL(tag) do { mfLog(@"[f8v2] ✗ 步骤:%s 中断(主二进制解析链无果)", tag); return nil; } while (0)
+
     // ---- 遍历 LC: fixups cmd / 段表 / __text/__stubs section ----
     const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
     uint32_t fixOff = 0, fixSize = 0;
@@ -109,7 +113,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
             }
         }
     }
-    if (!fixSize || !textSize || !stubSize) return nil;
+    if (!fixSize || !textSize || !stubSize) F8V2_BAIL("lc-parse");
     // fixups blob 内存地址 = 覆盖段 vmaddr + slide + (dataoff - fileoff)
     // (__LINKEDIT 元数据区, dyld 只消费 fixup 链本身, 表头/imports 串原样保留)
     const uint8_t *fixBase = NULL;
@@ -118,16 +122,16 @@ static NSDictionary *mfReconF8v2Scan(void) {
             fixBase = (const uint8_t *)((uintptr_t)segs[s].vmaddr + (uintptr_t)slide + (fixOff - segs[s].fileoff));
             break;
         }
-    if (!fixBase) return nil;
+    if (!fixBase) F8V2_BAIL("fixblob-locate");
 
     // ---- fixups header 7×u32 ----
-    if (fixSize < 28) return nil;
+    if (fixSize < 28) F8V2_BAIL("fixblob-size");
     uint32_t startsOff = *(const uint32_t *)(fixBase + 4);
     uint32_t importsOff = *(const uint32_t *)(fixBase + 8);
     uint32_t symbolsOff = *(const uint32_t *)(fixBase + 12);
     uint32_t importsCount = *(const uint32_t *)(fixBase + 16);
     uint32_t importsFormat = *(const uint32_t *)(fixBase + 20);
-    if (importsFormat != 1 || !importsCount) return nil;   // 只支持 plain 4B import
+    if (importsFormat != 1 || !importsCount) F8V2_BAIL("imports-format");   // 只支持 plain 4B import
 
     // ---- 锚点2: imports 表 → SK 符号名集 ----
     // SK 词表 = StoreKit API 家族(Apple 符号, App Store strip 永不删; 判定必须消费 SK2)
@@ -142,23 +146,41 @@ static NSDictionary *mfReconF8v2Scan(void) {
         BOOL isSK = NO;
         for (int w = 0; w < 5; w++) if (strstr(nm, kSKWords[w])) { isSK = YES; break; }
         if (!isSK) continue;
-        // 跳过元数据符号(Ma/Mn/Wl/构造器)与 async thunk(Tu 后缀), stub 槽只有真函数
+        // 过滤真 metadata(无 stub 槽): Mn(nominal)/Wl(protocol witness); Ma 保留 — metadata
+        // accessor 也是函数有 stub 槽(gongju 17 stub 里 ProductVMa/TransactionVMa 占近半)
         size_t nl = strlen(nm);
         if (nl < 8) continue;
-        if (!strcmp(nm + nl - 2, "Ma") || !strcmp(nm + nl - 2, "Mn") || !strcmp(nm + nl - 2, "Wl")) continue;
+        if (!strcmp(nm + nl - 2, "Mn") || !strcmp(nm + nl - 2, "Wl")) continue;
         if (strstr(nm, "Tu") && !strstr(nm, "vg")) continue;
-        // dlsym: Mach-O 符号带前导 _; dlsym 接受带 _ 原名(Swift mangled _$s… / ObjC 类 _OBJC_…)
-        void *addr = dlsym(RTLD_DEFAULT, nm);
+        // dlsym: Darwin dlsym 查找时自动加前导 _ — Mach-O 符号 "_$s8StoreKit…" 必须传 "$s8StoreKit…"
+        // (v2.58.9 首版传原名带 _, 全部 miss → nSK=0 静默断链 — 本次实锤修正)
+        const char *dlsymName = (nm[0] == '_') ? nm + 1 : nm;
+        void *addr = dlsym(RTLD_DEFAULT, dlsymName);
         if (!addr) continue;
         skNames[nSK] = nm; skAddrs[nSK] = (uintptr_t)addr; nSK++;
     }
-    if (!nSK) return nil;
+    if (!nSK) F8V2_BAIL("sk-dlsym");
 
     // ---- __stubs 解码 → slot 内存值(已解析函数指针)比对 → SK stub 集 ----
+    // stub 常规 12B(adrp+ldr+br); arm64e 有 16B auth 变体 — 前探测: 12B 连续 4 个形态
+    // 合法则用 12, 否则试 16(错位把数据当指令会乱解, 需验证 adrp/ldr 形态)
+    uint64_t stubStep = 0;
+    for (uint64_t st = 12; st <= 16; st += 4) {
+        int wellFormed = 0;
+        for (int k = 0; k < 4; k++) {
+            uintptr_t a = (uintptr_t)stubVM + (uintptr_t)slide + (uint64_t)k * st;
+            if (a + 8 >= (uintptr_t)stubVM + slide + stubSize) break;
+            uint32_t i1 = *(const uint32_t *)a, i2 = *(const uint32_t *)(a + 4);
+            uint32_t i3 = *(const uint32_t *)(a + 8);
+            if ((i1 >> 26) == 0x24 && (i2 & 0xFFC00000) == 0xF9400000 && (i3 & 0xFFFFFC1F) == 0xD61F0000) wellFormed++;
+        }
+        if (wellFormed >= 3) { stubStep = st; break; }
+    }
+    if (!stubStep) stubStep = 12;   // 探测失败按常规(可能小段/无 stub)
     // stub 12B: adrp x16,page ; ldr x16,[x16,#off] ; br x16
     // 运行时 slot 里 = bind 完成的函数地址 — 与 dlsym 地址比对即命中(无需解 fixup 链)
     uint64_t skStubVM[64]; int skStubSymIdx[64]; int nSkStub = 0;
-    for (uint64_t off = 0; off + 12 <= stubSize && nSkStub < 64; off += 12) {
+    for (uint64_t off = 0; off + 12 <= stubSize && nSkStub < 64; off += stubStep) {
         uintptr_t a = (uintptr_t)stubVM + (uintptr_t)slide + off;
         uint32_t ins1 = *(const uint32_t *)a, ins2 = *(const uint32_t *)(a + 4);
         if ((ins1 >> 26) != 0x24) continue;                 // adrp?
@@ -174,7 +196,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
             break;
         }
     }
-    if (!nSkStub) return nil;
+    if (!nSkStub) F8V2_BAIL("stub-match");
 
     // ---- __TEXT bl/b 扫描 → SK 调用点 → 归属函数 ----
     // 评分: currentEntitlements+5 / productID+3 / updates+2 / TransactionVMa+2 / products+2
@@ -191,7 +213,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
         for (int k = 0; k < nSkStub; k++)
             if (skStubVM[k] == tgt) { callPC[nCall] = textVM + off; callSKIdx[nCall] = k; nCall++; break; }
     }
-    if (!nCall) return nil;
+    if (!nCall) F8V2_BAIL("bl-scan");
 
     // 归属函数 + 评分(prologue: pacibsp / stp x29,x30 pre / sub sp,sp,#N — gongju 实锤 Swift async 形态)
     // 评分: currentEntitlements+5 / productID+3 / updates+2 / TransactionVMa+2 / products+2
@@ -224,7 +246,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
         else if (strstr(s, "6finish") || strstr(s, "requestReview")) sc -= 1;
         cd[@"score"] = @(sc);
     }
-    if (!cands.count) return nil;
+    if (!cands.count) F8V2_BAIL("prologue-own");
     [cands sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         int d = [b[@"score"] intValue] - [a[@"score"] intValue];
         return d < 0 ? NSOrderedAscending : (d > 0 ? NSOrderedDescending : NSOrderedSame);
