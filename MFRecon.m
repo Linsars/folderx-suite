@@ -285,6 +285,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
     }
     if (!nSkStub) F8V2_BAIL("stub-match");
     mfLog(@"[f8v2] SK stub=%d (currentEntitlements=%d updates=%d productID=%d)", nSkStub, nCE, nUpd, nPID);
+    // v2.58.16: stub 明细日志 — mf_debug_16 实锤运行时 SK stub=22 vs 静态 17, 差 5 个
+    // 假 stub 污染评分(垃圾候选 calls=10 score 错位), 名字打出来一次定位
+    for (int k = 0; k < nSkStub && k < 32; k++)
+        mfLog(@"[f8v2] stub[%d] @%#llx %s", k, (unsigned long long)skStubVM[k], skStubNames[k] ? skStubNames[k] : "(null)");
 
     // ---- __TEXT bl/b 扫描 → SK 调用点(上限 1024 — v2 的 128 截断教训) ----
     enum { kMaxCall = 1024 };
@@ -340,12 +344,15 @@ static NSDictionary *mfReconF8v2Scan(void) {
     if (!cands.count) F8V2_BAIL("prologue-own");
     [cands sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         int d = [b[@"score"] intValue] - [a[@"score"] intValue];
-        return d < 0 ? NSOrderedAscending : (d > 0 ? NSOrderedDescending : NSOrderedSame);
+        if (d) return d < 0 ? NSOrderedAscending : NSOrderedDescending;
+        return [a[@"calls"] intValue] <= [b[@"calls"] intValue] ? NSOrderedAscending : NSOrderedDescending;  // 并列时 calls 少的在前(判定函数调用点少, UI 函数调用点多)
     }];
 
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";
     NSMutableArray *out = [NSMutableArray array];
-    for (NSUInteger i = 0; i < cands.count && i < 6; i++) {
+    // v2.58.16: top6→top12 + CE 消费者无条件保位 — mf_debug_16 实锤真判定函数
+    // (CE 唯一消费者 0x100070cb0, score=5) 被垃圾候选(假 stub 的 calls大户)挤出 top6
+    for (NSUInteger i = 0; i < cands.count && i < 12; i++) {
         uint64_t head = [cands[i][@"vmaddr"] unsignedLongValue];
         mfLog(@"[f8v2] cand @%#llx score=%d calls=%d", (unsigned long long)head, [cands[i][@"score"] intValue], [cands[i][@"calls"] intValue]);
         [out addObject:@{
