@@ -502,8 +502,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         return -1;
                     };
                     // S 的 bl 目标 → W(只收 head 元素 — 函数内入口不展开, 会爆)
+                    // v2.58.19: S 直调也计 fan(0x1000b8700 直接 bl 真 oracle 的形态)
                     #define F8V3_MAXW 256
                     static uint64_t W[F8V3_MAXW]; int nW = 0;
+                    static uint64_t accTgt2[F8V3_MAXW]; static int accFan2[F8V3_MAXW]; int nAcc2 = 0;
                     for (int i2 = 0; i2 < nSemFn; i2++) {
                         uint64_t h = semFn[i2];
                         int hi = idxOf(h);
@@ -517,15 +519,21 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             uint64_t t2 = textVM + off2 + ((uint64_t)imm2 << 2);
                             if (t2 <= textVM || t2 >= textVM + textSize) continue;
                             if (t2 >= stubVM && t2 < stubVM + stubSize) continue;
-                            if (idxOf(t2) < 0) continue;                    // 只收 head(可展开)
+                            int sl2 = -1;
+                            for (int k = 0; k < nAcc2; k++) if (accTgt2[k] == t2) { sl2 = k; break; }
+                            if (sl2 < 0 && nAcc2 < F8V3_MAXW) { accTgt2[nAcc2] = t2; accFan2[nAcc2] = 0; sl2 = nAcc2++; }
+                            if (sl2 >= 0) accFan2[sl2]++;
+                            if (idxOf(t2) < 0) continue;                    // W 只收 head(可展开)
                             BOOL dup = NO;
                             for (int k = 0; k < nW && !dup; k++) if (W[k] == t2) dup = YES;
                             if (!dup && nW < F8V3_MAXW) W[nW++] = t2;
                         }
                     }
-                    // 2 跳 fan: W 中每个 w 的 bl 目标计数
+                    // 2 跳 fan: W 中每个 w 的 bl 目标计数(累加进 S 直调的 accTgt2 表)
                     #define F8V3_MAXCAND 128
                     static uint64_t accTgt[F8V3_MAXCAND]; static int accFan[F8V3_MAXCAND]; int nAcc = 0;
+                    // 先导入 S 直调表(v2.58.19)
+                    for (int k = 0; k < nAcc2; k++) { accTgt[nAcc] = accTgt2[k]; accFan[nAcc] = accFan2[k]; nAcc++; }
                     for (int iw = 0; iw < nW; iw++) {
                         uint64_t w = W[iw];
                         BOOL isSemFn2 = NO;
@@ -544,13 +552,16 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             if (t2 >= stubVM && t2 < stubVM + stubSize) continue;
                             BOOL inW = NO;
                             for (int k = 0; k < nW && !inW; k++) if (W[k] == t2) inW = YES;
-                            if (inW) continue;                               // 中间层不收
+                            // v2.58.19: 不再跳过 W 目标 — mf_debug_19 定谳: 语义函数可
+                            // 直接 bl 真 oracle(0x1000b8700→0x1000b81a0), "中间层不收"
+                            // 会把 oracle 误标中间层漏掉; 噪声交形态分类器拦(ptr 全滤)
                             int slot2 = -1;
                             for (int k = 0; k < nAcc; k++) if (accTgt[k] == t2) { slot2 = k; break; }
                             if (slot2 < 0 && nAcc < F8V3_MAXCAND) { accTgt[nAcc] = t2; accFan[nAcc] = 0; slot2 = nAcc++; }
                             if (slot2 >= 0) accFan[slot2]++;
                         }
                     }
+                    // w 自身的 fan 已由 S 直调计数 — W 循环跳过 W∩S 防双计(isSemFn2 检查已有)
                     // accessor = fan≥2; 排 runtime(取语义函数集最小地址做界 — 
                     // swift/objc 基础库 fan 目标集中在 __text 前段)
                     uint64_t textStartHi = UINT64_MAX;
@@ -561,53 +572,50 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     // 真 oracle 形态(yimuliaoran 0x1000b81a0): 函数尾 and w0,wN,#1 + ret。
                     // 分类: caller 侧 bl 后 ≤12 条指令内 tst w/cbz/csel(Bool 消费) vs
                     // ldur xN,[x0,#-8](指针消费) — 双信号定返回类型。
-                    for (int k = 0; k < nAcc; k++) accFan[k] = accFan[k]; // (占位, 下段用)
+                    // (占位行已删 — 分类逻辑在第二遍统一做)
+                    // v2.58.19 单遍: 门控(fan≥2 或 fan≥1+bool)+形态分类+输出
                     int nShared = 0;
                     for (int k = 0; k < nAcc; k++) {
-                        if (accFan[k] >= 2 && accTgt[k] >= textStartHi) {
+                        if (accTgt[k] < textStartHi || accFan[k] < 1) continue;
+                        BOOL boolTail2 = NO;
+                        for (uint64_t b = accTgt[k]; b + 8 <= textVM + textSize && b < accTgt[k] + 0x400; b += 4) {
+                            uint32_t x = *(const uint32_t *)((uintptr_t)b + (uintptr_t)slide);
+                            if (x == 0xD65F03C0) break;
+                            if ((x & 0xFF80001F) == 0x12000000 && ((x >> 5) & 0x1F) != 31) { boolTail2 = YES; break; }
+                        }
+                        BOOL isPtr2 = NO, isBool2 = NO;
+                        for (uint64_t off3 = 0; off3 + 4 <= textSize && !(isPtr2 && isBool2); off3 += 4) {
+                            uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3);
+                            uint32_t op = ins >> 26;
+                            if (op != 0x25 && op != 0x05) continue;
+                            int64_t imm3 = (int64_t)(ins & 0x3FFFFFF);
+                            if (imm3 & (1 << 25)) imm3 -= (int64_t)(1 << 26);
+                            if (textVM + off3 + ((uint64_t)imm3 << 2) != accTgt[k]) continue;
+                            BOOL ptrV = NO, boolV = NO;
+                            for (int step = 1; step <= 6 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
+                                uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
+                                if ((x >> 16) == 0xF85F && ((x >> 5) & 0x1F) == 0) { ptrV = YES; break; }
+                            }
+                            if (!ptrV) for (int step = 1; step <= 24 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
+                                uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
+                                if ((x & 0x7F800000) == 0x72000000 ||
+                                    (x & 0x7E000000) == 0x34000000 || (x & 0x7E000000) == 0x36000000 ||
+                                    (x & 0x7FE00C00) == 0x1A800000) { boolV = YES; break; }
+                            }
+                            isPtr2 |= ptrV; isBool2 |= boolV;
+                        }
+                        NSString *shape2 = isPtr2 ? @"ptr" : ((boolTail2 || isBool2) ? @"bool" : @"?");
+                        if (accFan[k] >= 2 || [shape2 isEqualToString:@"bool"]) {
                             nShared++;
-                            NSString *shape = nil;   // nil=未知(旧候选), bool/ptr=分类结果
-                            // callee 尾形态: 到首个 ret ≤0x400 内找 and w0,wN,#1
-                            BOOL boolTail = NO;
-                            for (uint64_t b = accTgt[k]; b + 8 <= textVM + textSize && b < accTgt[k] + 0x400; b += 4) {
-                                uint32_t x = *(const uint32_t *)((uintptr_t)b + (uintptr_t)slide);
-                                if (x == 0xD65F03C0) break;                                          // ret
-                                if ((x & 0xFF80001F) == 0x12000000 && ((x >> 5) & 0x1F) != 31) { boolTail = YES; break; }  // and w0,Wn,#imm
-                            }
-                            // caller 逐点投票(mf18 定谳: 指针消费=立即, Bool 消费可延迟): 
-                            // ptr票 = bl 后 ≤6 条 ldur xN,[x0,#imm](解引用返回值) — patch 炸弹
-                            // bool票 = ≤24 条 tst/cbz/csel 32位 — patch 返回 w0 安全
-                            BOOL anyPtr = NO, anyBool = NO;
-                            for (uint64_t off3 = 0; off3 + 4 <= textSize && !(anyPtr && anyBool); off3 += 4) {
-                                uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3);
-                                uint32_t op = ins >> 26;
-                                if (op != 0x25 && op != 0x05) continue;
-                                int64_t imm3 = (int64_t)(ins & 0x3FFFFFF);
-                                if (imm3 & (1 << 25)) imm3 -= (int64_t)(1 << 26);
-                                if (textVM + off3 + ((uint64_t)imm3 << 2) != accTgt[k]) continue;
-                                BOOL ptrV = NO, boolV = NO;
-                                for (int step = 1; step <= 6 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
-                                    uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
-                                    if ((x >> 16) == 0xF85F && ((x >> 5) & 0x1F) == 0) { ptrV = YES; break; }   // ldur xN,[x0,#-8]
-                                }
-                                if (!ptrV) for (int step = 1; step <= 24 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
-                                    uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
-                                    if ((x & 0x7F800000) == 0x72000000 ||                              // tst w
-                                        (x & 0x7E000000) == 0x34000000 || (x & 0x7E000000) == 0x36000000 || // cbz/cbzr 32位
-                                        (x & 0x7FE00C00) == 0x1A800000) { boolV = YES; break; }            // csel 32位
-                                }
-                                anyPtr |= ptrV; anyBool |= boolV;
-                            }
-                            shape = anyPtr ? @"ptr" : ((boolTail || anyBool) ? @"bool" : @"?");
-                            mfLog(@"[f8v3] ★判定accessor @%#llx (fan=%d shape=%@ 尾and=%d)", (unsigned long long)accTgt[k], accFan[k], shape, boolTail);
+                            mfLog(@"[f8v3] ★判定accessor @%#llx (fan=%d shape=%@ 尾and=%d)", (unsigned long long)accTgt[k], accFan[k], shape2, boolTail2);
                             [out addObject:@{
                                 @"img": imgName,
                                 @"sym": [NSString stringWithFormat:@"@%#llx", (unsigned long long)accTgt[k]],
                                 @"vmaddr": @(accTgt[k]),
                                 @"slide": @((long)slide),
-                                @"score": @([shape isEqualToString:@"bool"] ? 91 : 90),
+                                @"score": @([shape2 isEqualToString:@"bool"] ? 91 : 90),
                                 @"calls": @(accFan[k]),
-                                @"shape": shape,      // bool=可⚡ / ptr=禁patch(会崩) / ?=人工验
+                                @"shape": shape2,
                             }];
                         }
                     }
