@@ -503,19 +503,33 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 // SKU 交叉在数据流单向的 app 上到不了读侧(SKU 写侧独立) — SKU 只当
                 // "确有判定"的确认信号。算法: W = S 的 bl 目标(head 元素); 
                 // fan(t) = W 中 bl 到 t 的函数数; accessor = fan≥2 且非 W(非中间层)。
-                if (nSemFn >= 3 && nSkuFn >= 1) {
+                // v2.58.24: 门槛修正 — mf_debug_24 ServeLog 实锤语义串形态门把纯文案型 app
+                // 的 S 集清空(9→0), 旧门 nSemFn≥3 全灭 → 判定 accessor 段不跑, 真信号
+                // (尾and 候选)随 S 集一起丢。SKU 函数集(K) 是硬信号(判定必比较 SKU),
+                // S∪K 并集进 fan 展开: nSemFn+nSkuFn≥3 且 nSkuFn≥1。
+                if (nSemFn + nSkuFn >= 3 && nSkuFn >= 1) {
+                    // v2.58.24: S∪K 并集 fan 展开(旧: 仅 S) — K 的 bl 目标同样计 fan
+                    int nSK = nSemFn + nSkuFn;
+                    static uint64_t skFn[F8V3_MAXFN/2]; int nSKFn = 0;   // S∪K 去重并集
+                    for (int i2 = 0; i2 < nSemFn; i2++) skFn[nSKFn++] = semFn[i2];
+                    for (int i2 = 0; i2 < nSkuFn; i2++) {
+                        BOOL dup = NO;
+                        for (int k = 0; k < nSKFn; k++) if (skFn[k] == skuFn[i2]) { dup = YES; break; }
+                        if (!dup && nSKFn < F8V3_MAXFN/2) skFn[nSKFn++] = skuFn[i2];
+                    }
+                    (void)nSK;
                     // 辅助: 找 h 的下一头(有序表线性搜太慢 — nFn~2000, nSemFn~18, 可受)
                     int (^idxOf)(uint64_t) = ^int(uint64_t h) {
                         for (int k = 0; k < nFn; k++) if (fnHeads[k] == h) return k;
                         return -1;
                     };
-                    // S 的 bl 目标 → W(只收 head 元素 — 函数内入口不展开, 会爆)
+                    // S∪K 的 bl 目标 → W(只收 head 元素 — 函数内入口不展开, 会爆)
                     // v2.58.19: S 直调也计 fan(0x1000b8700 直接 bl 真 oracle 的形态)
                     #define F8V3_MAXW 256
                     static uint64_t W[F8V3_MAXW]; int nW = 0;
                     static uint64_t accTgt2[F8V3_MAXW]; static int accFan2[F8V3_MAXW]; int nAcc2 = 0;
-                    for (int i2 = 0; i2 < nSemFn; i2++) {
-                        uint64_t h = semFn[i2];
+                    for (int i2 = 0; i2 < nSKFn; i2++) {
+                        uint64_t h = skFn[i2];
                         int hi = idxOf(h);
                         uint64_t end2 = (hi >= 0 && hi + 1 < nFn) ? fnHeads[hi+1] : textVM + textSize;
                         for (uint64_t off2 = h - textVM; off2 + 4 <= end2 - textVM; off2 += 4) {
@@ -549,8 +563,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     for (int iw = 0; iw < nW; iw++) {
                         uint64_t w = W[iw];
                         BOOL isSemFn2 = NO;
-                        for (int k = 0; k < nSemFn; k++) if (semFn[k] == w) { isSemFn2 = YES; break; }
-                        if (isSemFn2) continue;                              // W ∩ S 已计过, 跳过防重复
+                        for (int k = 0; k < nSKFn; k++) if (skFn[k] == w) { isSemFn2 = YES; break; }
+                        if (isSemFn2) continue;                              // W ∩ (S∪K) 已计过, 跳过防重复
                         int hi = idxOf(w);
                         uint64_t end2 = (hi >= 0 && hi + 1 < nFn) ? fnHeads[hi+1] : textVM + textSize;
                         for (uint64_t off2 = w - textVM; off2 + 4 <= end2 - textVM; off2 += 4) {
@@ -577,7 +591,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     // accessor = fan≥2; 排 runtime(取语义函数集最小地址做界 — 
                     // swift/objc 基础库 fan 目标集中在 __text 前段)
                     uint64_t textStartHi = UINT64_MAX;
-                    for (int k = 0; k < nSemFn; k++) if (semFn[k] < textStartHi) textStartHi = semFn[k];
+                    for (int k = 0; k < nSKFn; k++) if (skFn[k] < textStartHi) textStartHi = skFn[k];   // v2.58.24: S∪K
                     // ---- 形态分类(mf_debug_18 定谳: mov w0,#1 对指针返回型=炸弹) ----
                     // mf_debug_18: ⚡0x1000a65f0(metadata accessor) → 内购页
                     // 0x1000a796c ldur x22,[x0,#-8] 解引用假指针 1 → 0xfff...f9 崩。

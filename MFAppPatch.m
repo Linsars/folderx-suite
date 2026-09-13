@@ -964,6 +964,9 @@ static MFAPEntList *g_apEntList = nil;
 @end
 
 // ====== 实验模拟页嵌入块 (由 MFPanel.m 的 mfShowLabPage 调用) ======
+// v2.58.24: F9 持久化状态显示(MFStateUnlock.m 导出)
+extern BOOL mfStatePersistIsOn(void);
+
 void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     CGFloat y = *yio;
     UILabel *grp = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 20)];
@@ -988,7 +991,8 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
         st.numberOfLines = 2;
         st.minimumScaleFactor = 0.7;
-        st.text = @"membership.* 语义key形态门侦查 → ⚡直写 · 零patch · 状态型主路线";
+        st.text = [NSString stringWithFormat:@"语义key侦查→⚡直写 · 零patch · 当前 app %@",
+                   mfStatePersistIsOn() ? @"已持久化" : @"未持久化"];
         st.font = [UIFont systemFontOfSize:10.5];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
@@ -997,37 +1001,31 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         [page addSubview:bar];
         y += 56;
     }
+    // v2.58.24: UI 合并(用户反馈) — 旧「🎯判定点按钮」+「🎯判定点卡片条」两个入口
+    // 合成一个 F9 同款卡片式交互; 点卡片条直接进列表。规则表(高级)入口移除
+    // (判定点主流程 v2.58 起不依赖规则表, 用户从未用过 — 编辑器代码保留, 入口撤)。
     {
         UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
         bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
         bar.layer.cornerRadius = 10;
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 5, g_mfCardW - 46, 22)];
-        l.text = @"🎯 判定点卡片";
+        l.text = @"🎯 判定点(代码判定型)";
         l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         [bar addSubview:l];
         UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
         st.numberOfLines = 2;
         st.minimumScaleFactor = 0.7;
-        st.text = [NSString stringWithFormat:@"侦查→卡片→左划[⚡patch][💾持久化] · 已存 %ld 点(%ld 持久)",
+        st.text = [NSString stringWithFormat:@"侦查点位→左划[⚡patch][💾持久化] · 已存 %ld 点(%ld 持久)",
                    mfAppPatchEntDumpCount(), (long)[[mfAppPatchEntDumps() filteredArrayUsingPredicate:
                         [NSPredicate predicateWithFormat:@"on == YES"]] count]];
         st.font = [UIFont systemFontOfSize:10.5];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:g_mfCtrl action:@selector(mfAPShowEntDumps)];
+        [bar addGestureRecognizer:tap];
         [page addSubview:bar];
         y += 56;
     }
-    UIButton *btnDumps = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnDumps.frame = CGRectMake(16, y, (g_mfCardW - 40) / 2, 38);
-    [btnDumps setTitle:@"🎯 判定点" forState:UIControlStateNormal];
-    [btnDumps addTarget:g_mfCtrl action:@selector(mfAPShowEntDumps) forControlEvents:UIControlEventTouchUpInside];
-    [page addSubview:btnDumps];
-    UIButton *btnRules = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnRules.frame = CGRectMake(16 + (g_mfCardW - 40) / 2 + 8, y, (g_mfCardW - 40) / 2, 38);
-    [btnRules setTitle:@"📜 规则表(高级)" forState:UIControlStateNormal];
-    [btnRules addTarget:g_mfCtrl action:@selector(mfAPShowRulesEditor) forControlEvents:UIControlEventTouchUpInside];
-    [page addSubview:btnRules];
-    y += 44;
     // v2.58 占位: 自签票据写入 app keychain(样本链B手法 — 无插件也亮)
     //   参数已逆向齐: kcp.ent.snapshot.v1 / DeviceSecret kcp.v3.nx7.p0.7f1a / LZFSE+HMAC-SHA256(psc.dv.s1)
     UIButton *btnKC = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -1041,7 +1039,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     [page addSubview:btnKC];
     y += 44;
     UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 64)];
-    note.text = @"冷启动: 有持久化点位自动重打(mov w0,#1; ret), 无开关依赖。\n规则表 = text/method 手工高级用法, 判定点主流程不依赖。\n日志已并入 mf_debug.log。";
+    note.text = @"冷启动: 已持久化点位自动重打(mov w0,#1; ret), 无开关依赖。\n规则表入口已撤(主流程不依赖); 日志已并入 mf_debug.log。";
     note.numberOfLines = 0;
     note.font = [UIFont systemFontOfSize:11];
     note.textColor = [UIColor secondaryLabelColor];
