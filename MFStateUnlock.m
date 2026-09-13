@@ -41,15 +41,38 @@ static void stateWordsInit(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         kStateKeyWords = @[@"vip", @"member", @"premium", @"purchas", @"entitle",
-                          @"lifetime", @"expir", @"unlock", @"subscri"];
+                          @"lifetime", @"expir", @"unlock", @"subscri",
+                          @"isvip", @"ispro", @"is_paid", @"ispaid", @"pro_"];  // v2.58.21: 词表补缺
         kStateDateWords = @[@"expir", @"date", @"until"];
     });
+}
+
+// —— key 形态门(v2.58.21): ServeLog 事故定谳 — 词表扫 __cstring 会命中英文文案/URL
+// ("No active ... purchase ..."/"https://apps.apple.com/..."). 真 plist key 是紧凑标识符:
+// a.b 点分 camelCase, 无空格, 无 ://, 段内仅字母数字+._-. 句子/URL 一律不是 key ——
+// 命中即清名单(词表误命中 = 误判状态型 = 掐死代码型 app 的 F8 路线, ServeLog 实锤)。
+static BOOL stateKeyShapeOK(NSString *k) {
+    if ([k containsString:@" "]) return NO;                      // 句子/短语(文案)
+    if ([k containsString:@"://"]) return NO;                    // URL
+    if ([k containsString:@"/"]) return NO;                      // 路径(含 URL 遗漏形态)
+    NSArray *segs = [k componentsSeparatedByString:@"."];
+    if (segs.count < 2) return NO;                               // 纯单词不是 plist key 风格
+    static NSCharacterSet *okChars = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ okChars = [[NSCharacterSet characterSetWithCharactersInString:
+        @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._"] invertedSet]; });
+    for (NSString *s in segs) {
+        if (!s.length) return NO;                                // a..b / .x 畸形
+        if ([s rangeOfCharacterFromSet:okChars].location != NSNotFound) return NO; // 段内仅 [A-Za-z0-9_-]
+    }
+    return YES;
 }
 
 static BOOL stateKeyMatch(NSString *k) {
     if (k.length < 4 || k.length > 64) return NO;
     if (![k containsString:@"."]) return NO;    // plist key 命名风格: a.b 点分 camelCase
     if ([k hasPrefix:@"com."]) return NO;       // 排除第三方 SDK 域名风格 key(RC 映射等 — 缓存 dict, 直写会破坏)
+    if (!stateKeyShapeOK(k)) return NO;         // v2.58.21: 形态门 — 文案/URL/路径不是 key
     NSString *lk = [k lowercaseString];
     for (NSString *w in kStateKeyWords)
         if ([lk containsString:w]) return YES;
@@ -277,6 +300,20 @@ void mfStateSetPersist(NSArray *keys, BOOL on) {
 }
 void mfStateBootReplay(void) {
     NSArray *ks = stateStore()[stateWritesKey()];
+    // v2.58.21: Boot 自愈 — 2.58.20 词表误命中(ServeLog 文案/URL 被⚡进 store)的
+    // 垃圾条目形态不过新门, 静默清出; 剩下的才重打。防跨版本污染滚动。
+    if ([ks isKindOfClass:[NSArray class]] && ks.count) {
+        NSMutableArray *ok = [NSMutableArray array];
+        for (NSString *k in ks) {
+            if ([k isKindOfClass:[NSString class]] && stateKeyShapeOK(k)) [ok addObject:k];
+            else mfLog(@"[f9] Boot 自愈: 剔除垃圾条目 %@", k);
+        }
+        if (ok.count < ks.count) {
+            if (ok.count) { stateStoreSet(@{stateWritesKey(): ok}); }
+            else { stateStoreSet(nil); }
+            ks = ok;
+        }
+    }
     if (![ks isKindOfClass:[NSArray class]] || !ks.count) return;
     long ok = 0;
     for (NSString *k in ks) if (mfStateUnlockApplyKey(k, YES)) ok++;

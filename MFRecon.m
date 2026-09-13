@@ -924,21 +924,24 @@ NSDictionary *mfReconFingerprint(void) {
                 [lines addObject:[NSString stringWithFormat:@"  %@:%#lx …%@", f[@"img"], [f[@"vmaddr"] unsignedLongValue], tail]];
             }
             } else {
-            // v2.58.20: F9 状态型判定优先 — 判定数据源形态先行, UserDefaults 型直写, 代码扫描降级
+        // v2.58.21: F9+F8 双路并报 — ServeLog 教训: 旧逻辑"F9 命中即跳过 F8"误判
+        // (文案/URL 词表误命中 → 把纯 SK2 代码判定型 app 掐死在 F8 门外)。现在
+        // 状态型线索与代码扫描并存, recon 只报数据, 用户在 UI 里自己选主路线。
+            // v2.58.20: F9 状态型判定 — 判定数据源形态先行, UserDefaults 型直写
             extern NSArray *mfStateProbeKeys(void);            // MFStateUnlock.m(F9 状态型判定)
             NSArray *stateKeys = mfStateProbeKeys();          // 局部接住(ARC 命名桥接教训)
             long nStateKeys = [stateKeys count];
             if (nStateKeys > 0) {
-                [lines addObject:[NSString stringWithFormat:@"判定数据源: 🔓 状态型(UserDefaults %ld 语义key) — 🧪实验模拟→F9 状态解锁 直写, 代码扫描已跳过", nStateKeys]];
+                [lines addObject:[NSString stringWithFormat:@"判定数据源: 🔓 状态型(UserDefaults %ld 语义key) — 🧪实验模拟→F9 状态解锁 直写", nStateKeys]];
                 for (NSDictionary *d in [stateKeys subarrayWithRange:NSMakeRange(0, MIN(3, nStateKeys))]) {
                     [lines addObject:[NSString stringWithFormat:@"  %@%@ %@",
                         d[@"key"], [d[@"isDate"] boolValue] ? @" 📅" : @"",
                         [d[@"live"] boolValue] ? @"(实存)" : @"(静态)"]];
                 }
-                [lines addObject:@"entitlement 判定点位: 0(状态型, 无需 patch) — 见实验模拟页 F9"];
-            } else
+            }
             // v2.58.9 F8v2: strip 主二进制兜底 — 符号表无判定函数时走 chained fixups 链
             // (imports→SK 词表→bind→GOT slot→stubs→bl 调用点→prologue 归属), 点位合成 @0x 名
+            // v2.58.21: 不再被 F9 else 掐死 — 双路并报(状态型与代码型可并存)
             {
             NSDictionary *f8v2 = mfReconF8v2Scan();
             NSArray *cands = f8v2[@"cands"];

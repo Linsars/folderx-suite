@@ -988,7 +988,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
         st.numberOfLines = 2;
         st.minimumScaleFactor = 0.7;
-        st.text = @"membership.*/vip key 语义侦查 → ⚡直写 · 零patch · 主路线";
+        st.text = @"membership.* 语义key形态门侦查 → ⚡直写 · 零patch · 状态型主路线";
         st.font = [UIFont systemFontOfSize:10.5];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
