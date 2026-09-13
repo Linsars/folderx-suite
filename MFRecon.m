@@ -623,6 +623,37 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     // ldur xN,[x0,#-8](指针消费) — 双信号定返回类型。
                     // (占位行已删 — 分类逻辑在第二遍统一做)
                     // v2.58.19 单遍: 门控(fan≥2 或 fan≥1+bool)+形态分类+输出
+                    // v2.58.32: 调用侧形态(ptr/bool)反转循环 — mf_debug_32 定谳: gooby
+                    // 语义引用函数=192(大小写修复后大 app 真实规模) → nAcc 池 256 满 →
+                    // 旧"每候选独立全 text 扫 bl 调用点" = 256×textSize/4 ≈ 2.5亿迭代,
+                    // 主线程分钟级卡死, 侦查页 4 次全停在同一日志行。改单次全扫+查表,
+                    // 复杂度除以 256 — 判定语义不变(ptr/bool 收集口径逐位一致)。
+                    static BOOL ptrFlag[F8V3_MAXCAND], boolFlag[F8V3_MAXCAND];
+                    memset(ptrFlag, 0, sizeof(ptrFlag)); memset(boolFlag, 0, sizeof(boolFlag));
+                    for (uint64_t off3 = 0; off3 + 4 <= textSize; off3 += 4) {
+                        uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3);
+                        uint32_t op = ins >> 26;
+                        if (op != 0x25 && op != 0x05) continue;
+                        int64_t imm3 = (int64_t)(ins & 0x3FFFFFF);
+                        if (imm3 & (1 << 25)) imm3 -= (int64_t)(1 << 26);
+                        uint64_t tgt3 = textVM + off3 + ((uint64_t)imm3 << 2);
+                        int hit3 = -1;
+                        for (int k = 0; k < nAcc; k++) if (accTgt[k] == tgt3) { hit3 = k; break; }
+                        if (hit3 < 0 || (ptrFlag[hit3] && boolFlag[hit3])) continue;
+                        BOOL ptrV = NO, boolV = NO;
+                        for (int step = 1; step <= 6 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
+                            uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
+                            if ((x >> 16) == 0xF85F && ((x >> 5) & 0x1F) == 0) { ptrV = YES; break; }
+                        }
+                        if (!ptrV) for (int step = 1; step <= 24 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
+                            uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
+                            if ((x & 0x7F800000) == 0x72000000 ||
+                                (x & 0x7E000000) == 0x34000000 || (x & 0x7E000000) == 0x36000000 ||
+                                (x & 0x7FE00C00) == 0x1A800000) { boolV = YES; break; }
+                        }
+                        if (ptrV) ptrFlag[hit3] = YES;
+                        if (boolV) boolFlag[hit3] = YES;
+                    }
                     int nShared = 0;
                     for (int k = 0; k < nAcc; k++) {
                         if (accTgt[k] < textStartHi || accFan[k] < 1) continue;
@@ -644,27 +675,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             if ((x & 0xFFC0001F) == 0x39400000) { ldrbTail2 = YES; break; }
                             if (x == 0xD65F03C0) break;
                         }
-                        BOOL isPtr2 = NO, isBool2 = NO;
-                        for (uint64_t off3 = 0; off3 + 4 <= textSize && !(isPtr2 && isBool2); off3 += 4) {
-                            uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3);
-                            uint32_t op = ins >> 26;
-                            if (op != 0x25 && op != 0x05) continue;
-                            int64_t imm3 = (int64_t)(ins & 0x3FFFFFF);
-                            if (imm3 & (1 << 25)) imm3 -= (int64_t)(1 << 26);
-                            if (textVM + off3 + ((uint64_t)imm3 << 2) != accTgt[k]) continue;
-                            BOOL ptrV = NO, boolV = NO;
-                            for (int step = 1; step <= 6 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
-                                uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
-                                if ((x >> 16) == 0xF85F && ((x >> 5) & 0x1F) == 0) { ptrV = YES; break; }
-                            }
-                            if (!ptrV) for (int step = 1; step <= 24 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
-                                uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
-                                if ((x & 0x7F800000) == 0x72000000 ||
-                                    (x & 0x7E000000) == 0x34000000 || (x & 0x7E000000) == 0x36000000 ||
-                                    (x & 0x7FE00C00) == 0x1A800000) { boolV = YES; break; }
-                            }
-                            isPtr2 |= ptrV; isBool2 |= boolV;
-                        }
+                        BOOL isPtr2 = ptrFlag[k], isBool2 = boolFlag[k];
                         NSString *shape2 = isPtr2 ? @"ptr" : ((boolTail2 || isBool2) ? @"bool" : @"?");
                         // v2.58.23: 门控重立 — mf_debug_23 ServeLog 205 accessor 定谳:
                         // 旧门 fan≥2 || shape=bool 在 Swift 上 = 基础库 helper 全中(String
