@@ -385,6 +385,19 @@ static NSDictionary *mfReconF8v2Scan(void) {
     // 简化: 全 segs[] 段里 vmaddr 落在 [imgBase, imgBase+__TEXT vmsize) 外的 const 区都算
     // 实操: 只扫 __TEXT.__cstring + __objc_methname(引用函数的目标判断用字符串内容)
     static const char *kSemWords[] = { "vip", "entitle", "premium", "purchas", "member", "subscri", "unlock" };
+    // v2.58.26: 小写不敏感子串(词表全小写, 输入先转小写) — strstr 大小写敏感,
+    // ServeLog 驼峰串(Entitle/Subscription)全 miss 的 mf_debug_25 定谳修复
+    static const char *mfStrCaseStr(const char *hay, const char *needle) {
+        if (!hay || !needle) return NULL;
+        size_t nl = strlen(needle);
+        if (!nl) return hay;
+        for (const char *p = hay; *p; p++) {
+            size_t k = 0;
+            while (k < nl && p[k] && p[k] == needle[k]) k++;
+            if (k == nl) return p;
+        }
+        return NULL;
+    }
     // cstring 区 vmaddr/size(扫描时 LC 循环顺带收集) — 重走 LC 拿 __cstring/__objc_methname
     uint64_t cstrVM = 0, cstrSize = 0, methVM = 0, methSize = 0;
     lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
@@ -425,9 +438,17 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     // 不是带空格/冒号的句子 — 同 F9 stateKeyShapeOK 判据。
                     BOOL shapeBad = NO;
                     if (memchr(s, ' ', sl) || memchr(s, ':', sl) || memchr(s, '/', sl)) shapeBad = YES;
-                    if (!shapeBad)
-                    for (int w = 0; w < 7 && nSem < F8V3_MAXSTR; w++)
-                        if (strstr(s, kSemWords[w])) { semStrVM[nSem++] = cstrVM + coff; break; }
+                    // v2.58.26: 词表改小写不敏感匹配(mf_debug_25 定谳: ServeLog 驼峰命名
+                    // EntitlementManager/_hasProSubscription 被 strstr 小写词表全 miss,
+                    // S 集归零 → 判定 accessor 段死。yimuliaoran 是小写 URL 串才碰巧命中)
+                    if (!shapeBad) {
+                        char low2[96];
+                        unsigned li = 0;
+                        for (; li < sl && li < 95; li++) { char ch = s[li]; low2[li] = (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch; }
+                        low2[li] = 0;
+                        for (int w = 0; w < 7 && nSem < F8V3_MAXSTR; w++)
+                            if (mfStrCaseStr(low2, kSemWords[w])) { semStrVM[nSem++] = cstrVM + coff; break; }
+                    }
                 }
             }
             coff += sl + 1;
@@ -609,6 +630,18 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             if (x == 0xD65F03C0) break;
                             if ((x & 0xFF80001F) == 0x12000000 && ((x >> 5) & 0x1F) != 31) { boolTail2 = YES; break; }
                         }
+                        // v2.58.26: ldrb w0,[xN,#imm] 尾判据 — @Observable Bool ivar getter
+                        // 形态(mf_debug_25 ServeLog 静态定谳: hasProSubscription getter 尾
+                        // ldrb w0,[x19,#0x10] 后 epilogue+ret, 无 and 无 tst — 旧门全杀)。
+                        // ldrb(1 字节加载)本身就是 Bool 返回铁证。
+                        BOOL ldrbTail2 = NO;
+                        for (uint64_t b = accTgt[k]; b + 8 <= textVM + textSize && b < accTgt[k] + 0x400; b += 4) {
+                            uint32_t x = *(const uint32_t *)((uintptr_t)b + (uintptr_t)slide);
+                            // ldrb w0,[xN,#imm12]: opcode 0x39400000 + imm12<<10 + Rn<<5 + Rt=0
+                            // (掩码只锁 opcode 位段, imm12/Rn 不锁 — 0xFFC003FF 全锁是永假 bug)
+                            if ((x & 0xFFC0001F) == 0x39400000) { ldrbTail2 = YES; break; }
+                            if (x == 0xD65F03C0) break;
+                        }
                         BOOL isPtr2 = NO, isBool2 = NO;
                         for (uint64_t off3 = 0; off3 + 4 <= textSize && !(isPtr2 && isBool2); off3 += 4) {
                             uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3);
@@ -638,11 +671,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         BOOL gateOK = NO;
                         if (![shape2 isEqualToString:@"ptr"]) {
                             if (boolTail2) gateOK = YES;                          // 尾 and w0,#1 — 判定尾巴(最稀有)
+                            else if (ldrbTail2) gateOK = YES;                     // v2.58.26: ldrb w0 尾 — Bool ivar getter(@Observable 形态)
                             else if (accFan[k] >= 2 && [shape2 isEqualToString:@"bool"]) gateOK = YES;  // 共享 Bool
                         }
                         if (gateOK) {
                             nShared++;
-                            mfLog(@"[f8v3] ★判定accessor @%#llx (fan=%d shape=%@ 尾and=%d)", (unsigned long long)accTgt[k], accFan[k], shape2, boolTail2);
+                            mfLog(@"[f8v3] ★判定accessor @%#llx (fan=%d shape=%@ 尾and=%d ldrb尾=%d)", (unsigned long long)accTgt[k], accFan[k], shape2, boolTail2, ldrbTail2);
                             // v2.58.23: score 重立 — 尾and(判定尾巴) > 单纯共享 bool;
                             // top 截断在出栈前统一做(见下), 不在这里堆全量
                             [out addObject:@{
@@ -650,13 +684,84 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                 @"sym": [NSString stringWithFormat:@"@%#llx", (unsigned long long)accTgt[k]],
                                 @"vmaddr": @(accTgt[k]),
                                 @"slide": @((long)slide),
-                                @"score": @(boolTail2 ? ([shape2 isEqualToString:@"bool"] ? 93 : 92) : 91),
+                                @"score": @((boolTail2 || ldrbTail2) ? ([shape2 isEqualToString:@"bool"] ? 93 : 92) : 91),
                                 @"calls": @(accFan[k]),
                                 @"shape": shape2,
                             }];
                         }
                     }
                     mfLog(@"[f8v3] 判定 accessor=%d 个 (W=%d)", nShared, nW);
+                    // ---- v2.58.26 ④: ivar Bool getter 直扫(@Observable keypath 间接调用
+                    // 使 getter 0 个 bl 调用者, fan 模型结构性失明 — mf_debug_25 ServeLog
+                    // 定谳: hasProSubscription getter 0x10009cb58 不在 fan 池但 ldrb w0,
+                    // [x19,#0x10]+ret 形态铁证) ----
+                    // S∪K 函数体 ldrb/strb [xN,#imm12] imm 收集 = 判定 ivar offset 集;
+                    // 全 __text 扫小函数(≤0x200)内「最后一次 w0 写入 = ldrb w0,[xN,#ivarOff]
+                    // 且其后 ≤7 条内 ret」= ivar Bool getter。
+                    {
+                        unsigned char ivHit[64]; memset(ivHit, 0, sizeof(ivHit));
+                        int nIvOff = 0;
+                        for (int i3 = 0; i3 < nSKFn && nIvOff < 60; i3++) {
+                            int hi3 = idxOf(skFn[i3]);
+                            if (hi3 < 0) continue;
+                            uint64_t end3 = (hi3 + 1 < nFn) ? fnHeads[hi3+1] : textVM + textSize;
+                            if (end3 - skFn[i3] > 0x800) continue;
+                            for (uint64_t o3 = skFn[i3] - textVM; o3 + 4 <= end3 - textVM; o3 += 4) {
+                                uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + o3);
+                                if ((x & 0xFFC00000) == 0x39400000 || (x & 0xFFC00000) == 0x39000000) {
+                                    unsigned imm12 = (x >> 10) & 0xFFF;
+                                    unsigned rn = (x >> 5) & 0x1F;
+                                    if (rn != 31 && imm12 > 0 && imm12 < 64 && !ivHit[imm12]) { ivHit[imm12] = 1; nIvOff++; }
+                                }
+                            }
+                        }
+                        if (nIvOff >= 1) {
+                            if (nIvOff) {
+                                char b3[256]; int p3 = 0;
+                                for (int q3 = 1; q3 < 64 && p3 < 250; q3++)
+                                    if (ivHit[q3]) p3 += snprintf(b3 + p3, (size_t)(250 - p3), "%s%d", p3 ? "/" : "", q3);
+                                b3[p3] = 0;
+                                mfLog(@"[f8v3] ivar 偏移集 %d 个: %s", nIvOff, b3);
+                            }
+                            int nGetter = 0;
+                            for (int fi = 0; fi < nFn && nGetter < 8; fi++) {
+                                uint64_t gh = fnHeads[fi];
+                                uint64_t gend = (fi + 1 < nFn) ? fnHeads[fi+1] : textVM + textSize;
+                                if (gend - gh > 0x200 || gend - gh < 0x20) continue;
+                                uint64_t lastLdrb = 0; unsigned lastImm = 0;
+                                for (uint64_t o3 = gh - textVM; o3 + 4 <= gend - textVM; o3 += 4) {
+                                    uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + o3);
+                                    if ((x & 0xFFC0001F) == 0x39400000) {          // ldrb w0,[xN,#imm12]
+                                        unsigned imm12 = (x >> 10) & 0xFFF;
+                                        unsigned rn = (x >> 5) & 0x1F;
+                                        if (rn != 31 && imm12 < 64 && ivHit[imm12]) { lastLdrb = textVM + o3; lastImm = imm12; }
+                                    }
+                                }
+                                if (!lastLdrb) continue;
+                                BOOL retNear = NO;
+                                for (int d3 = 4; d3 <= 28; d3 += 4) {
+                                    uint64_t aa = lastLdrb + d3;
+                                    if (aa + 4 > textVM + textSize) break;
+                                    uint32_t y = *(const uint32_t *)((uintptr_t)aa + (uintptr_t)slide);
+                                    if (y == 0xD65F03C0) { retNear = YES; break; }
+                                }
+                                if (retNear) {
+                                    nGetter++;
+                                    mfLog(@"[f8v3] ★ivarBoolGetter @%#llx (off=0x%x size=%#llx)", (unsigned long long)gh, lastImm, (unsigned long long)(gend-gh));
+                                    [out addObject:@{
+                                        @"img": imgName,
+                                        @"sym": [NSString stringWithFormat:@"ivarGetter@0x%x", lastImm],
+                                        @"vmaddr": @(gh),
+                                        @"slide": @((long)slide),
+                                        @"score": @(94),
+                                        @"calls": @(0),
+                                        @"shape": @"bool",
+                                    }];
+                                }
+                            }
+                            mfLog(@"[f8v3] ivar Bool getter=%d 个", nGetter);
+                        }
+                    }
                     // v2.58.23: score 排序 + top12 截断 — mf_debug_23 定谳 205 个全量
                     // 入 entDumps 是噪声倾倒(真 oracle 1~3 个)。排序: score↓ → fan↓
                     // (f8v2 的 out 在此 return 前已 top12, 这里只截 f8v3 追加段)

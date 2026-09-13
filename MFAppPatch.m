@@ -985,26 +985,6 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
         bar.layer.cornerRadius = 10;
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 5, g_mfCardW - 46, 22)];
-        l.text = @"🅰️ A链·权益类直写(ivar 字节)";
-        l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        [bar addSubview:l];
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
-        st.numberOfLines = 2;
-        st.minimumScaleFactor = 0.7;
-        st.text = @"EntitlementManager/_hasPro 类 → L3全堆定位 → ⚡ivar直写";
-        st.font = [UIFont systemFontOfSize:10.5];
-        st.textColor = [UIColor secondaryLabelColor];
-        [bar addSubview:st];
-        UITapGestureRecognizer *tapA = [[UITapGestureRecognizer alloc] initWithTarget:g_mfCtrl action:@selector(mfChainAShowPage)];
-        [bar addGestureRecognizer:tapA];
-        [page addSubview:bar];
-        y += 56;
-    }
-    {
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
-        bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-        bar.layer.cornerRadius = 10;
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 5, g_mfCardW - 46, 22)];
         l.text = @"🔓 F9 状态解锁(判定在 plist)";
         l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         [bar addSubview:l];
