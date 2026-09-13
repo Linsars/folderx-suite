@@ -925,6 +925,7 @@ NSDictionary *mfReconFingerprint(void) {
             }
             } else {
             // v2.58.20: F9 状态型判定优先 — 判定数据源形态先行, UserDefaults 型直写, 代码扫描降级
+            extern NSArray *mfStateProbeKeys(void);            // MFStateUnlock.m(F9 状态型判定)
             NSArray *stateKeys = mfStateProbeKeys();          // 局部接住(ARC 命名桥接教训)
             long nStateKeys = [stateKeys count];
             if (nStateKeys > 0) {
