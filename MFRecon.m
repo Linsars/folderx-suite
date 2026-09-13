@@ -418,6 +418,14 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 if (nSku < F8V3_MAXSTR && bpre[0] && !strncmp(s, bpre, strlen(bpre)) && s[strlen(s)-1] != '.')
                     { skuStrVM[nSku++] = cstrVM + coff; }
                 else {
+                    // v2.58.23: 语义串形态门 — mf_debug_23 实锤 ServeLog UI 文案
+                    // ("No active purchase..."含 purchas)混进 S 集 → 显示层 bl 的基础库
+                    // helper fan≥2 全中 → 205 accessor 噪声爆炸(真 oracle 1~3 个)。
+                    // 引用串(代码里 adrp+add 指到它)是紧凑 camelCase/点分标识符,
+                    // 不是带空格/冒号的句子 — 同 F9 stateKeyShapeOK 判据。
+                    BOOL shapeBad = NO;
+                    if (memchr(s, ' ', sl) || memchr(s, ':', sl) || memchr(s, '/', sl)) shapeBad = YES;
+                    if (!shapeBad)
                     for (int w = 0; w < 7 && nSem < F8V3_MAXSTR; w++)
                         if (strstr(s, kSemWords[w])) { semStrVM[nSem++] = cstrVM + coff; break; }
                 }
@@ -609,21 +617,48 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             isPtr2 |= ptrV; isBool2 |= boolV;
                         }
                         NSString *shape2 = isPtr2 ? @"ptr" : ((boolTail2 || isBool2) ? @"bool" : @"?");
-                        if (accFan[k] >= 2 || [shape2 isEqualToString:@"bool"]) {
+                        // v2.58.23: 门控重立 — mf_debug_23 ServeLog 205 accessor 定谳:
+                        // 旧门 fan≥2 || shape=bool 在 Swift 上 = 基础库 helper 全中(String
+                        // 格式化/enum accessor 被 S 集共享), 真 oracle 1~3 个。
+                        // 新门(从严): ptr 杀; (fan≥2 && bool) 收; 尾and 收; 其余杀。
+                        BOOL gateOK = NO;
+                        if (![shape2 isEqualToString:@"ptr"]) {
+                            if (boolTail2) gateOK = YES;                          // 尾 and w0,#1 — 判定尾巴(最稀有)
+                            else if (accFan[k] >= 2 && [shape2 isEqualToString:@"bool"]) gateOK = YES;  // 共享 Bool
+                        }
+                        if (gateOK) {
                             nShared++;
                             mfLog(@"[f8v3] ★判定accessor @%#llx (fan=%d shape=%@ 尾and=%d)", (unsigned long long)accTgt[k], accFan[k], shape2, boolTail2);
+                            // v2.58.23: score 重立 — 尾and(判定尾巴) > 单纯共享 bool;
+                            // top 截断在出栈前统一做(见下), 不在这里堆全量
                             [out addObject:@{
                                 @"img": imgName,
                                 @"sym": [NSString stringWithFormat:@"@%#llx", (unsigned long long)accTgt[k]],
                                 @"vmaddr": @(accTgt[k]),
                                 @"slide": @((long)slide),
-                                @"score": @([shape2 isEqualToString:@"bool"] ? 91 : 90),
+                                @"score": @(boolTail2 ? ([shape2 isEqualToString:@"bool"] ? 93 : 92) : 91),
                                 @"calls": @(accFan[k]),
                                 @"shape": shape2,
                             }];
                         }
                     }
                     mfLog(@"[f8v3] 判定 accessor=%d 个 (W=%d)", nShared, nW);
+                    // v2.58.23: score 排序 + top12 截断 — mf_debug_23 定谳 205 个全量
+                    // 入 entDumps 是噪声倾倒(真 oracle 1~3 个)。排序: score↓ → fan↓
+                    // (f8v2 的 out 在此 return 前已 top12, 这里只截 f8v3 追加段)
+                    if ([out isKindOfClass:[NSMutableArray class]]) {
+                        NSMutableArray *mo = (NSMutableArray *)out;
+                        NSRange appRange = NSMakeRange(0, mo.count);   // f8v2 段+ f8v3 段
+                        // 只排序截断「整体」— f8v2 段(≤12)已按 score 排, 合并后再全局排不丢
+                        (void)appRange;
+                        [mo sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                            int d = [b[@"score"] intValue] - [a[@"score"] intValue];
+                            if (d) return d < 0 ? NSOrderedDescending : NSOrderedAscending;
+                            int c = [b[@"calls"] intValue] - [a[@"calls"] intValue];
+                            return c < 0 ? NSOrderedDescending : NSOrderedAscending;
+                        }];
+                        while (mo.count > 12) [mo removeLastObject];
+                    }
                 }
             }
         }
