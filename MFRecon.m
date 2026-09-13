@@ -555,18 +555,59 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     // swift/objc 基础库 fan 目标集中在 __text 前段)
                     uint64_t textStartHi = UINT64_MAX;
                     for (int k = 0; k < nSemFn; k++) if (semFn[k] < textStartHi) textStartHi = semFn[k];
+                    // ---- 形态分类(mf_debug_18 定谳: mov w0,#1 对指针返回型=炸弹) ----
+                    // mf_debug_18: ⚡0x1000a65f0(metadata accessor) → 内购页
+                    // 0x1000a796c ldur x22,[x0,#-8] 解引用假指针 1 → 0xfff...f9 崩。
+                    // 真 oracle 形态(yimuliaoran 0x1000b81a0): 函数尾 and w0,wN,#1 + ret。
+                    // 分类: caller 侧 bl 后 ≤12 条指令内 tst w/cbz/csel(Bool 消费) vs
+                    // ldur xN,[x0,#-8](指针消费) — 双信号定返回类型。
+                    for (int k = 0; k < nAcc; k++) accFan[k] = accFan[k]; // (占位, 下段用)
                     int nShared = 0;
                     for (int k = 0; k < nAcc; k++) {
                         if (accFan[k] >= 2 && accTgt[k] >= textStartHi) {
                             nShared++;
-                            mfLog(@"[f8v3] ★判定accessor @%#llx (fan=%d)", (unsigned long long)accTgt[k], accFan[k]);
+                            NSString *shape = nil;   // nil=未知(旧候选), bool/ptr=分类结果
+                            // callee 尾形态: 到首个 ret ≤0x400 内找 and w0,wN,#1
+                            BOOL boolTail = NO;
+                            for (uint64_t b = accTgt[k]; b + 8 <= textVM + textSize && b < accTgt[k] + 0x400; b += 4) {
+                                uint32_t x = *(const uint32_t *)((uintptr_t)b + (uintptr_t)slide);
+                                if (x == 0xD65F03C0) break;                                          // ret
+                                if ((x & 0xFF80001F) == 0x12000000 && ((x >> 5) & 0x1F) != 31) { boolTail = YES; break; }  // and w0,Wn,#imm
+                            }
+                            // caller 逐点投票(mf18 定谳: 指针消费=立即, Bool 消费可延迟): 
+                            // ptr票 = bl 后 ≤6 条 ldur xN,[x0,#imm](解引用返回值) — patch 炸弹
+                            // bool票 = ≤24 条 tst/cbz/csel 32位 — patch 返回 w0 安全
+                            BOOL anyPtr = NO, anyBool = NO;
+                            for (uint64_t off3 = 0; off3 + 4 <= textSize && !(anyPtr && anyBool); off3 += 4) {
+                                uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3);
+                                uint32_t op = ins >> 26;
+                                if (op != 0x25 && op != 0x05) continue;
+                                int64_t imm3 = (int64_t)(ins & 0x3FFFFFF);
+                                if (imm3 & (1 << 25)) imm3 -= (int64_t)(1 << 26);
+                                if (textVM + off3 + ((uint64_t)imm3 << 2) != accTgt[k]) continue;
+                                BOOL ptrV = NO, boolV = NO;
+                                for (int step = 1; step <= 6 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
+                                    uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
+                                    if ((x >> 16) == 0xF85F && ((x >> 5) & 0x1F) == 0) { ptrV = YES; break; }   // ldur xN,[x0,#-8]
+                                }
+                                if (!ptrV) for (int step = 1; step <= 24 && off3 + (uint64_t)step * 4 + 4 <= textSize; step++) {
+                                    uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off3 + (uint64_t)step * 4);
+                                    if ((x & 0x7F800000) == 0x72000000 ||                              // tst w
+                                        (x & 0x7E000000) == 0x34000000 || (x & 0x7E000000) == 0x36000000 || // cbz/cbzr 32位
+                                        (x & 0x7FE00C00) == 0x1A800000) { boolV = YES; break; }            // csel 32位
+                                }
+                                anyPtr |= ptrV; anyBool |= boolV;
+                            }
+                            shape = anyPtr ? @"ptr" : ((boolTail || anyBool) ? @"bool" : @"?");
+                            mfLog(@"[f8v3] ★判定accessor @%#llx (fan=%d shape=%@ 尾and=%d)", (unsigned long long)accTgt[k], accFan[k], shape, boolTail);
                             [out addObject:@{
                                 @"img": imgName,
                                 @"sym": [NSString stringWithFormat:@"@%#llx", (unsigned long long)accTgt[k]],
                                 @"vmaddr": @(accTgt[k]),
                                 @"slide": @((long)slide),
-                                @"score": @90,        // 判定层直通位
+                                @"score": @([shape isEqualToString:@"bool"] ? 91 : 90),
                                 @"calls": @(accFan[k]),
+                                @"shape": shape,      // bool=可⚡ / ptr=禁patch(会崩) / ?=人工验
                             }];
                         }
                     }

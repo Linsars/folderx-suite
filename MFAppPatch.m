@@ -484,6 +484,13 @@ void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
             NSMutableDictionary *m = [n mutableCopy];
             m[@"on"] = @NO;                       // 新点位默认未开启(用户左划持久化才开)
             [g_entDumps addObject:m];
+        } else {
+            // v2.58.18: 旧点位补 shape 字段(重扫后分类升级, 不动用户持久化开关)
+            for (NSMutableDictionary *m in g_entDumps)
+                if ([m[@"img"] isEqualToString:n[@"img"]] && [m[@"sym"] isEqualToString:n[@"sym"]]) {
+                    if (n[@"shape"] && !m[@"shape"]) m[@"shape"] = n[@"shape"];
+                    break;
+                }
         }
     }
     apEntDumpsSave();
@@ -511,6 +518,11 @@ void apEntDumpsApply(void) {
     if (!g_entDumps.count) return;
     for (NSDictionary *d in g_entDumps) {
         if (![d[@"on"] boolValue]) continue;
+        // v2.58.18: ptr 形态拦截(持久化路径同防 — 指针返回型 patch 会崩)
+        if ([d[@"shape"] isEqualToString:@"ptr"]) {
+            apLog(@"[entdump] ⛔ %@ shape=ptr 跳过重打", [d[@"sym"] lastPathComponent]);
+            continue;
+        }
         NSString *err = nil;
         NSData *newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
@@ -840,8 +852,18 @@ static UITextView *g_apEditor = nil;
     fn.text = pretty.length > 52 ? [NSString stringWithFormat:@"…%@", [pretty substringFromIndex:pretty.length - 52]] : pretty;
     loc.text = [NSString stringWithFormat:@"%@:%@+%@", d[@"img"] ?: @"?", [d[@"vmaddr"] stringValue], @([d[@"slide"] longValue])];
     BOOL on = [d[@"on"] boolValue];
-    st.text = on ? @"💾 已持久化 — 冷启动自动重打" : @"未开启 — 左划操作";
-    st.textColor = on ? [UIColor systemGreenColor] : [UIColor tertiaryLabelColor];
+    // v2.58.18: 形态标记 — ptr(指针返回)patch 必崩, 红🔻警示; bool 可安全⚡
+    NSString *shape = d[@"shape"] ?: @"";
+    if ([shape isEqualToString:@"ptr"]) {
+        st.text = @"🔻ptr 禁patch — 指针返回会崩";
+        st.textColor = [UIColor systemRedColor];
+    } else if ([shape isEqualToString:@"bool"]) {
+        st.text = on ? @"💾✓ Bool判定 — 冷启动自动重打" : @"✓ Bool判定 — 左划⚡";
+        st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemTealColor];
+    } else {
+        st.text = on ? @"💾 已持久化 — 冷启动自动重打" : @"未开启 — 左划操作";
+        st.textColor = on ? [UIColor systemGreenColor] : [UIColor tertiaryLabelColor];
+    }
     return c;
 }
 // 左划: ⚡立即patch(橙) / 💾持久化开关(绿/灰)
@@ -905,6 +927,14 @@ static MFAPEntList *g_apEntList = nil;
     // 立即单点 patch: 从 entDumps 找该 sym 打 mov w0,#1; ret
     for (NSDictionary *d in mfAppPatchEntDumps()) {
         if (![d[@"sym"] isEqualToString:sym]) continue;
+        // v2.58.18: 指针型返回禁 patch(mf_debug_18 实锤: 0x1000a65f0 = metadata
+        // accessor, ⚡后调用者 ldur x22,[x0,#-8] 解引用 1-8 → SIGSEGV 内购页)
+        NSString *shape = d[@"shape"] ?: @"";
+        if ([shape isEqualToString:@"ptr"]) {
+            mfToast(@"⛔ 指针型函数 — patch 会崩, 已拦截");
+            apLog(@"[entdump] ⛔ %@ 形态=ptr(指针返回) patch 拦截", sym);
+            return;
+        }
         NSString *err = nil;
         NSData *newBytes = apHexToBytes(@"20008052c0035fd6");
         if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
