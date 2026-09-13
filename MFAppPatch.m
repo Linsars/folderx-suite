@@ -209,6 +209,30 @@ uintptr_t mfApSymVMAddr(const void *mh, const char *symName) {
 // hasValidToken/hasPro 均为此类, PurchaseManager.isProEnabled 直接 bl 汇聚点已实锤)
 // v2.58.9 F8v2: sym 以 "@0x" 开头 = strip 二进制合成名 — 无符号表可查, 直接用
 // dump 内 vmaddr(镜像内偏移)+slide 定位, 与 F8v2 扫描器(链B引擎直打分支)配套
+// v2.58.30: apSwiftTextPatch 加 dump 直打分支 — 合成 sym(ivarRead@/ivarGetter@)
+// 无符号表可查, strip 主二进制 mfApSymVMAddr 必 miss("symbol not in XXX" 空转
+// 2.58.27/28 两轮实锤)。zap/Boot 两路都从 entDumps 拿 dump 字典, vmaddr+slide
+// 直打 — 与 @0x 前缀同一地址口径(镜像内偏移+slide)。
+static BOOL apSwiftTextPatchDump(NSDictionary *d, NSData *oldBytes, NSData *newBytes, NSString **err) {
+    if (!d[@"vmaddr"]) { *err = @"dump 缺 vmaddr"; return NO; }
+    NSString *imgName = d[@"img"] ?: @"";
+    // 1. 找镜像(与 apSwiftTextPatch 同口径)
+    const struct mach_header *mh = NULL; intptr_t slide = 0;
+    const char *want = imgName.UTF8String;
+    uint32_t ic = _dyld_image_count();
+    for (uint32_t i = 0; i < ic; i++) {
+        const char *n = _dyld_get_image_name(i);
+        if (n && strstr(n, want)) { mh = _dyld_get_image_header(i); slide = _dyld_get_image_vmaddr_slide(i); break; }
+    }
+    if (!mh) { *err = [NSString stringWithFormat:@"image %@ not loaded", imgName]; return NO; }
+    // 2. 直打: dump 存的 slide 优先(扫描时快照), 缺失用当前镜像 slide
+    uintptr_t vmAddr = (uintptr_t)[d[@"vmaddr"] unsignedLongLongValue];
+    if (d[@"slide"]) slide = (intptr_t)[d[@"slide"] longValue];
+    uintptr_t abs = vmAddr + (uintptr_t)slide;
+    BOOL ok = apTextPatchAt(abs, oldBytes, newBytes, err);
+    if (ok) apLog(@"[swifttext] %@ %@ vmaddr=%#lx abs=%#lx → patch OK", imgName, [d[@"sym"] lastPathComponent], (unsigned long)vmAddr, (unsigned long)abs);
+    return ok;
+}
 static BOOL apSwiftTextPatch(NSString *imgName, NSString *symName, NSData *oldBytes, NSData *newBytes, NSString **err) {
     if (imgName.length < 3 || symName.length < 4 || newBytes.length < 4) { *err = @"bad swifttext args"; return NO; }
     // 1. 找镜像(名字 contains — ScriptingKit 匹配 "…/Scripting.app/Frameworks/ScriptingKit.framework/ScriptingKit")
@@ -486,9 +510,14 @@ void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
             [g_entDumps addObject:m];
         } else {
             // v2.58.18: 旧点位补 shape 字段(重扫后分类升级, 不动用户持久化开关)
+            // v2.58.30: 同时补 vmaddr/slide — mf_debug_30 定谳: ivarRead@/ivarGetter@
+            // 合成 sym 无符号表可查, apSwiftTextPatch 查符号必 miss → "symbol not
+            // in XXX" → ⚡空转(2.58.27/28 两轮, 日志零落盘)。定位数据必须随点位存库。
             for (NSMutableDictionary *m in g_entDumps)
                 if ([m[@"img"] isEqualToString:n[@"img"]] && [m[@"sym"] isEqualToString:n[@"sym"]]) {
                     if (n[@"shape"] && !m[@"shape"]) m[@"shape"] = n[@"shape"];
+                    if (n[@"vmaddr"] && !m[@"vmaddr"]) m[@"vmaddr"] = n[@"vmaddr"];
+                    if (n[@"slide"] && !m[@"slide"]) m[@"slide"] = n[@"slide"];
                     break;
                 }
         }
@@ -532,7 +561,7 @@ void apEntDumpsApply(void) {
             uint32_t movz = 0x52800020u | rt;
             newBytes = [NSData dataWithBytes:&movz length:4];
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
-        if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
+        if (apSwiftTextPatchDump(d, nil, newBytes, &err)) {
             g_apHits++;
             apLog(@"[entdump] ✓ %@ 持久化 patch 重打", [d[@"sym"] lastPathComponent]);
         } else apLog(@"[entdump] ✗ %@: %@", d[@"sym"], err);
@@ -962,7 +991,7 @@ static MFAPEntList *g_apEntList = nil;
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }
-        if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
+        if (apSwiftTextPatchDump(d, nil, newBytes, &err)) {
             g_apHits++;
             apLog(@"[entdump] ⚡ %@ 立即 patch OK", sym);
             mfToast(@"⚡ 已 patch");
