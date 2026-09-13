@@ -225,9 +225,10 @@ static BOOL apSwiftTextPatchDump(NSDictionary *d, NSData *oldBytes, NSData *newB
         if (n && strstr(n, want)) { mh = _dyld_get_image_header(i); slide = _dyld_get_image_vmaddr_slide(i); break; }
     }
     if (!mh) { *err = [NSString stringWithFormat:@"image %@ not loaded", imgName]; return NO; }
-    // 2. 直打: dump 存的 slide 优先(扫描时快照), 缺失用当前镜像 slide
+    // 2. 直打: vmaddr(镜像内偏移, 静态) + 当前镜像 slide — ASLR 每次启动不同,
+    //    存的 slide 快照只在当次会话有效, 冷启动必过期(mf_debug_31 实锤:
+    //    Boot 重打用旧 slide → abs 错 → vm_protect RW failed kr=1)
     uintptr_t vmAddr = (uintptr_t)[d[@"vmaddr"] unsignedLongLongValue];
-    if (d[@"slide"]) slide = (intptr_t)[d[@"slide"] longValue];
     uintptr_t abs = vmAddr + (uintptr_t)slide;
     BOOL ok = apTextPatchAt(abs, oldBytes, newBytes, err);
     if (ok) apLog(@"[swifttext] %@ %@ vmaddr=%#lx abs=%#lx → patch OK", imgName, [d[@"sym"] lastPathComponent], (unsigned long)vmAddr, (unsigned long)abs);
@@ -894,10 +895,10 @@ static UITextView *g_apEditor = nil;
         st.text = @"🔻ptr 禁patch — 指针返回会崩";
         st.textColor = [UIColor systemRedColor];
     } else if ([shape isEqualToString:@"bool"]) {
-        st.text = on ? @"💾✓ Bool判定 — 冷启动自动重打" : @"✓ Bool判定 — 左划⚡";
+        st.text = on ? @"💾✓ Bool判定 — 冷启动自动重打" : @"✓ Bool判定 — 左划⚡(即持久)";
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemTealColor];
     } else {
-        st.text = on ? @"💾 已持久化 — 冷启动自动重打" : @"未开启 — 左划操作";
+        st.text = on ? @"💾 已持久化 — 冷启动自动重打" : @"未开启 — 左划⚡patch";
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor tertiaryLabelColor];
     }
     return c;
@@ -908,13 +909,16 @@ static UITextView *g_apEditor = nil;
     NSString *sym = d[@"sym"] ?: @"";
     BOOL on = [d[@"on"] boolValue];
     UIContextualAction *patch = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
-        title:@"⚡patch" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+        title:on ? @"⚡重打" : @"⚡patch" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
             [(id)g_mfCtrl mfAPEntPatchNow:sym];
             done(YES);
         }];
     patch.backgroundColor = [UIColor systemOrangeColor];
+    // v2.58.31: 💾取消 = 回滚(还原 patch 状态 + off) — 与 F9 卡片「patch 即持久化/
+    // 取消即回滚」同交互。旧设计 💾是独立开关(⚡patch 不持久化)被用户否掉:
+    // "patch 了还要再点一次持久化, 重启就丢" — 2.58.30 全链打通后无意义。
     UIContextualAction *persist = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
-        title:on ? @"💾取消" : @"💾持久" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+        title:on ? @"💾回滚" : @"💾patch" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
             [(id)g_mfCtrl mfAPEntSetOn:sym on:!on];
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 [tv reloadData];
@@ -993,8 +997,11 @@ static MFAPEntList *g_apEntList = nil;
         }
         if (apSwiftTextPatchDump(d, nil, newBytes, &err)) {
             g_apHits++;
-            apLog(@"[entdump] ⚡ %@ 立即 patch OK", sym);
-            mfToast(@"⚡ 已 patch");
+            // v2.58.31: ⚡即持久化 — 与 F9 卡片交互对齐(用户定谳: "patch 了还要再点
+            // 一次持久化, 重启就丢" 的双开关设计不要)。⚡成功自动 on, 冷启动重打。
+            mfAppPatchEntDumpSetOn(sym, YES);
+            apLog(@"[entdump] ⚡ %@ 立即 patch OK + 已持久化", sym);
+            mfToast(@"⚡ 已 patch · 冷启动自动重打");
         } else mfToast(err ?: @"patch 失败");
         return;
     }
@@ -1002,7 +1009,7 @@ static MFAPEntList *g_apEntList = nil;
 }
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on {
     mfAppPatchEntDumpSetOn(sym, on);
-    mfToast(on ? @"💾 已持久化 — 冷启动自动重打" : @"已取消持久化");
+    mfToast(on ? @"💾 已持久化 — 冷启动自动重打" : @"已回滚 — 冷启动不再重打");
 }
 // v2.58.12: 左划删除 — 误扫/假点位清理解
 - (void)mfAPEntDelete:(NSString *)sym {
