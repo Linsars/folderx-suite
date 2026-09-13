@@ -524,7 +524,14 @@ void apEntDumpsApply(void) {
             continue;
         }
         NSString *err = nil;
-        NSData *newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
+        NSData *newBytes = nil;
+        if ([d[@"sym"] hasPrefix:@"ivarRead@"]) {
+            unsigned rt = 0;
+            NSRange dot = [d[@"sym"] rangeOfString:@"." options:NSBackwardsSearch];
+            if (dot.location != NSNotFound) rt = (unsigned)[[d[@"sym"] substringFromIndex:dot.location + 1] intValue];
+            uint32_t movz = 0x52800020u | rt;
+            newBytes = [NSData dataWithBytes:&movz length:4];
+        } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
             g_apHits++;
             apLog(@"[entdump] ✓ %@ 持久化 patch 重打", [d[@"sym"] lastPathComponent]);
@@ -933,10 +940,10 @@ static MFAPEntList *g_apEntList = nil;
 }
 - (void)mfAPEntPatchNow:(NSString *)sym {
     // 立即单点 patch: 从 entDumps 找该 sym 打 mov w0,#1; ret
+    // v2.58.28: ivarRead@ 前缀 = ldrb 指令点(mf_debug_27 实锤: @Observable getter
+    // patch 头跳过 registrar.access → SwiftUI 崩) — 单指令 ldrb w<Rt> → mov w<Rt>,#1
     for (NSDictionary *d in mfAppPatchEntDumps()) {
         if (![d[@"sym"] isEqualToString:sym]) continue;
-        // v2.58.18: 指针型返回禁 patch(mf_debug_18 实锤: 0x1000a65f0 = metadata
-        // accessor, ⚡后调用者 ldur x22,[x0,#-8] 解引用 1-8 → SIGSEGV 内购页)
         NSString *shape = d[@"shape"] ?: @"";
         if ([shape isEqualToString:@"ptr"]) {
             mfToast(@"⛔ 指针型函数 — patch 会崩, 已拦截");
@@ -944,7 +951,17 @@ static MFAPEntList *g_apEntList = nil;
             return;
         }
         NSString *err = nil;
-        NSData *newBytes = apHexToBytes(@"20008052c0035fd6");
+        NSData *newBytes = nil;
+        if ([sym hasPrefix:@"ivarRead@"]) {
+            // sym 格式 ivarRead@0x<off>.<Rt> — MOVZ w<Rt>,#1 = 0x52800000 | (1<<5) | Rt
+            unsigned rt = 0;
+            NSRange dot = [sym rangeOfString:@"." options:NSBackwardsSearch];
+            if (dot.location != NSNotFound) rt = (unsigned)[[sym substringFromIndex:dot.location + 1] intValue];
+            uint32_t movz = 0x52800020u | rt;   // (imm16=1)<<5 | Rd
+            newBytes = [NSData dataWithBytes:&movz length:4];
+        } else {
+            newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
+        }
         if (apSwiftTextPatch(d[@"img"] ?: @"", d[@"sym"] ?: @"", nil, newBytes, &err)) {
             g_apHits++;
             apLog(@"[entdump] ⚡ %@ 立即 patch OK", sym);

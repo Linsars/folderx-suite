@@ -725,11 +725,19 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                 b3[p3] = 0;
                                 mfLog(@"[f8v3] ivar 偏移集 %d 个: %s", nIvOff, b3);
                             }
+                            // v2.58.28: 家族距离判据 — offset 16/17/18 太常见, 别的类的
+                            // metadata/witness 小函数(0x10011b414 ldur 解引用形态)也会命中
+                            // ldrb w0 尾判据 → mf_debug_27 全崩。真 EntitlementManager 族
+                            // getter 与 S∪K 语义函数同族连续(0x10009cbxx-0x10009d7xx),
+                            // 距最近 S∪K 函数头 < 0x1000 才收。
+                            uint64_t famAnchor = UINT64_MAX;
+                            for (int i4 = 0; i4 < nSKFn; i4++) if (skFn[i4] < famAnchor) famAnchor = skFn[i4];
                             int nGetter = 0;
                             for (int fi = 0; fi < nFn && nGetter < 8; fi++) {
                                 uint64_t gh = fnHeads[fi];
                                 uint64_t gend = (fi + 1 < nFn) ? fnHeads[fi+1] : textVM + textSize;
                                 if (gend - gh > 0x200 || gend - gh < 0x20) continue;
+                                if (famAnchor != UINT64_MAX && (gh < famAnchor ? famAnchor - gh : gh - famAnchor) > 0x1000) continue;   // v2.58.28: 家族窗口(双向 — 真 getter 可能在语义函数前, mf_debug_26: 0x10009cb58 < 0x10009cc70)
                                 uint64_t lastLdrb = 0; unsigned lastImm = 0;
                                 for (uint64_t o3 = gh - textVM; o3 + 4 <= gend - textVM; o3 += 4) {
                                     uint32_t x = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + o3);
@@ -749,11 +757,17 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                 }
                                 if (retNear) {
                                     nGetter++;
-                                    mfLog(@"[f8v3] ★ivarBoolGetter @%#llx (off=0x%x size=%#llx)", (unsigned long long)gh, lastImm, (unsigned long long)(gend-gh));
+                                    // v2.58.28: patch 点 = ldrb 指令本身(不是函数头) — mf_debug_27 实锤:
+                                    // @Observable 宏 getter 内联 registrar.access(), patch 头跳过 access
+                                    // → SwiftUI 观察链断 → 全崩。改单指令: ldrb w<Rt>,#ivar → mov w<Rt>,#1,
+                                    // 函数结构保留(registrar 照跑), 只把读值恒真。
+                                    uint32_t orig = *(const uint32_t *)((uintptr_t)lastLdrb + (uintptr_t)slide);
+                                    unsigned rt = orig & 0x1F;
+                                    mfLog(@"[f8v3] ★ivarRead @%#llx (off=0x%x Rt=w%u size=%#llx fn@%#llx)", (unsigned long long)lastLdrb, lastImm, rt, (unsigned long long)(gend-gh), (unsigned long long)gh);
                                     [out addObject:@{
                                         @"img": imgName,
-                                        @"sym": [NSString stringWithFormat:@"ivarGetter@0x%x", lastImm],
-                                        @"vmaddr": @(gh),
+                                        @"sym": [NSString stringWithFormat:@"ivarRead@0x%x.%u", lastImm, rt],
+                                        @"vmaddr": @(lastLdrb),
                                         @"slide": @((long)slide),
                                         @"score": @(94),
                                         @"calls": @(0),
