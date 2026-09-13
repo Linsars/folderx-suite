@@ -923,9 +923,21 @@ NSDictionary *mfReconFingerprint(void) {
                 NSString *tail = s.length > 46 ? [s substringFromIndex:s.length - 46] : s;
                 [lines addObject:[NSString stringWithFormat:@"  %@:%#lx …%@", f[@"img"], [f[@"vmaddr"] unsignedLongValue], tail]];
             }
-        } else {
+            } else {
+            // v2.58.20: F9 状态型判定优先 — 判定数据源形态先行, UserDefaults 型直写, 代码扫描降级
+            long nStateKeys = [(NSArray *)mfStateProbeKeys() count];
+            if (nStateKeys > 0) {
+                [lines addObject:[NSString stringWithFormat:@"判定数据源: 🔓 状态型(UserDefaults %ld 语义key) — 🧪实验模拟→F9 状态解锁 直写, 代码扫描已跳过", nStateKeys]];
+                for (NSDictionary *d in [(NSArray *)mfStateProbeKeys() subarrayWithRange:NSMakeRange(0, MIN(3, nStateKeys))]) {
+                    [lines addObject:[NSString stringWithFormat:@"  %@%@ %@",
+                        d[@"key"], [d[@"isDate"] boolValue] ? @" 📅" : @"",
+                        [d[@"live"] boolValue] ? @"(实存)" : @"(静态)"]];
+                }
+                [lines addObject:@"entitlement 判定点位: 0(状态型, 无需 patch) — 见实验模拟页 F9"];
+            } else
             // v2.58.9 F8v2: strip 主二进制兜底 — 符号表无判定函数时走 chained fixups 链
             // (imports→SK 词表→bind→GOT slot→stubs→bl 调用点→prologue 归属), 点位合成 @0x 名
+            {
             NSDictionary *f8v2 = mfReconF8v2Scan();
             NSArray *cands = f8v2[@"cands"];
             if ([cands isKindOfClass:[NSArray class]] && cands.count) {
@@ -937,6 +949,7 @@ NSDictionary *mfReconFingerprint(void) {
                     [lines addObject:[NSString stringWithFormat:@"  %@:%@ score=%@ · swifttext 直打", f[@"img"], f[@"vmaddr"], f[@"score"] ?: @"?"]];
                 }
             } else [lines addObject:@"entitlement 判定点位: 未发现(框架无符号判定函数, 主二进制 fixups 链无 SK 消费候选)"];
+            }
         }
     }
 

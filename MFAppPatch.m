@@ -972,8 +972,31 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     grp.textColor = [UIColor secondaryLabelColor];
     [page addSubview:grp];
     y += 24;
-    // v2.58 重构(用户六点清单): 引擎开关退役 — 有持久化点位(mfEntDumps)冷启动自动重打;
-    //   采集器迁观察模块(MFCompatPatcher 同路); 规则表保留为 text/method 手工高级用法。
+    // ====== v2.58 重构(用户六点清单): 引擎开关退役 — 有持久化点位(mfEntDumps)冷启动自动重打;
+    //   采集器迁观察模块(MFCompatPatcher 同路); 规则表保留为 text/method 手工高级用法。 ======
+    // v2.58.20: F9 状态型判定优先(主路线) — 判定在 UserDefaults 的 app 直写解锁,
+    //   F8 代码扫描(下方)降级为 fallback。yimuliaoran 定谳: fan-in/形态分类对
+    //   状态型 app 全空转(判定无函数实体)。
+    {
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
+        bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+        bar.layer.cornerRadius = 10;
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 5, g_mfCardW - 46, 22)];
+        l.text = @"🔓 F9 状态解锁(判定在 plist)";
+        l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        [bar addSubview:l];
+        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
+        st.numberOfLines = 2;
+        st.minimumScaleFactor = 0.7;
+        st.text = @"membership.*/vip key 语义侦查 → ⚡直写 · 零patch · 主路线";
+        st.font = [UIFont systemFontOfSize:10.5];
+        st.textColor = [UIColor secondaryLabelColor];
+        [bar addSubview:st];
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:g_mfCtrl action:@selector(mfShowStatePage)];
+        [bar addGestureRecognizer:tap];
+        [page addSubview:bar];
+        y += 56;
+    }
     {
         UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
         bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];

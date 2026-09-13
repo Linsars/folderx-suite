@@ -2460,6 +2460,8 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
         mfProcCaptureStart();
         extern void mfAppPatchBoot(void);       // v2.58: 判定点引擎(mfEntDumps 自判, 无开关)
         mfAppPatchBoot();
+        extern void mfStateBootReplay(void);     // v2.58.20: F9 状态解锁冷启动重打(UserDefaults 型)
+        mfStateBootReplay();
         mfObjCHookApplySilent();
         mfSubInjectAutoStart();
         mfReceiptForgeAutoStart();
