@@ -21,6 +21,18 @@ void mfStateBootReplay(void);
 BOOL mfStatePersistIsOn(void);
 void mfStateSetPersist(NSArray *keys, BOOL on);
 
+// MFPanelCtrl 定义在 MFPanel.m — 最小前向声明让 category 可编译(MFAppPatch.m 同款)
+@interface MFPanelCtrl : NSObject @end
+// 声明段在前(UI 块的 [(id)g_mfCtrl mfStateZap:] 需要它), 实现段在本文件尾部
+@interface MFPanelCtrl (StateUnlock)
+- (void)mfShowStatePage;
+- (void)mfStateZap:(NSString *)key;
+- (void)mfStateZapOff:(NSString *)key;
+- (void)mfStateZapAll;
+- (void)mfStatePersistToggle:(UIButton *)sender;
+@end
+
+
 // —— 词表: plist 权益 key 语义(yimuliaoran 命名族实锤: membership.hasLifetime/monthlyExpiration) ——
 static NSArray *kStateKeyWords = nil;
 static NSArray *kStateDateWords = nil;   // 命中 → Date 型(distantFuture), 其余 Bool 型
@@ -276,15 +288,6 @@ BOOL mfStatePersistIsOn(void) {
 }
 
 // —— MFPanelCtrl action 方法(category — 页面控制器在 MFPanel.m) ——
-// MFPanelCtrl 定义在 MFPanel.m — 最小前向声明让 category 可编译(MFAppPatch.m 同款)
-@interface MFPanelCtrl : NSObject @end
-@interface MFPanelCtrl (StateUnlockFwd)   // 声明段: 让上文的 [(id)g_mfCtrl mfStateZap:] 编译过
-- (void)mfShowStatePage;
-- (void)mfStateZap:(NSString *)key;
-- (void)mfStateZapOff:(NSString *)key;
-- (void)mfStateZapAll;
-- (void)mfStatePersistToggle:(UIButton *)sender;
-@end
 @implementation MFPanelCtrl (StateUnlock)
 - (void)mfShowStatePage { mfShowStatePage(); }
 - (void)mfStateZap:(NSString *)key {
