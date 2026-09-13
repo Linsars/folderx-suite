@@ -11,11 +11,15 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import "MFPanel.h"
 
 // 跨文件接口(MFRecon 调侦查 / ctor 调重打)
 NSArray *mfStateProbeKeys(void);
 void mfStateBootReplay(void);
+BOOL mfStatePersistIsOn(void);
+void mfStateSetPersist(NSArray *keys, BOOL on);
 
 // —— 词表: plist 权益 key 语义(yimuliaoran 命名族实锤: membership.hasLifetime/monthlyExpiration) ——
 static NSArray *kStateKeyWords = nil;
@@ -143,7 +147,6 @@ long mfStateUnlockApplyAll(NSArray *keys) {
         n += mfStateUnlockApplyKey(d[@"key"], YES);
     return n;
 }
-long mfStateUnlockHits(void) { return [[NSDate date] timeIntervalSinceReferenceDate] > 0 ? 0 : 0; }  // 占位: 由 Boot 计
 
 // —— UI: F9 状态解锁页(v2.58.20 主路线 — 状态型判定 app 的解锁入口) ——
 @interface MFStateList : NSObject <UITableViewDataSource, UITableViewDelegate>
@@ -273,6 +276,15 @@ BOOL mfStatePersistIsOn(void) {
 }
 
 // —— MFPanelCtrl action 方法(category — 页面控制器在 MFPanel.m) ——
+// MFPanelCtrl 定义在 MFPanel.m — 最小前向声明让 category 可编译(MFAppPatch.m 同款)
+@interface MFPanelCtrl : NSObject @end
+@interface MFPanelCtrl (StateUnlockFwd)   // 声明段: 让上文的 [(id)g_mfCtrl mfStateZap:] 编译过
+- (void)mfShowStatePage;
+- (void)mfStateZap:(NSString *)key;
+- (void)mfStateZapOff:(NSString *)key;
+- (void)mfStateZapAll;
+- (void)mfStatePersistToggle:(UIButton *)sender;
+@end
 @implementation MFPanelCtrl (StateUnlock)
 - (void)mfShowStatePage { mfShowStatePage(); }
 - (void)mfStateZap:(NSString *)key {
@@ -285,12 +297,14 @@ BOOL mfStatePersistIsOn(void) {
     mfToast(@"已回滚(remove)");
 }
 - (void)mfStateZapAll {
-    long n = mfStateUnlockApplyAll(mfStateProbeKeys());
+    NSArray *ks = mfStateProbeKeys();                   // 局部接住(ARC 命名桥接)
+    long n = mfStateUnlockApplyAll(ks);
     mfToast([NSString stringWithFormat:@"⚡ 已直写 %ld 个 key", n]);
 }
 - (void)mfStatePersistToggle:(UIButton *)sender {
     BOOL now = mfStatePersistIsOn();
-    mfStateSetPersist(mfStateProbeKeys(), !now);
+    NSArray *ks = mfStateProbeKeys();                   // 局部接住(ARC 命名桥接)
+    mfStateSetPersist(ks, !now);
     sender.titleLabel.text = !now ? @"💾持久化 ON(冷启动重打)" : @"💾持久化(冷启动重打)";
     mfToast(!now ? @"💾 冷启动自动重打已开" : @"已取消持久化");
 }

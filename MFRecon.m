@@ -925,10 +925,11 @@ NSDictionary *mfReconFingerprint(void) {
             }
             } else {
             // v2.58.20: F9 状态型判定优先 — 判定数据源形态先行, UserDefaults 型直写, 代码扫描降级
-            long nStateKeys = [(NSArray *)mfStateProbeKeys() count];
+            NSArray *stateKeys = mfStateProbeKeys();          // 局部接住(ARC 命名桥接教训)
+            long nStateKeys = [stateKeys count];
             if (nStateKeys > 0) {
                 [lines addObject:[NSString stringWithFormat:@"判定数据源: 🔓 状态型(UserDefaults %ld 语义key) — 🧪实验模拟→F9 状态解锁 直写, 代码扫描已跳过", nStateKeys]];
-                for (NSDictionary *d in [(NSArray *)mfStateProbeKeys() subarrayWithRange:NSMakeRange(0, MIN(3, nStateKeys))]) {
+                for (NSDictionary *d in [stateKeys subarrayWithRange:NSMakeRange(0, MIN(3, nStateKeys))]) {
                     [lines addObject:[NSString stringWithFormat:@"  %@%@ %@",
                         d[@"key"], [d[@"isDate"] boolValue] ? @" 📅" : @"",
                         [d[@"live"] boolValue] ? @"(实存)" : @"(静态)"]];
