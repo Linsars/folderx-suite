@@ -530,10 +530,14 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         }
                     }
                     // 2 跳 fan: W 中每个 w 的 bl 目标计数(累加进 S 直调的 accTgt2 表)
-                    #define F8V3_MAXCAND 128
+                    #define F8V3_MAXCAND 256   // v2.58.22: 128→256 对齐 accTgt2 容量(源表 256, 截断丢判定 accessor 风险)
                     static uint64_t accTgt[F8V3_MAXCAND]; static int accFan[F8V3_MAXCAND]; int nAcc = 0;
-                    // 先导入 S 直调表(v2.58.19)
-                    for (int k = 0; k < nAcc2; k++) { accTgt[nAcc] = accTgt2[k]; accFan[nAcc] = accFan2[k]; nAcc++; }
+                    // 先导入 S 直调表(v2.58.19) — 带 F8V3_MAXCAND 截断
+                    // v2.58.22 崩溃定谳(ServeLog ips): 此循环曾无界拷贝 accTgt2(≤256)进
+                    // accTgt(128) — ServeLog 语义串多, nAcc2>128 越界写踩相邻 __DATA 的
+                    // mfLog.logPath/once → dispatch_once 状态损坏 → libdispatch
+                    // "Owner in ulock is unknown" brk abort。yimuliaoran nAcc2=31 从未触发。
+                    for (int k = 0; k < nAcc2 && nAcc < F8V3_MAXCAND; k++) { accTgt[nAcc] = accTgt2[k]; accFan[nAcc] = accFan2[k]; nAcc++; }
                     for (int iw = 0; iw < nW; iw++) {
                         uint64_t w = W[iw];
                         BOOL isSemFn2 = NO;
