@@ -913,7 +913,15 @@ static MFAPEntList *g_apEntList = nil;
 - (void)mfAPShowEntDumps {
     UIView *page = mfMakePage(@"🎯 判定点", YES);
     g_apEntList = [[MFAPEntList alloc] init];
-    g_apEntList.items = mfAppPatchEntDumps();
+    NSArray *rawItems = mfAppPatchEntDumps();
+    // v2.58.27: 按 score 降序显示 — 旧序=插入序(F8v2 旧候选堆在前), mf_debug_26 实锤
+    // 8 个 ivarBoolGetter(score=94, 真判定层)排在第 13+ 位被埋, 用户惯性⚡旧 12 个全空转
+    NSArray *sorted = [rawItems sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        int d = [b[@"score"] intValue] - [a[@"score"] intValue];
+        if (d) return d < 0 ? NSOrderedDescending : NSOrderedAscending;
+        return NSOrderedSame;
+    }];
+    g_apEntList.items = sorted;
     UITableView *tv = [[UITableView alloc] initWithFrame:CGRectMake(0, 46, g_mfCardW, g_mfCardH - 46)
                                                     style:UITableViewStylePlain];
     tv.dataSource = g_apEntList;

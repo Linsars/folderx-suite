@@ -773,10 +773,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         // 只排序截断「整体」— f8v2 段(≤12)已按 score 排, 合并后再全局排不丢
                         (void)appRange;
                         [mo sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                            // v2.58.27: 方向修正 — 旧写法 d<0?Descending:Ascending 把高分排到尾部,
+                            // top12 removeLast 恰好删掉 ivarBoolGetter(94)真判定层, mf_debug_26 实锤
                             int d = [b[@"score"] intValue] - [a[@"score"] intValue];
-                            if (d) return d < 0 ? NSOrderedDescending : NSOrderedAscending;
+                            if (d) return d < 0 ? NSOrderedAscending : NSOrderedDescending;
                             int c = [b[@"calls"] intValue] - [a[@"calls"] intValue];
-                            return c < 0 ? NSOrderedDescending : NSOrderedAscending;
+                            return c < 0 ? NSOrderedAscending : NSOrderedDescending;
                         }];
                         while (mo.count > 12) [mo removeLastObject];
                     }
