@@ -1148,15 +1148,23 @@ void mfShowScanPage(void) {
     mfPushPage(page);
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // v2.58.34: 产品ID先行(2.58.7 定案回归) — hooked+本地候选是秒级扫描, 先于
+        // mfReconFingerprint()(重, 大 app 20s+)即时上屏; recon 卡死不再拖死产品ID。
+        NSArray *hookedPIDs = [[NSUserDefaults standardUserDefaults] objectForKey:@"SavedIAPIDs"] ?: @[];
+        NSArray *localCandidates = mfScanLocalProductIDs();
+        if (localCandidates.count || hookedPIDs.count) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                st.text = [NSString stringWithFormat:@"产品ID先行: %lu+%lu 候选(SK 验证中…) — 侦查独立跑, 不阻塞", (unsigned long)hookedPIDs.count, (unsigned long)localCandidates.count];
+            });
+            mfLog(@"[iap] 产品ID先行: hooked=%lu local=%lu 即时可看, 侦查独立跑", (unsigned long)hookedPIDs.count, (unsigned long)localCandidates.count);
+        }
         // v2.47.0: 内购模式一次性侦查(零 hook 纯读, 判据沉淀自 Reflix 战役终案) — 结果进置顶卡
         NSDictionary *recon = mfReconFingerprint();
         for (NSString *rl in recon[@"lines"]) mfLog(@"[recon] %@", rl);
         // 1.0 运行时截获回流(v2.6.11): SK1 hook 历史截获的 app 自查 ID——app 亲口报的,最高优先级
         // 依据: 任何 app 要展示/购买商品必发 SKProductsRequest(init 参数含全部 ID),打开一次购买页即现形
-        NSArray *hookedPIDs = [[NSUserDefaults standardUserDefaults] objectForKey:@"SavedIAPIDs"] ?: @[];
 
-        // 1. 本地扫描 + 网络提取（双源）
-        NSArray *localCandidates = mfScanLocalProductIDs();
+        // 1. 网络提取(本地扫已提前, 捕获读不依赖 recon)
         NSArray *netPIDs = mfExtractPIDsFromCaptures();
 
         // 1.5 RevenueCat 路径(v2.6.4): 静态挖到的 appl_ key → offerings API 全量 productId

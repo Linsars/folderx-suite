@@ -690,8 +690,13 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         // 旧门 fan≥2 || shape=bool 在 Swift 上 = 基础库 helper 全中(String
                         // 格式化/enum accessor 被 S 集共享), 真 oracle 1~3 个。
                         // 新门(从严): ptr 杀; (fan≥2 && bool) 收; 尾and 收; 其余杀。
+                        // v2.58.34: fan>500 拦 — mf_debug_34 gooby 崩溃定谳(ips: Firebase
+                        // worker 线程 _SwiftDeferredNSDictionary 桥接 ldur[x0-8] 解引用
+                        // 0xfff...f9 = ptr 型被 mov w0,#1): 192 语义函数大池把 String 桥接/
+                        // 格式化 helper 全放进门(fan=13674/2381), 真 oracle 的 fan 天花
+                        // 板是几十(显示层函数数), 万级 fan = 基础库铁证。
                         BOOL gateOK = NO;
-                        if (![shape2 isEqualToString:@"ptr"]) {
+                        if (![shape2 isEqualToString:@"ptr"] && accFan[k] <= 500) {
                             if (boolTail2) gateOK = YES;                          // 尾 and w0,#1 — 判定尾巴(最稀有)
                             else if (ldrbTail2) gateOK = YES;                     // v2.58.26: ldrb w0 尾 — Bool ivar getter(@Observable 形态)
                             else if (accFan[k] >= 2 && [shape2 isEqualToString:@"bool"]) gateOK = YES;  // 共享 Bool
