@@ -11,6 +11,21 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
+
+// v2.58.26: 小写不敏感子串(词表全小写, 输入先转小写) — strstr 大小写敏感,
+// ServeLog 驼峰串(Entitle/Subscription)全 miss 的 mf_debug_25 定谳修复
+static const char *mfStrCaseStr(const char *hay, const char *needle) {
+    if (!hay || !needle) return NULL;
+    size_t nl = strlen(needle);
+    if (!nl) return hay;
+    for (const char *p = hay; *p; p++) {
+        size_t k = 0;
+        while (k < nl && p[k] && p[k] == needle[k]) k++;
+        if (k == nl) return p;
+    }
+    return NULL;
+}
+
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
@@ -385,19 +400,6 @@ static NSDictionary *mfReconF8v2Scan(void) {
     // 简化: 全 segs[] 段里 vmaddr 落在 [imgBase, imgBase+__TEXT vmsize) 外的 const 区都算
     // 实操: 只扫 __TEXT.__cstring + __objc_methname(引用函数的目标判断用字符串内容)
     static const char *kSemWords[] = { "vip", "entitle", "premium", "purchas", "member", "subscri", "unlock" };
-    // v2.58.26: 小写不敏感子串(词表全小写, 输入先转小写) — strstr 大小写敏感,
-    // ServeLog 驼峰串(Entitle/Subscription)全 miss 的 mf_debug_25 定谳修复
-    static const char *mfStrCaseStr(const char *hay, const char *needle) {
-        if (!hay || !needle) return NULL;
-        size_t nl = strlen(needle);
-        if (!nl) return hay;
-        for (const char *p = hay; *p; p++) {
-            size_t k = 0;
-            while (k < nl && p[k] && p[k] == needle[k]) k++;
-            if (k == nl) return p;
-        }
-        return NULL;
-    }
     // cstring 区 vmaddr/size(扫描时 LC 循环顺带收集) — 重走 LC 拿 __cstring/__objc_methname
     uint64_t cstrVM = 0, cstrSize = 0, methVM = 0, methSize = 0;
     lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
