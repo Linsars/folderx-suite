@@ -728,10 +728,14 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             // v2.58.28: 家族距离判据 — offset 16/17/18 太常见, 别的类的
                             // metadata/witness 小函数(0x10011b414 ldur 解引用形态)也会命中
                             // ldrb w0 尾判据 → mf_debug_27 全崩。真 EntitlementManager 族
-                            // getter 与 S∪K 语义函数同族连续(0x10009cbxx-0x10009d7xx),
+                            // getter 与语义函数同族连续(0x10009cbxx-0x10009d7xx),
                             // 距最近 S∪K 函数头 < 0x1000 才收。
+                            // v2.58.29: famAnchor 改取语义函数(S)min — mf_debug_29 实锤:
+                            // S∪K 的 min 是 SKU 请求层(0x10001111c, StoreKit 一带),
+                            // 与判定类(0x10009cbxx, 另一带)隔 0x8bxxx → 窗口全杀真 getter
+                            // (ivar Bool getter=0)。语义函数才是判定类同族锚。
                             uint64_t famAnchor = UINT64_MAX;
-                            for (int i4 = 0; i4 < nSKFn; i4++) if (skFn[i4] < famAnchor) famAnchor = skFn[i4];
+                            for (int i4 = 0; i4 < nSemFn; i4++) if (semFn[i4] < famAnchor) famAnchor = semFn[i4];
                             int nGetter = 0;
                             for (int fi = 0; fi < nFn && nGetter < 8; fi++) {
                                 uint64_t gh = fnHeads[fi];
