@@ -2462,6 +2462,8 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
         mfAppPatchBoot();
         extern void mfStateBootReplay(void);     // v2.58.20: F9 状态解锁冷启动重打(UserDefaults 型)
         mfStateBootReplay();
+        extern void mfChainABootReplay(void);     // v2.58.25: A链 ivar 直写冷启动重打(ServeLog EntitlementManager 型)
+        mfChainABootReplay();
         mfObjCHookApplySilent();
         mfSubInjectAutoStart();
         mfReceiptForgeAutoStart();
