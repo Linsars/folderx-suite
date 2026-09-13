@@ -541,9 +541,18 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         if (!dup && nSKFn < F8V3_MAXFN/2) skFn[nSKFn++] = skuFn[i2];
                     }
                     (void)nSK;
-                    // 辅助: 找 h 的下一头(有序表线性搜太慢 — nFn~2000, nSemFn~18, 可受)
+                    // v2.58.33: idxOf 改二分 — mf_debug_33 定谳: gooby 语义函数 192 个,
+                    // S∪K bl 扫里每条 bl 都 idxOf(t2) O(nFn=4096) 线性搜 → 4万 bl × 4096
+                    // ≈ 1.7亿比较, 侦查卡死在"语义引用函数=192"行后(与 2.58.31 停点相同 —
+                    // 形态分类修了, W 展开段的 idxOf 是下一个 O(N×M) 炸弹)。
+                    // fnHeads 按地址递增收集, 天然有序 → 二分 O(log 4096)=12 次。
                     int (^idxOf)(uint64_t) = ^int(uint64_t h) {
-                        for (int k = 0; k < nFn; k++) if (fnHeads[k] == h) return k;
+                        int lo = 0, hi = nFn - 1;
+                        while (lo <= hi) {
+                            int mid = (lo + hi) >> 1;
+                            if (fnHeads[mid] == h) return mid;
+                            if (fnHeads[mid] < h) lo = mid + 1; else hi = mid - 1;
+                        }
                         return -1;
                     };
                     // S∪K 的 bl 目标 → W(只收 head 元素 — 函数内入口不展开, 会爆)
