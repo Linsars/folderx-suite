@@ -206,13 +206,24 @@ static NSArray *mfEntsFromBinaryScan(void) {
     @try {
         NSData *d = [NSData dataWithContentsOfFile:[[NSBundle mainBundle] executablePath]];
         if (!d || d.length > 200 * 1024 * 1024) return out;
-        NSString *s = [[NSString alloc] initWithData:d encoding:NSASCIIStringEncoding];
-        if (!s) return out;
-        NSError *err = nil;
-        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:
-            @"[a-z0-9][a-z0-9.-]{2,80}\\.entitlements" options:0 error:&err];
-        for (NSTextCheckingResult *r in [re matchesInString:s options:0 range:NSMakeRange(0, s.length)]) {
-            NSString *e = [s substringWithRange:r.range];
+        // v2.58.36: NSString ASCII 整文件解码 = 高位字节直接 nil, 永远扫不中(mf_debug_38 实锤:
+        //   mfEntsFromBinaryScan 空 → ents fallback "pro" → app 查的不是 "pro" → Pro 不亮)。
+        //   改逐段 C 扫(只捕 [a-z0-9.-]+\.entitlements 邻域, 无视高位字节)。
+        const char *p = d.bytes;
+        NSUInteger n = d.length;
+        for (NSUInteger i = 0; i + 14 < n; i++) {
+            if (p[i] != 's' || p[i+1] != 0) continue;      // 快速预筛: 串尾 's' + NUL 终止
+            // 回扫找串头: 从 i 向前找连续 [a-z0-9.-] 且长度 ≤85, 尾部必须 ".entitlements"
+            NSUInteger j = i;
+            while (j > 0 && (NSUInteger)(p[j-1]) &&
+                   (isalnum((unsigned char)p[j-1]) || p[j-1]=='.' || p[j-1]=='-') && (i - (j-1)) < 85) j--;
+            NSUInteger len = i - j + 1;          // 串长精确(j..i, i 是最后字符 's')
+            if (len < 14 || len > 85) continue;
+            // 确认尾部 .entitlements
+            if (strncmp(p + i - 12, ".entitlements", 14) != 0) continue;
+            char buf[88];
+            memcpy(buf, p + j, len); buf[len] = 0;
+            NSString *e = [NSString stringWithUTF8String:buf];
             if ([e hasPrefix:@"com.apple."]) continue;
             if (![out containsObject:e]) [out addObject:e];
             if (out.count >= 8) break;

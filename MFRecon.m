@@ -1162,10 +1162,17 @@ NSDictionary *mfReconFingerprint(void) {
             // v2.58.9 F8v2: strip 主二进制兜底 — 符号表无判定函数时走 chained fixups 链
             // (imports→SK 词表→bind→GOT slot→stubs→bl 调用点→prologue 归属), 点位合成 @0x 名
             // v2.58.21: 不再被 F9 else 掐死 — 双路并报(状态型与代码型可并存)
+            // v2.58.36: 云验证型降权 — mf_debug_38 实锤: gooby(RC 云验证型)12 个 F8v2
+            //   swifttext 点位⚡后购买页崩(ips: String.init(localized:) @Observable 渲染,
+            //   被patch函数返回对象非Bool, mov w0,#1 → 调用方当指针解 → SIGSEGV)。
+            //   云SDK在场 = 判定本体在云端回包, F8 点位对这类 app 无意义还高危 —
+            //   不入库不显示, lines 明说路线是 mock。纯 StoreKit/SK1 型 app 照旧入库。
             {
             NSDictionary *f8v2 = mfReconF8v2Scan();
             NSArray *cands = f8v2[@"cands"];
-            if ([cands isKindOfClass:[NSArray class]] && cands.count) {
+            if (cloudBrands.count) {
+                [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: 已抑制(%lu 个 F8v2 候选 — 云验证型判定在云端回包, patch 本地函数高危且无效, 主路线=subinject mock)", (unsigned long)([cands isKindOfClass:[NSArray class]] ? cands.count : 0)]];
+            } else if ([cands isKindOfClass:[NSArray class]] && cands.count) {
                 extern void mfAppPatchEntDumpsMerge(NSArray *);
                 mfAppPatchEntDumpsMerge(cands);
                 [entFuncs addObjectsFromArray:cands];
