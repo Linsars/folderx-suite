@@ -14,6 +14,7 @@
 #import <Foundation/Foundation.h>
 #import "fishhook.h"
 #import <Security/Security.h>
+#import <stdlib.h>
 
 static BOOL g_subOn = NO;
 static IMP orig_dtReq = NULL, orig_dtURL = NULL;
@@ -41,17 +42,96 @@ static Boolean my_SecKeyVerifySignature(SecKeyRef key, SecKeyAlgorithm algorithm
     return orig_SecKeyVerifySignature ? orig_SecKeyVerifySignature(key, algorithm, signedData, signature, error) : true;
 }
 
-static void mfInstallSecurityBypass(void) {
+// RC 验签出口 hook 的原实现指针(mfInstallRCVerificationBypass 装载)
+static IMP orig_RCEntitlementInfo_verification = NULL;
+
+// v2.58.38: RC offline entitlements 验签出口 hook(mf_debug_40 定谳) —
+//   app 配了 EntitlementVerificationMode, SDK 用自带 ASN.1/ECDSA(纯 Swift, 无
+//   SecKeyVerifySignature import — 老 bypass 全空转), 验签结果挂 RCEntitlementInfo
+//   的 verification 属性(VerificationResult: verified/unverified/unknown)。
+//   app Monetization preflight 读它, unverified → signature_verification_failed
+//   → ProVerificationFailurePrompt 锁死。伪造签名无解(RC 私钥), 唯一出口 = getter 恒 verified。
+//   VerificationResult 是 ObjC 桥可见枚举(RC ObjC: +[RCEntitlementInfoVerificationResult...]),
+//   枚举 verified case 的实际 ObjC 类在 runtime 才知道 — 启动时枚举所有 RC VerificationResult
+//   子类, 找 rawValue/内部ivar 匹配 verified 的类, 缓存后 getter 恒返它。
+static Class g_rcVerifiedClass = NULL;
+
+static id mfRCVerifiedInstance(void) {
+    static id cached = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        struct rebinding rebs[] = {
-            {"SecKeyRawVerify", (void *)my_SecKeyRawVerify, (void **)&orig_SecKeyRawVerify},
-            {"SecKeyVerifySignature", (void *)my_SecKeyVerifySignature, (void **)&orig_SecKeyVerifySignature}
-        };
-        rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
-        mfLog(@"[subinject] Security framework signature verification rebound");
+        if (!g_rcVerifiedClass) return;
+        id inst = [[g_rcVerifiedClass alloc] init];
+        if (inst) { cached = inst; return; }
+        // init 不行试单例式工厂(VerificationResult 可能是 case class 实例由 SDK 内建)
+        cached = nil;
+    });
+    return cached;
+}
+
+static id mf_RCEntitlementInfo_verification(id self, SEL _cmd) {
+    id v = orig_RCEntitlementInfo_verification ?
+        ((id(*)(id, SEL))orig_RCEntitlementInfo_verification)(self, _cmd) : nil;
+    id fake = mfRCVerifiedInstance();
+    if (fake) return fake;
+    // 观察模式: 没找到 verified case 类 — 打一次真实返回类型(下轮日志定谳)
+    static int logged = 0;
+    if (!logged && v) {
+        logged = 1;
+        mfLog(@"[subinject] RC verification 原值: %@ (%@)", v, NSStringFromClass([v class]));
+    }
+    return v;
+}
+
+static void mfInstallRCVerificationBypass(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // RCEntitlementInfo 是 Swift 类的 ObjC 桥(RCCustomercInfo 属性表 T@"RCEntitlementInfos" 实锤)
+        Class entInfo = NSClassFromString(@"RCEntitlementInfo") ?: NSClassFromString(@"_TtC10RevenueCat15EntitlementInfo");
+        if (!entInfo) { mfLog(@"[subinject] RC verification bypass: RCEntitlementInfo 类未见(旧SDK) 跳过"); return; }
+        // 枚举 VerificationResult: RC 5.5 ObjC 形态是嵌套 enum case 类或 NSNumber rawValue
+        // 先探属性存在性(class_getInstanceMethod verification)
+        Method m = class_getInstanceMethod(entInfo, @selector(verification));
+        if (!m) { mfLog(@"[subinject] RC verification bypass: verification selector 未见于 RCEntitlementInfo"); return; }
+        // 找 verified 实例形态: VerificationResult 是 Swift enum — ObjC 侧表现为
+        // 私有 case 类(_TtCC10RevenueCat... 或 RevenueCat 内部类)带 verified 静态成员。
+        // 通用法: 全 RC 模块类枚举, 找类名含 "VerificationResult" 且能响应 verified 的。
+        Class verifiedClass = NULL;
+        // 全类表枚举找 RC VerificationResult 的 verified case 类(Swift enum case = 私有 ObjC 类)
+        int nCls = objc_getClassList(NULL, 0);
+        if (nCls > 0) {
+            Class *cls = (Class *)malloc(sizeof(Class) * (unsigned)nCls);
+            if (cls) {
+                unsigned int actual = objc_getClassList(cls, (unsigned int)nCls);
+                for (unsigned int i = 0; i < actual && !verifiedClass; i++) {
+                    const char *nm = class_getName(cls[i]);
+                    if (!nm) continue;
+                    if (strstr(nm, "VerificationResult") && (strstr(nm, "Verified") || strstr(nm, "verified"))) {
+                        verifiedClass = cls[i];
+                    }
+                }
+                free(cls);
+            }
+        }
+        if (!verifiedClass) {
+            // case 类名可能不带 verified — 退而求其次: 直接打日志看 verification 真实返回类型
+            mfLog(@"[subinject] RC verification bypass: verified case 类未枚举到 — 需 runtime dump RCEntitlementInfo.verification 返回类型");
+            // 仍装 hook: 把返回值转成 verified 的通用兜底 = 枚举 rawValue 可控时改写
+            // 兜底方案: hook 后打印一次真实值类型, 下轮日志定谳再改
+            Method mm = class_getInstanceMethod(entInfo, @selector(verification));
+            orig_RCEntitlementInfo_verification = (void *)method_getImplementation(mm);
+            method_setImplementation(mm, (IMP)mf_RCEntitlementInfo_verification);
+            mfLog(@"[subinject] RC verification bypass: 观察模式已装(打值定类型)");
+            return;
+        }
+        g_rcVerifiedClass = verifiedClass;
+        Method mm = class_getInstanceMethod(entInfo, @selector(verification));
+        orig_RCEntitlementInfo_verification = (void *)method_getImplementation(mm);
+        method_setImplementation(mm, (IMP)mf_RCEntitlementInfo_verification);
+        mfLog(@"[subinject] RC verification bypass: RCEntitlementInfo.verification → 恒 %@ 已装", @(class_getName(verifiedClass)));
     });
 }
+
 
 #pragma mark - 商品 ID 源(SK1 扫描列表)
 
@@ -442,6 +522,20 @@ static id mf_dtURL(id self, SEL _cmd, NSURL *u, void (^handler)(NSData *, NSURLR
 }
 
 #pragma mark - 开关/持久化
+
+// v2.58.38: Security.framework 绕过 + RC verification 出口(原 mfInstallSecurityBypass 扩容)
+static void mfInstallSecurityBypass(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct rebinding rebs[] = {
+            {"SecKeyRawVerify", (void *)my_SecKeyRawVerify, (void **)&orig_SecKeyRawVerify},
+            {"SecKeyVerifySignature", (void *)my_SecKeyVerifySignature, (void **)&orig_SecKeyVerifySignature}
+        };
+        rebind_symbols(rebs, sizeof(rebs) / sizeof(rebs[0]));
+        mfLog(@"[subinject] Security framework signature verification rebound");
+        mfInstallRCVerificationBypass();
+    });
+}
 
 void mfSubInjectEnable(void) {
     if (g_subOn) return;
