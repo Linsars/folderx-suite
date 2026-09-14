@@ -1147,20 +1147,69 @@ void mfShowScanPage(void) {
     [page addSubview:st];
     mfPushPage(page);
 
+    // v2.58.35: 真·产品ID先行 — 候选秒级上真列表(不再是文案)。列表由 verify 完成回调
+    //   增量接管: 先渲染 hook+静态候选(标"验证中"), verify 跑完重建全量(带价格/来源)。
+    //   侦查卡独立流水线: recon 跑完即换卡, 不等 SK verify。两线互不阻塞。
+    __block UITableView *earlyList = nil;
+    __block MFScanList *earlyCtl = nil;
+    __block UILabel *earlyCount = nil;
+    __block NSMutableArray *earlyShown = nil;    // 已上屏 pid 集合, verify 重建时跳过
+
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // v2.58.34: 产品ID先行(2.58.7 定案回归) — hooked+本地候选是秒级扫描, 先于
+        // v2.58.34→35: 产品ID先行(2.58.7 定案回归) — hooked+本地候选是秒级扫描, 先于
         // mfReconFingerprint()(重, 大 app 20s+)即时上屏; recon 卡死不再拖死产品ID。
         NSArray *hookedPIDs = [[NSUserDefaults standardUserDefaults] objectForKey:@"SavedIAPIDs"] ?: @[];
         NSArray *localCandidates = mfScanLocalProductIDs();
         if (localCandidates.count || hookedPIDs.count) {
+            NSMutableArray *early = [NSMutableArray array];
+            for (NSString *p in hookedPIDs) if (p.length) [early addObject:@{@"pid": p, @"price": @"验证中…", @"title": @"", @"src": @"运行"}];
+            for (NSString *p in localCandidates) if (p.length) [early addObject:@{@"pid": p, @"price": @"验证中…", @"title": @"", @"src": @"静态"}];
+            // 去重(hook+静态可重复)
+            NSMutableSet *es = [NSMutableSet set];
+            NSMutableArray *earlyDedup = [NSMutableArray array];
+            for (NSDictionary *d in early) {
+                if ([es containsObject:d[@"pid"]]) continue;
+                [es addObject:d[@"pid"]]; [earlyDedup addObject:d];
+            }
+            earlyShown = earlyDedup.mutableCopy;
+            NSMutableArray *earlyCopy = [earlyDedup mutableCopy];
             dispatch_async(dispatch_get_main_queue(), ^{
-                st.text = [NSString stringWithFormat:@"产品ID先行: %lu+%lu 候选(SK 验证中…) — 侦查独立跑, 不阻塞", (unsigned long)hookedPIDs.count, (unsigned long)localCandidates.count];
+                [st removeFromSuperview];
+                earlyCount = [[UILabel alloc] initWithFrame:CGRectMake(16, 106, g_mfCardW - 32, 20)];
+                earlyCount.text = [NSString stringWithFormat:@"候选 %lu 个先行上屏(SK 验证中…) — 侦查独立跑", (unsigned long)earlyCopy.count];
+                earlyCount.font = [UIFont systemFontOfSize:11];
+                earlyCount.textColor = [UIColor tertiaryLabelColor];
+                [page addSubview:earlyCount];
+                earlyList = [[UITableView alloc] initWithFrame:CGRectMake(0, 126, g_mfCardW, g_mfCardH - 126) style:UITableViewStylePlain];
+                earlyList.backgroundColor = UIColor.clearColor;
+                earlyList.separatorStyle = UITableViewCellSeparatorStyleNone;
+                earlyCtl = [MFScanList new];
+                earlyCtl.items = earlyCopy;
+                earlyList.dataSource = earlyCtl;
+                earlyList.delegate = earlyCtl;
+                objc_setAssociatedObject(page, "earlyScanCtl", earlyCtl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                [page addSubview:earlyList];
+                st.frame = CGRectMake(0, 0, 0, 0);   // 占位标签作废
             });
-            mfLog(@"[iap] 产品ID先行: hooked=%lu local=%lu 即时可看, 侦查独立跑", (unsigned long)hookedPIDs.count, (unsigned long)localCandidates.count);
+            mfLog(@"[iap] 产品ID先行: hooked=%lu local=%lu 候选秒级上真列表", (unsigned long)hookedPIDs.count, (unsigned long)localCandidates.count);
         }
         // v2.47.0: 内购模式一次性侦查(零 hook 纯读, 判据沉淀自 Reflix 战役终案) — 结果进置顶卡
+        //   v2.58.35: recon 完成即换卡(独立流水线), 不再与产品ID/SK verify 绑在一个回调里
         NSDictionary *recon = mfReconFingerprint();
         for (NSString *rl in recon[@"lines"]) mfLog(@"[recon] %@", rl);
+        {
+            NSDictionary *reconCopy = recon;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if ([ph.superview isKindOfClass:[UIView class]]) {
+                    [ph removeFromSuperview];
+                    UIView *reconCard = mfReconMakeCard(reconCopy);
+                    objc_setAssociatedObject(page, "reconCard", reconCard, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    [page addSubview:reconCard];
+                    // v2.58.35: recon 换卡要重挂 mfReconApplySKResult 的目标 — verify 后面
+                    // 仍会调它(纯 SK 型回填), 早于 verify 的换卡也记录到 page 关联
+                }
+            });
+        }
         // 1.0 运行时截获回流(v2.6.11): SK1 hook 历史截获的 app 自查 ID——app 亲口报的,最高优先级
         // 依据: 任何 app 要展示/购买商品必发 SKProductsRequest(init 参数含全部 ID),打开一次购买页即现形
 
@@ -1272,14 +1321,9 @@ void mfShowScanPage(void) {
             mfContributeToArchive(ctid, verifiedPrices.allKeys);
             dispatch_async(dispatch_get_main_queue(), ^{
                 [st removeFromSuperview];
-                // v2.58.7: 全链路(SK verify 含)跑完 — 灰占位卡换真侦查卡(此刻详情才完整, 可点)
-                if ([ph.superview isKindOfClass:[UIView class]]) {
-                    [ph removeFromSuperview];
-                    UIView *reconCard = mfReconMakeCard(recon);
-                    objc_setAssociatedObject(page, "reconCard", reconCard, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                    [page addSubview:reconCard];
-                }
-
+                // v2.58.7→35: 侦查卡换卡已由 recon 完成回调独立处理(不在此处)。
+                //   此回调只管产品列表: earlyList 在 → 换数据源增量接管; 不在(无候选/
+                //   秒扫场景) → 建全量列表。布局恒定, 不跳变。
                 NSMutableArray *merged = [NSMutableArray array];
                 NSSet *hookSet = [NSSet setWithArray:hookedPIDs];
                 NSSet *archiveSet = [NSSet setWithArray:archivePIDs];
@@ -1327,17 +1371,33 @@ void mfShowScanPage(void) {
                 [page addSubview:countLb];
 
                 // v2.6.16: UITableView 三行 cell + 系统 swipe actions(对标捕获列表)
-                UITableView *sv = [[UITableView alloc] initWithFrame:CGRectMake(0, 126, g_mfCardW, g_mfCardH - 126) style:UITableViewStylePlain];
-                sv.backgroundColor = UIColor.clearColor;
-                sv.separatorStyle = UITableViewCellSeparatorStyleNone;
-                MFScanList *scanCtl = [MFScanList new];
-                scanCtl.items = merged;
-                sv.dataSource = scanCtl;
-                sv.delegate = scanCtl;
-                objc_setAssociatedObject(page, "scanCtl", scanCtl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                [page addSubview:sv];
-                mfLog(@"scan done: verified=%lu total=%lu",
-                    (unsigned long)verifiedPrices.count, (unsigned long)merged.count);
+                if (earlyList.superview == page && earlyCtl) {
+                    // 增量接管: 直接换已上屏列表的数据源(布局不动, 无跳变)
+                    earlyCtl.items = merged;
+                    if (earlyCount) earlyCount.text = [NSString stringWithFormat:@"验证通过 %lu / 候选 %lu（左划复制 · 点按购买）",
+                        (unsigned long)merged.count, (unsigned long)toVerify.count];
+                    [earlyList reloadData];
+                    objc_setAssociatedObject(page, "scanCtl", earlyCtl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                } else {
+                    UITableView *sv = [[UITableView alloc] initWithFrame:CGRectMake(0, 126, g_mfCardW, g_mfCardH - 126) style:UITableViewStylePlain];
+                    sv.backgroundColor = UIColor.clearColor;
+                    sv.separatorStyle = UITableViewCellSeparatorStyleNone;
+                    MFScanList *scanCtl = [MFScanList new];
+                    scanCtl.items = merged;
+                    sv.dataSource = scanCtl;
+                    sv.delegate = scanCtl;
+                    objc_setAssociatedObject(page, "scanCtl", scanCtl, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    [page addSubview:sv];
+                    UILabel *countLb = [[UILabel alloc] initWithFrame:CGRectMake(16, 106, g_mfCardW - 32, 20)];
+                    countLb.text = [NSString stringWithFormat:@"验证通过 %lu / 候选 %lu（左划复制 · 点按购买）",
+                        (unsigned long)merged.count, (unsigned long)toVerify.count];
+                    countLb.font = [UIFont systemFontOfSize:11];
+                    countLb.textColor = [UIColor tertiaryLabelColor];
+                    [page addSubview:countLb];
+                }
+                mfLog(@"scan done: verified=%lu total=%lu (early接管=%d)",
+                    (unsigned long)verifiedPrices.count, (unsigned long)merged.count,
+                    (int)(earlyList.superview == page));
                 // v2.47.5: 第三类判定回填 — 无云/mach 指纹时 SK 产品名就是形态答案(纯 StoreKit 本地型)
                 if (merged.count > 0) {
                     NSString *topPid = merged[0][@"pid"];

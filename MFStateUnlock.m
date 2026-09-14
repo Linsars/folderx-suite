@@ -73,6 +73,18 @@ static BOOL stateKeyMatch(NSString *k) {
     if (![k containsString:@"."]) return NO;    // plist key 命名风格: a.b 点分 camelCase
     if ([k hasPrefix:@"com."]) return NO;       // 排除第三方 SDK 域名风格 key(RC 映射等 — 缓存 dict, 直写会破坏)
     if (!stateKeyShapeOK(k)) return NO;         // v2.58.21: 形态门 — 文案/URL/路径不是 key
+    // v2.58.35: 静态污染排除(Reflix 76 假案定谳) — __cstring 里的 i18n 文案段
+    //   (discover./drawer./paywall./testflight./player./settings./badge_/detail.)
+    //   与 Firebase 埋点段 (measurement./error_/.token/.mocking_) 词表全误命中
+    //   ("pro_header"/"lifetime"/"expiresIn" 子串), 但全是文案 key 非状态位。
+    static NSArray *i18nSegs = nil;
+    static dispatch_once_t o2;
+    dispatch_once(&o2, ^{ i18nSegs = @[@"discover.", @"drawer.", @"paywall.", @"testflight.",
+                                        @"settings.", @"player.", @"badge_", @"measurement.",
+                                        @"adservices_", @"log2_", @"caching_", @"error_",
+                                        @"sk2_invalid", @"manage_subscription", @"general_tier"]; });
+    for (NSString *seg in i18nSegs)
+        if ([k hasPrefix:seg] || [k containsString:[@"." stringByAppendingString:seg]]) return NO;
     NSString *lk = [k lowercaseString];
     for (NSString *w in kStateKeyWords)
         if ([lk containsString:w]) return YES;
@@ -237,10 +249,23 @@ long mfStateUnlockApplyAll(NSArray *keys) {
 @end
 static MFStateList *g_stateList = nil;
 
+// v2.58.35: 侦查=唯一采集器(用户架构定案) — recon 采集的 stateKeys 缓存于此, F9
+//   全部消费点只读缓存; 缓存空(未跑过侦查)时回退原 mfStateProbeKeys()(保 UI 不空,
+//   但定性只认侦查卡)。缓存带 ts, 冷启动过期(数据是侦查时快照)。
+static NSArray *g_reconStateKeys = nil;
+void mfStateReconCacheSet(NSArray *keys) {
+    g_reconStateKeys = [keys copy];
+}
+NSArray *mfStateKeysForUI(void) {
+    if (g_reconStateKeys.count) return g_reconStateKeys;
+    return mfStateProbeKeys();   // 兜底: 没跑侦查直接开 F9(不推荐, 侦查卡才是定性者)
+}
+
 void mfShowStatePage(void) {
     UIView *page = mfMakePage(@"🔓 状态解锁 F9", YES);
-    NSArray *keys = mfStateProbeKeys();
-    mfLog(@"[f9] 侦查: %lu 个语义 key%@", (unsigned long)keys.count, keys.count ? @"" : @"(无 — 该 app 非状态型判定)");
+    NSArray *keys = mfStateKeysForUI();
+    mfLog(@"[f9] 侦查: %lu 个语义 key%@ (源: %@)", (unsigned long)keys.count, keys.count ? @"" : @"(无 — 该 app 非状态型判定)",
+        g_reconStateKeys.count ? @"侦查卡缓存" : @"F9 兜底独立扫(未跑侦查)");
     UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(16, 46, g_mfCardW - 32, 30)];
     hint.font = [UIFont systemFontOfSize:11];
     hint.textColor = [UIColor secondaryLabelColor];
@@ -337,13 +362,13 @@ BOOL mfStatePersistIsOn(void) {
     mfToast(@"已回滚(remove)");
 }
 - (void)mfStateZapAll {
-    NSArray *ks = mfStateProbeKeys();                   // 局部接住(ARC 命名桥接)
+    NSArray *ks = mfStateKeysForUI();                   // 局部接住(ARC 命名桥接) — 吃侦查缓存
     long n = mfStateUnlockApplyAll(ks);
     mfToast([NSString stringWithFormat:@"⚡ 已直写 %ld 个 key", n]);
 }
 - (void)mfStatePersistToggle:(UIButton *)sender {
     BOOL now = mfStatePersistIsOn();
-    NSArray *ks = mfStateProbeKeys();                   // 局部接住(ARC 命名桥接)
+    NSArray *ks = mfStateKeysForUI();                   // 局部接住(ARC 命名桥接) — 吃侦查缓存
     mfStateSetPersist(ks, !now);
     sender.titleLabel.text = !now ? @"💾持久化 ON(冷启动重打)" : @"💾持久化(冷启动重打)";
     mfToast(!now ? @"💾 冷启动自动重打已开" : @"已取消持久化");

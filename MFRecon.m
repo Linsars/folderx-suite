@@ -1133,16 +1133,29 @@ NSDictionary *mfReconFingerprint(void) {
         // (文案/URL 词表误命中 → 把纯 SK2 代码判定型 app 掐死在 F8 门外)。现在
         // 状态型线索与代码扫描并存, recon 只报数据, 用户在 UI 里自己选主路线。
             // v2.58.20: F9 状态型判定 — 判定数据源形态先行, UserDefaults 型直写
+            //   v2.58.35: 侦查=唯一采集器(用户架构定案) — key 列表由 recon 采集打包进
+            //   recon dict(stateKeys), F9 卡片只读缓存, 不再独立扫(此前 F9 自己又扫一遍
+            //   __cstring+plist, 与侦查卡各扫各的, 定性互相矛盾)。
             extern NSArray *mfStateProbeKeys(void);            // MFStateUnlock.m(F9 状态型判定)
+            extern void mfStateReconCacheSet(NSArray *);       // v2.58.35: 侦查=唯一采集器
             NSArray *stateKeys = mfStateProbeKeys();          // 局部接住(ARC 命名桥接教训)
-            long nStateKeys = [stateKeys count];
-            if (nStateKeys > 0) {
-                [lines addObject:[NSString stringWithFormat:@"判定数据源: 🔓 状态型(UserDefaults %ld 语义key) — 🧪实验模拟→F9 状态解锁 直写", nStateKeys]];
-                for (NSDictionary *d in [stateKeys subarrayWithRange:NSMakeRange(0, MIN(3, nStateKeys))]) {
+            mfStateReconCacheSet(stateKeys);                  // F9 卡片吃缓存, 不再独立扫
+            // v2.58.35: 状态型判定升级 — 仅静态命中(全是 __cstring 里的死串)不算状态型:
+            //   Reflix 76 key 全静态(i18n 文案 key/类名/埋点 key 过词表门), 判"状态型"
+            //   与第一行 RC 云验证自相矛盾。实存 key(app 自己写过/读过的)才是 app 真在
+            //   用的状态位。静态候选只作 F9 的"可试探"展示, 不再撑判定。
+            NSUInteger liveKeys = 0;
+            for (NSDictionary *d in stateKeys) if ([d[@"live"] boolValue]) liveKeys++;
+            if (liveKeys > 0) {
+                [lines addObject:[NSString stringWithFormat:@"判定数据源: 🔓 状态型(UserDefaults 实存 %lu 语义key, 静态候选 %lu) — 🧪实验模拟→F9 状态解锁 直写",
+                    (unsigned long)liveKeys, (unsigned long)stateKeys.count]];
+                for (NSDictionary *d in [stateKeys subarrayWithRange:NSMakeRange(0, MIN(3, stateKeys.count))]) {
                     [lines addObject:[NSString stringWithFormat:@"  %@%@ %@",
                         d[@"key"], [d[@"isDate"] boolValue] ? @" 📅" : @"",
                         [d[@"live"] boolValue] ? @"(实存)" : @"(静态)"]];
                 }
+            } else if (stateKeys.count) {
+                [lines addObject:[NSString stringWithFormat:@"判定数据源: 非状态型(静态候选 %lu 全是二进制死串, 无实存 key) — i18n 文案/类名误命中已排除", (unsigned long)stateKeys.count]];
             }
             // v2.58.9 F8v2: strip 主二进制兜底 — 符号表无判定函数时走 chained fixups 链
             // (imports→SK 词表→bind→GOT slot→stubs→bl 调用点→prologue 归属), 点位合成 @0x 名
@@ -1165,6 +1178,19 @@ NSDictionary *mfReconFingerprint(void) {
 
     // ---- 判定(动态拼接, 可叠加: Reflix = 云+mach 双面) ----
     BOOL cloud = cloudBrands.count > 0;
+    // v2.58.35: 云验证优先级定案(用户架构: 侦查卡是定性器) — RC/Adapty 等云 SDK 在场时
+    //   判定本体在云端回包, UserDefaults 状态 key 只是缓存镜像(直写有概率生效但不定死
+    //   类型)。verdict 云分支前置, 状态型只作 lines 里的辅助线索(实存 key 才标注)。
+    BOOL stateType = NO;
+    {
+        // 状态型 = 无云无 mach + 实存语义 key 数量 ≥2(静态死串不算, Reflix 76 假案定谳)
+        if (!cloud && !mach) {
+            NSUInteger live = 0;
+            NSArray *sk = recon[@"stateKeys"];
+            for (NSDictionary *d in (NSArray *)sk) if ([d isKindOfClass:[NSDictionary class]] && [d[@"live"] boolValue]) live++;
+            if (live >= 2) stateType = YES;
+        }
+    }
     // F7 服务器权益型(2026-09-06 mailnow 案定案): 无云 SDK + 纯 SK + WebView 权益标志(FlexCall/loadSuccess
     // /premium/no_ad/vip 类 JS 桥字段) → 权益本体在服务端会话, 本地解锁无意义
     BOOL serverSide = NO;
@@ -1187,6 +1213,7 @@ NSDictionary *mfReconFingerprint(void) {
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 可直达", cloudBrands.allObjects.firstObject];
     else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, Reflix/ScriptingPass 同族) — EXCPROBE 应答器可复刻";
     else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
+    else if (stateType)     verdict = @"状态型(UserDefaults 实存语义key) — 🧪实验模拟→F9 状态解锁 直写";
     // v2.58.7: 纯 StoreKit 本地校验型分支(2.58.6 缺失 — SK2 明明已判定却显示"未发现订阅验证 SDK"兜底文案)
     else if (skLocal)       verdict = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@ · %@) — 判定点已入库, 实验模拟页左划 patch", skType, validator];
     else                    verdict = @"未发现订阅验证 SDK";
@@ -1199,7 +1226,8 @@ NSDictionary *mfReconFingerprint(void) {
     return @{@"verdict": verdict, @"lines": lines,
              @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide), @"sk": @(skLocal),
              @"sktype": skType, @"validator": validator,
-             @"entFuncs": entFuncs};
+             @"entFuncs": entFuncs,
+             @"stateKeys": stateKeys};   // v2.58.35: 侦查=唯一采集器 — F9 卡片吃这个, 不独立扫
 }
 
 // ===== 详情页(面板导航, 可滚动可长按选中复制) =====
