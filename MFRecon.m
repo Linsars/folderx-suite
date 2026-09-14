@@ -835,6 +835,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
 }
 
 NSDictionary *mfReconFingerprint(void) {
+    __block NSArray *stateKeys = @[];   // v2.58.35: 提升函数级 — lines 块内采集, verdict 判型/return 都要用
+
     NSMutableArray *lines = [NSMutableArray array];
     NSMutableSet *cloudBrands = [NSMutableSet set];
     BOOL mach = NO;
@@ -1138,7 +1140,7 @@ NSDictionary *mfReconFingerprint(void) {
             //   __cstring+plist, 与侦查卡各扫各的, 定性互相矛盾)。
             extern NSArray *mfStateProbeKeys(void);            // MFStateUnlock.m(F9 状态型判定)
             extern void mfStateReconCacheSet(NSArray *);       // v2.58.35: 侦查=唯一采集器
-            NSArray *stateKeys = mfStateProbeKeys();          // 局部接住(ARC 命名桥接教训)
+            stateKeys = mfStateProbeKeys();          // 采集(函数级变量, 局部接住教训仍守: 不在参数位内联)
             mfStateReconCacheSet(stateKeys);                  // F9 卡片吃缓存, 不再独立扫
             // v2.58.35: 状态型判定升级 — 仅静态命中(全是 __cstring 里的死串)不算状态型:
             //   Reflix 76 key 全静态(i18n 文案 key/类名/埋点 key 过词表门), 判"状态型"
@@ -1186,8 +1188,7 @@ NSDictionary *mfReconFingerprint(void) {
         // 状态型 = 无云无 mach + 实存语义 key 数量 ≥2(静态死串不算, Reflix 76 假案定谳)
         if (!cloud && !mach) {
             NSUInteger live = 0;
-            NSArray *sk = recon[@"stateKeys"];
-            for (NSDictionary *d in (NSArray *)sk) if ([d isKindOfClass:[NSDictionary class]] && [d[@"live"] boolValue]) live++;
+            for (NSDictionary *d in stateKeys) if ([d isKindOfClass:[NSDictionary class]] && [d[@"live"] boolValue]) live++;
             if (live >= 2) stateType = YES;
         }
     }
