@@ -323,18 +323,23 @@ static NSString *mfSubJSON(NSURL *u) {
         NSString *body;
         if (!subShape) {
             // lifetime 形态 = v2.24.5 定版 9 字段(实测亮, 不动)
+            // v2.58.37: 补 "subscriptions":{} — RC SDK JSONDecoder 严格解析, subscriber 块
+            //   缺 subscriptions 键 = KeyNotFound → 整个回包丢弃 → Pro 不亮(mf_debug_39 定谳:
+            //   ents 名对上+mock 在打+回包结构缺键)。真实 RC 回包两键恒并存, 空也是 {}。
             NSString *nonSubs = [NSString stringWithFormat:
                 @"\"%@\":[{\"id\":\"lifetime_%@\",\"is_sandbox\":false,\"original_purchase_date\":\"2021-11-21T17:32:12Z\",\"purchase_date\":\"2021-11-21T17:32:12Z\",\"store\":\"app_store\",\"store_transaction_id\":\"lifetime_%@\"}]",
                 bindPID, bindPID, bindPID];
             body = [NSString stringWithFormat:
                 @"{\"request_date\":\"%@\",\"subscriber\":{"
                 @"\"entitlements\":{%@},"
+                @"\"subscriptions\":{},"
                 @"\"non_subscriptions\":{%@},"
                 @"\"first_seen\":\"2024-06-10T11:12:09Z\","
                 @"\"original_app_user_id\":\"%@\"}}",
                 nowMs, ent, nonSubs, uid];
         } else {
-            // 订阅形态: expires_date 滚动未来 + 产品进 subscriptions(RC 订阅规范位), 无 non_subscriptions
+            // 订阅形态: expires_date 滚动未来 + 产品进 subscriptions(RC 订阅规范位)
+            // v2.58.37: 对称补 "non_subscriptions":{} — 同一 JSONDecoder 严格性问题
             NSString *subs = [NSString stringWithFormat:
                 @"\"%@\":{\"expires_date\":\"%@\",\"original_purchase_date\":\"2021-11-21T17:32:12Z\",\"purchase_date\":\"2021-11-21T17:32:12Z\",\"store\":\"app_store\",\"is_sandbox\":false,\"ownership_type\":\"PURCHASED\",\"period_type\":\"normal\",\"auto_renew_status\":true}",
                 bindPID, mfSubISOFuture(step)];
@@ -342,6 +347,7 @@ static NSString *mfSubJSON(NSURL *u) {
                 @"{\"request_date\":\"%@\",\"subscriber\":{"
                 @"\"entitlements\":{%@},"
                 @"\"subscriptions\":{%@},"
+                @"\"non_subscriptions\":{},"
                 @"\"first_seen\":\"2024-06-10T11:12:09Z\","
                 @"\"original_app_user_id\":\"%@\"}}",
                 nowMs, ent, subs, uid];
