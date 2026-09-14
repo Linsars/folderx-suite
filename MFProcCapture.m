@@ -32,6 +32,7 @@ static os_unfair_lock g_machLock = OS_UNFAIR_LOCK_INIT;
 static int g_machCapCount = 0;
 static uint32_t g_excHitCount = 0;   // v2.54.0: EXCPROBE 应答命中计数
 void mfExcArm(void);   // v2.54.1: 前向声明(定义在下方), 开关变化时重触发武装
+static void mfCapReflixInlinePatchOnly(void);   // v2.58.39: Reflix INLINE-PATCH 独立通道(定义在下方)
 
 // v2.54.0: EXCPROBE 应答器开关状态(mfExcEnabled)——实验模拟页 UISwitch
 BOOL mfExcIsOn(void) {
@@ -1222,6 +1223,14 @@ void mfProcCaptureStart(void) {
     // EXCPROBE 武装: 兼容列表内的 app + 开关 ON(在 mfExcArm 内部判断 mfExcEnabled)
     if (!inCompat) {
         mfLog(@"[capture] EXCPROBE skip (bid=%@ not in mfCompatAppList)", bid ?: @"?");
+        // v2.58.39: ★止损门不可吞掉 Reflix 定版资产 — 2.46.0 的 INLINE-PATCH(mov x9,#1)
+        //   在本函数 return 之后, 白名单门(2.54.4 加)把 gooby 挡在门外导致定版链断裂
+        //   (mf_debug_40 实锤 skip + INLINE-PATCH 未执行, Pro 不亮)。
+        //   解耦: gooby(Reflix, bid+ver 匹配 2.46.0 白名单)恒走 INLINE-PATCH,
+        //   不受 mfCompatAppList 管; 其他 app 维持 2.54.4 止损语义(高侵入面只对观察目标装)。
+        if ([bid isEqualToString:@"com.magicgroot.gooby"]) {
+            mfCapReflixInlinePatchOnly();
+        }
         return;
     }
     mfLog(@"[capture] EXCPROBE armed (mfCompatAppList, bid=%@ ver=%@)", bid, ver);
@@ -1453,32 +1462,48 @@ void mfProcCaptureStart(void) {
         mfLog(@"[capture] TRAPSCAN done found=%u (dt=%llums)", found,
               (unsigned long long)((mach_absolute_time() - t0) / 1000000));
     }
-    // v2.46.0: ★ 内联补丁(替代件终形态) — 机制终案: vendor 的一切 = 把 main+0x14211bc
-    //   的 ldur x9,[x29,#-0x100](f85003a9, 解码字段加载) 换成陷阱, 异常应答 x9=1 跳过原指令
-    //   = "该字段恒 1"。等价内联: 直接写 mov x9,#1(0xd2800029) — 无异常无端口无 vendor
-    {
-        uint64_t siteOff = 0x14211bc;
-        uint32_t expect = 0xf85003a9, patch = 0xd2800029;   // mov x9, #1
-        volatile uint32_t *siteP = (volatile uint32_t *)(mhCapMainText + siteOff);
-        uint32_t cur = *siteP;
-        if (cur == expect) {
-            kern_return_t kp = vm_protect(mach_task_self(), (vm_address_t)mhCapMainText,
-                                          0x2e30000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-            if (kp == KERN_SUCCESS) {
-                *siteP = patch;
-                uint32_t chk = *siteP;
-                kern_return_t kr3 = vm_protect(mach_task_self(), (vm_address_t)mhCapMainText,
-                                               0x2e30000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-                mfLog(@"[capture] INLINE-PATCH 0x14211bc f85003a9→%08x chk=%08x rxs kr=%d patch_kr=%d",
-                      patch, chk, kr3, kp);
-            } else {
-                mfLog(@"[capture] INLINE-PATCH vm_protect kr=%d — 走 EXCPROBE 路径", kp);
-            }
-        } else {
-            mfLog(@"[capture] INLINE-PATCH skip: live=%08x ≠ %08x", cur, expect);
+
+// v2.58.39: Reflix 定版资产独立通道(白名单门外的恒走版) — 2.46.0 INLINE-PATCH 解耦件。
+//   机制终案: vendor 唯一实质动作 = main+0x14211bc 的 ldur x9,[x29,#-0x100](f85003a9)
+//   换成陷阱+异常应答 x9=1 跳过原指令 = "该字段恒 1"。
+//   等价内联: 直接写 mov x9,#1(0xd2800029) — 无异常无端口无 vendor。
+//   vm_protect 被拒时回落 EXCPROBE(mfExcArm, 需 mfExcEnabled)。
+static void mfCapReflixInlinePatchOnly(void) {
+    const struct mach_header_64 *mh = NULL;
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const struct mach_header *h = _dyld_get_image_header(i);
+        if (h && h->magic == MH_MAGIC_64 && h->filetype == MH_EXECUTE) {
+            mh = (const struct mach_header_64 *)h;
+            break;
         }
     }
-    // v2.34.0 核心: add_image 回调 — dyld 映射完镜像、initializer 执行之前触发
+    if (!mh) { mfLog(@"[capture] INLINE-PATCH skip: main image not found"); return; }
+    uint8_t *mainText = (uint8_t *)mh;
+    uint64_t siteOff = 0x14211bc;
+    uint32_t expect = 0xf85003a9, patch = 0xd2800029;   // mov x9, #1
+    volatile uint32_t *siteP = (volatile uint32_t *)(mainText + siteOff);
+    uint32_t cur = *siteP;
+    if (cur != expect) {
+        // 已是 patch 值(重打) / 新版二进制指令漂移 — 报 live 值, 不盲写
+        mfLog(@"[capture] INLINE-PATCH skip: live=%08x ≠ %08x", cur, expect);
+        return;
+    }
+    kern_return_t kp = vm_protect(mach_task_self(), (vm_address_t)mainText,
+                                  0x2e30000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kp == KERN_SUCCESS) {
+        *siteP = patch;
+        uint32_t chk = *siteP;
+        kern_return_t kr3 = vm_protect(mach_task_self(), (vm_address_t)mainText,
+                                       0x2e30000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+        mfLog(@"[capture] INLINE-PATCH 0x14211bc f85003a9→%08x chk=%08x rxs kr=%d patch_kr=%d",
+              patch, chk, kr3, kp);
+    } else {
+        mfLog(@"[capture] INLINE-PATCH vm_protect kr=%d — 走 EXCPROBE 路径", kp);
+        mfExcArm();   // 2.46.0 兜底: 异常端口应答器接管(内部看 mfExcEnabled)
+    }
+}
+
+// v2.34.0 核心: add_image 回调 — dyld 映射完镜像、initializer 执行之前触发
     //   回调里武装 vendor 全套 GOT 钩 + 预 ctor 段快照 → 它 ctor 的每一步都在监视下
     _dyld_register_func_for_add_image(mf_vendorAddImageCB);
     mfLog(@"[capture] add_image callback registered (pre-dlopen)");
