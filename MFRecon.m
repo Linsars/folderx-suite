@@ -118,13 +118,20 @@ static NSDictionary *mfReconF8v2Scan(void) {
     // ---- LC: __text/__stubs section(rev2 不再需要 fixups 表) ----
     const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
     uint64_t textVM = 0, textSize = 0, stubVM = 0, stubSize = 0, textFileOff = 0;
+    uint64_t baseVM = 0;   // v2.58.52: __TEXT vmaddr(sk2pro 串定位)
+    uint64_t constSecVM[8] = {0}; uint64_t constSecSize[8] = {0}; int nConstSec = 0;
     for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
         if (lc->cmd != LC_SEGMENT_64) continue;
         const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
+        if (!strcmp(sg->segname, "__TEXT")) baseVM = sg->vmaddr;
         const struct section_64 *sc = (const struct section_64 *)((const uint8_t *)sg + sizeof(struct segment_command_64));
         for (uint32_t s = 0; s < sg->nsects; s++, sc++) {
             if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__text")) { textVM = sc->addr; textSize = sc->size; textFileOff = sc->offset; }
             if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__stubs")) { stubVM = sc->addr; stubSize = sc->size; }
+            // v2.58.52: const 段收集(oslog fmt 槽在 __const/__constg_swiftt — sk2pro 用)
+            if (!strcmp(sc->segname, "__TEXT") && !strncmp(sc->sectname, "__const", 7) && nConstSec < 8) {
+                constSecVM[nConstSec] = sc->addr; constSecSize[nConstSec] = sc->size; nConstSec++;
+            }
         }
     }
     if (!textSize || !stubSize) F8V2_BAIL("lc-parse");
@@ -421,6 +428,94 @@ static NSDictionary *mfReconF8v2Scan(void) {
         mfLog(@"[f8v2] SK2 流消费点=%d → 判别点=%lu 个", nSk2StreamCall, (unsigned long)sk2pts.count);
         for (NSDictionary *sp in sk2pts)
             mfLog(@"[f8v2] ★sk2ver @%#llx (判别→恒verified)", (unsigned long long)[sp[@"vmaddr"] unsignedLongLongValue]);
+    }
+
+    // =====================================================================
+    // sk2pro (v2.58.52): isPro 写入点 — mf_debug_54 定谳: 空流时判别点循环体
+    //   不执行, 恒 verified NOP 全部空转; 真 gate = 流后汇总的 _isPro 写入。
+    //   定位链(侦查读内存, patch 改磁盘字节 — 与 F8v2/F10 同体系, 零 hook):
+    //   "Pro state changed" oslog 串 → 运行时解析 __const fmt 槽(值==串abs)
+    //   → 磁盘扫 adrp+add 引用槽的 os_log 调用点 → 回溯 strb 写入 + 其前
+    //   movz wN,#0 定值 → 点位=movz, patch=movz wN,#1。
+    // =====================================================================
+    {
+        static const char kProTag[] = "Pro state changed";
+        const uint8_t *strHit = NULL;
+        for (uint64_t i = 0; i + sizeof(kProTag) <= binLen; i++)
+            if (!memcmp(bd + i, kProTag, sizeof(kProTag) - 1)) { strHit = bd + i; break; }
+        if (strHit) {
+            uint64_t strVM = baseVM + (uint64_t)(strHit - bd);
+            const char *rs = (const char *)((uintptr_t)strVM + (uintptr_t)slide);
+            if (!strncmp(rs, kProTag, sizeof(kProTag) - 1)) {
+                uint64_t strAbs = (uintptr_t)rs;
+                enum { kProMaxSlot = 16 };
+                uint64_t slots[kProMaxSlot]; int nSlot2 = 0;
+                for (int s2 = 0; s2 < nConstSec && nSlot2 < kProMaxSlot; s2++) {
+                    uint64_t sv = constSecVM[s2];
+                    for (uint64_t o = 0; o + 8 <= constSecSize[s2]; o += 8) {
+                        uint64_t v = *(const uint64_t *)((uintptr_t)sv + (uintptr_t)slide + o);
+                        if (v == strAbs) slots[nSlot2++] = sv + o;
+                    }
+                }
+                mfLog(@"[f8v2] sk2pro: Pro串 abs=%#llx fmt槽=%d 个", strAbs, nSlot2);
+                for (int s2 = 0; s2 < nSlot2; s2++) {
+                    uint64_t slot = slots[s2];
+                    for (uint64_t off = 0; off + 8 <= textSize; off += 4) {
+                        uint32_t i1 = *(const uint32_t *)(bd + textFileOff + off);
+                        uint32_t i2 = *(const uint32_t *)(bd + textFileOff + off + 4);
+                        if ((i1 & 0x9F000000) != 0x90000000) continue;      // adrp
+                        if ((i2 & 0xFFC00000) != 0x91000000) continue;      // add Xd,Xn,#imm12
+                        int64_t imm = (int64_t)((((i1 >> 5) & 0x7FFFF) << 2) | ((i1 >> 29) & 3));
+                        if (imm & (1 << 20)) imm -= (int64_t)(1 << 21);
+                        uint64_t page = ((textVM + off) & ~0xFFFULL) + ((uint64_t)imm << 12);
+                        uint32_t rd = (i2 >> 5) & 0x1F, rn = i2 & 0x1F;
+                        if (rd != rn) continue;
+                        if (page + (uint32_t)((i2 >> 10) & 0xFFF) != slot) continue;
+                        uint64_t ref = textVM + off;   // os_log 调用点(adrp)
+                        // 回溯 0x40 找 strb Wt,[Xn,#imm12] + 前 ≤4 条 movz wRt,#0 / orr wRt,wzr,wzr
+                        for (int64_t back = 4; back <= 0x40; back += 4) {
+                            if (off < (uint64_t)back) break;
+                            uint32_t w = *(const uint32_t *)(bd + textFileOff + off - back);
+                            if ((w & 0xFFC00000) != 0x39000000) continue;
+                            uint32_t rt = w & 0x1F;
+                            uint64_t movAddr = 0; uint32_t movOld = 0;
+                            for (int64_t b2 = back + 4; b2 <= back + 16; b2 += 4) {
+                                if (off < (uint64_t)b2) break;
+                                uint32_t m = *(const uint32_t *)(bd + textFileOff + off - b2);
+                                if (m == (0x52800000u | rt) || m == (0x2A1F03E0u | rt)) {
+                                    movAddr = textVM + off - b2; movOld = m; break;
+                                }
+                            }
+                            if (!movAddr) continue;
+                            uint32_t movNew = 0x52800020u | rt;   // movz wRt,#1
+                            // 去重
+                            BOOL dup = NO;
+                            for (NSDictionary *sp in sk2pts)
+                                if ([sp[@"vmaddr"] unsignedLongLongValue] == movAddr) { dup = YES; break; }
+                            if (dup) continue;
+                            [sk2pts addObject:@{
+                                @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                                @"sym": [NSString stringWithFormat:@"sk2pro@%#llx", (unsigned long long)(movAddr - textVM)],
+                                @"vmaddr": @(movAddr),
+                                @"slide": @((long)slide),
+                                @"score": @(96),
+                                @"calls": @(0),
+                                @"shape": @"sk2pro",
+                                @"kind": @"sk2pro",
+                                @"old": [NSString stringWithFormat:@"%08x", movOld],
+                                @"new": [NSString stringWithFormat:@"%08x", movNew],
+                            }];
+                            mfLog(@"[f8v2] ★sk2pro @%#llx (isPro 定值0→1, oslog@%#llx)", (unsigned long long)movAddr, (unsigned long long)ref);
+                            break;
+                        }
+                    }
+                }
+                NSUInteger nPro = 0;
+                for (NSDictionary *sp in sk2pts) if ([sp[@"shape"] isEqualToString:@"sk2pro"]) nPro++;
+                if (!nPro) mfLog(@"[f8v2] sk2pro: 槽已定位但 mov#0+strb 形态未命中 — 下轮人工定 isPro 写入点");
+                else mfLog(@"[f8v2] sk2pro: isPro 写入点=%lu 个", (unsigned long)nPro);
+            }
+        }
     }
 
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";

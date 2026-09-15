@@ -572,12 +572,18 @@ void apEntDumpsApply(void) {
             newBytes = [NSData dataWithBytes:&movx length:4];
         } else if ([d[@"sym"] hasPrefix:@"sk2ver@"]) {
             // v2.58.50: SK2 判别点 — 分支指令改 NOP → 恒走 verified 落空路径
-            //   点位即分支指令本身(侦查卡扫描时已存 old/new 字节)
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"1f2003d5");   // nop
+        } else if ([d[@"sym"] hasPrefix:@"sk2pro@"]) {
+            // v2.58.52: SK2 isPro 写入点 — movz wN,#0 → movz wN,#1(恒解锁)
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"20008052");
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
-        if (apSwiftTextPatchDump(d, nil, newBytes, &err)) {
+        // v2.58.52: 点位带 old 字段时校验原字节(指令漂移自检, sk2pro/sk2ver 专用)
+        NSData *oldBytes = ([d[@"old"] isKindOfClass:[NSString class]] && [d[@"old"] length]) ? apHexToBytes(d[@"old"]) : nil;
+        if (apSwiftTextPatchDump(d, oldBytes, newBytes, &err)) {
             g_apHits++;
             apLog(@"[entdump] ✓ %@ 持久化 patch 重打", [d[@"sym"] lastPathComponent]);
         } else apLog(@"[entdump] ✗ %@: %@", d[@"sym"], err);
@@ -798,6 +804,7 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 // v2.58: 判定点操作方法在独立 category(列表类需文件作用域)
 @interface MFPanelCtrl (AppPatchEnt)
 - (void)mfAPShowEntDumps;
+- (void)mfAPShowSk2List;   // v2.58.52: SK2 判别点过滤列表(与 F8v2 点位分家)
 - (void)mfAPEntPatchNow:(NSString *)sym;
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
 - (void)mfAPKeychainStub;
@@ -969,6 +976,13 @@ static MFAPEntList *g_apEntList = nil;
     UIView *page = mfMakePage(@"🎯 判定点", YES);
     g_apEntList = [[MFAPEntList alloc] init];
     NSArray *rawItems = mfAppPatchEntDumps();
+    // v2.58.52: 支持 shape 过滤(通过 associatedObject 传入) — SK2 卡片只列 sk2ver,
+    //   不再与 F8v2 fixups 点混排(用户: "判定点串行了? 两个卡片都是 17 个")
+    NSString *shapeFilter = objc_getAssociatedObject(self, "mfAPShapeFilter");
+    if (shapeFilter.length) {
+        rawItems = [rawItems filteredArrayUsingPredicate:
+            [NSPredicate predicateWithFormat:@"shape == %@", shapeFilter]];
+    }
     // v2.58.27: 按 score 降序显示 — 旧序=插入序(F8v2 旧候选堆在前), mf_debug_26 实锤
     // 8 个 ivarBoolGetter(score=94, 真判定层)排在第 13+ 位被埋, 用户惯性⚡旧 12 个全空转
     NSArray *sorted = [rawItems sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
@@ -985,6 +999,12 @@ static MFAPEntList *g_apEntList = nil;
     tv.separatorStyle = UITableViewCellSeparatorStyleNone;
     [page addSubview:tv];
     mfPushPage(page);
+}
+// v2.58.52: SK2 判别点专属列表 — 与 F8v2 点位分家(用户: "判定点串行了")
+- (void)mfAPShowSk2List {
+    objc_setAssociatedObject(self, "mfAPShapeFilter", @"sk2ver", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    [self mfAPShowEntDumps];
+    objc_setAssociatedObject(self, "mfAPShapeFilter", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 - (void)mfAPEntPatchNow:(NSString *)sym {
     // 立即单点 patch: 从 entDumps 找该 sym 打 mov w0,#1; ret
@@ -1021,10 +1041,17 @@ static MFAPEntList *g_apEntList = nil;
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"1f2003d5");
+        } else if ([sym hasPrefix:@"sk2pro@"]) {
+            // v2.58.52: SK2 isPro 写入点 — movz wN,#0 → movz wN,#1(恒解锁)
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"20008052");   // movz w0,#1 兜底
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }
-        if (apSwiftTextPatchDump(d, nil, newBytes, &err)) {
+        // v2.58.52: 点位带 old 字段时校验原字节(指令漂移自检)
+        NSData *oldBytes = ([d[@"old"] isKindOfClass:[NSString class]] && [d[@"old"] length]) ? apHexToBytes(d[@"old"]) : nil;
+        if (apSwiftTextPatchDump(d, oldBytes, newBytes, &err)) {
             g_apHits++;
             // v2.58.31: ⚡即持久化 — 与 F9 卡片交互对齐(用户定谳: "patch 了还要再点
             // 一次持久化, 重启就丢" 的双开关设计不要)。⚡成功自动 on, 冷启动重打。
@@ -1105,9 +1132,12 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
         st.numberOfLines = 2;
         st.minimumScaleFactor = 0.7;
+        // v2.58.52: 计数排除 sk2ver(已独立成 🛰 卡片) — 不再与 SK2 点混计
+        NSUInteger nSk2x = [[mfAppPatchEntDumps() filteredArrayUsingPredicate:
+            [NSPredicate predicateWithFormat:@"shape == 'sk2ver'"]] count];
         st.text = [NSString stringWithFormat:@"侦查点位→左划[⚡patch][💾持久化] · 已存 %ld 点(%ld 持久)",
-                   mfAppPatchEntDumpCount(), (long)[[mfAppPatchEntDumps() filteredArrayUsingPredicate:
-                        [NSPredicate predicateWithFormat:@"on == YES"]] count]];
+                   (long)(mfAppPatchEntDumpCount() - nSk2x), (long)[[mfAppPatchEntDumps() filteredArrayUsingPredicate:
+                        [NSPredicate predicateWithFormat:@"on == YES AND shape != 'sk2ver'"]] count]];
         st.font = [UIFont systemFontOfSize:10.5];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
@@ -1119,6 +1149,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     // v2.58.50: SK2 事务流伪造入口 — mf_debug_52(HostLog)定谳的新引擎类型:
     //   SK2 事务流验证型 = VerificationResult 判别在 async continuation 簇里,
     //   旧三路(F9 直写/F8 getter/读侧守卫)全证伪。判别点⚡ = 分支改 NOP 恒 verified。
+    // v2.58.52: 卡片只统计 sk2ver 点(不再与 F8v2 混计), 进过滤列表
     {
         NSUInteger nSk2 = [[mfAppPatchEntDumps() filteredArrayUsingPredicate:
             [NSPredicate predicateWithFormat:@"shape == 'sk2ver'"]] count];
@@ -1134,11 +1165,11 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
             UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
             st.numberOfLines = 2;
             st.minimumScaleFactor = 0.7;
-            st.text = [NSString stringWithFormat:@"判别点 %lu 个 → 左划⚡恒 verified · UserDefaults 直写对此型无效", (unsigned long)nSk2];
+            st.text = [NSString stringWithFormat:@"SK2 判别点 %lu 个 → 左划⚡恒 verified · UserDefaults 直写对此型无效", (unsigned long)nSk2];
             st.font = [UIFont systemFontOfSize:10.5];
             st.textColor = [UIColor whiteColor];
             [bar addSubview:st];
-            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:g_mfCtrl action:@selector(mfAPShowEntDumps)];
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:g_mfCtrl action:@selector(mfAPShowSk2List)];
             [bar addGestureRecognizer:tap];
             [page addSubview:bar];
             y += 56;
