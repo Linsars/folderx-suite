@@ -874,7 +874,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     if ((q & 0x7FC00000) != 0x29800000 || ((q >> 5) & 0x1F) != 31) continue;
                                     for (int d3 = 4; d3 <= 32; d3 += 4) {
                                         uint32_t q2 = *(const uint32_t *)(qa + d3);
-                                        if ((q2 & 0xFFC003FF) == 0x910003FD) { h = qa; break; }
+                                        if ((q2 & 0xFFC003FF) == 0x910003FD) { h = textVM + off - back; break; }   // v2.58.42: 无 slide 口径(与 F8v3 fnHeads 同)
                                     }
                                     if (h) break;
                                 }
@@ -918,7 +918,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                         if ((q & 0x7FC00000) != 0x29800000 || ((q >> 5) & 0x1F) != 31) continue;
                                         for (int d3 = 4; d3 <= 32; d3 += 4) {
                                             uint32_t q2 = *(const uint32_t *)(qa + d3);
-                                            if ((q2 & 0xFFC003FF) == 0x910003FD) { h = qa; break; }   // add x29,sp,#imm
+                                            if ((q2 & 0xFFC003FF) == 0x910003FD) { h = textVM + off - back; break; }   // v2.58.42: 无 slide 口径
                                         }
                                         if (h) break;
                                     }
@@ -939,7 +939,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     BOOL isHost = NO;
                                     for (int k = 0; k < nDsPts; k++) if (dsHost[k] == tgt) { isHost = YES; break; }
                                     if (!isHost) continue;
-                                    // caller 函数头(紧判据)
+                                    // caller 函数头(紧判据, 无 slide 口径)
                                     uint64_t cf = 0;
                                     for (int64_t back = 0; back < 0x10000 && off >= (uint64_t)back + 12; back += 4) {
                                         uintptr_t qa = (uintptr_t)textVM + (uintptr_t)slide + off - back;
@@ -947,7 +947,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                         if ((q & 0x7FC00000) != 0x29800000 || ((q >> 5) & 0x1F) != 31) continue;
                                         for (int d3 = 4; d3 <= 32; d3 += 4) {
                                             uint32_t q2 = *(const uint32_t *)(qa + d3);
-                                            if ((q2 & 0xFFC003FF) == 0x910003FD) { cf = qa; break; }
+                                            if ((q2 & 0xFFC003FF) == 0x910003FD) { cf = textVM + off - back; break; }
                                         }
                                         if (cf) break;
                                     }
@@ -959,16 +959,16 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                         for (int k = 0; k < nDsSemFn; k++) if (dsSemFn[k] == cf2) { sem = YES; break; }
                                         if (sem) break;
                                         if (cf - cf2 > 0x8000) break;   // 总跨度上限
-                                        // 向外层函数头回溯(紧判据, 从 cf2 向下找最近函数头)
+                                        // 向外层函数头回溯(紧判据, 无 slide 口径, 从 cf2 向下找最近函数头)
                                         uint64_t outer = 0;
                                         for (int64_t back = 4; back < 0x8000; back += 4) {
-                                            if (cf2 < (uint64_t)back + 12) break;
-                                            uintptr_t qa = (uintptr_t)textVM + (uintptr_t)slide + cf2 - back;
+                                            if (cf2 - textVM < (uint64_t)back + 12) break;
+                                            uintptr_t qa = (uintptr_t)textVM + (uintptr_t)slide + (cf2 - textVM) - back;
                                             uint32_t q = *(const uint32_t *)qa;
                                             if ((q & 0x7FC00000) != 0x29800000 || ((q >> 5) & 0x1F) != 31) continue;
                                             for (int d3 = 4; d3 <= 32; d3 += 4) {
                                                 uint32_t q2 = *(const uint32_t *)(qa + d3);
-                                                if ((q2 & 0xFFC003FF) == 0x910003FD) { outer = qa; break; }
+                                                if ((q2 & 0xFFC003FF) == 0x910003FD) { outer = cf2 - back; break; }
                                             }
                                             if (outer) break;
                                         }
