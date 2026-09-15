@@ -561,6 +561,11 @@ void apEntDumpsApply(void) {
             if (dot.location != NSNotFound) rt = (unsigned)[[d[@"sym"] substringFromIndex:dot.location + 1] intValue];
             uint32_t movz = 0x52800020u | rt;
             newBytes = [NSData dataWithBytes:&movz length:4];
+        } else if ([d[@"sym"] hasPrefix:@"deepslot@"]) {
+            // v2.58.40: F10 深槽装载点 — ldur x9,[x29,#-imm] → mov x9,#1(0xd2800029)
+            //   与 Reflix 2.46.0 INLINE-PATCH 同款语义(字段恒 licensed), 64 位 MOVZ
+            uint32_t movx9 = 0xd2800029u;
+            newBytes = [NSData dataWithBytes:&movx9 length:4];
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         if (apSwiftTextPatchDump(d, nil, newBytes, &err)) {
             g_apHits++;
@@ -992,6 +997,10 @@ static MFAPEntList *g_apEntList = nil;
             if (dot.location != NSNotFound) rt = (unsigned)[[sym substringFromIndex:dot.location + 1] intValue];
             uint32_t movz = 0x52800020u | rt;   // (imm16=1)<<5 | Rd
             newBytes = [NSData dataWithBytes:&movz length:4];
+        } else if ([sym hasPrefix:@"deepslot@"]) {
+            // v2.58.40: F10 深槽装载点 — ldur x9,[x29,#-imm] → mov x9,#1
+            uint32_t movx9 = 0xd2800029u;      // MOVZ x9,#1 (64 位, licensed 字段恒真)
+            newBytes = [NSData dataWithBytes:&movx9 length:4];
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }

@@ -807,6 +807,185 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             mfLog(@"[f8v3] ivar Bool getter=%d 个", nGetter);
                         }
                     }
+                    // ============================================================
+                    // v2.58.40: F10 深槽字段装载链(静态可行已三样本实证 — gooby 真目标
+                    // 0x14211bc 回归命中, Blink×3 构建逐点恒差-8 对齐, 61→3 收敛零噪声)。
+                    // 算法(deepslot_fast.py 同款):
+                    //   L1 深槽ldur→str[reg]: LDUR Xt,[x29,#-imm9] imm9∈[0xC0,0x180)
+                    //       (w>>22)==0x3E1 && Rn==x29 && opc==0, imm9 在 bits20-12(勿用低9位!)
+                    //       + 后4条内 STR Xt,[Xn,Xm] reg-offset ((w>>22)==0x3E0)
+                    //   L2 宿主函数的 bl caller ∈ 语义函数 + 闭包归并(caller 段无词表串
+                    //       时 0x8000 内向外层函数头回溯 — Swift async 闭包 outline 假头,
+                    //       gooby 0x11d4af4→0x11d2980 实锤)
+                    //   L3 caller bl 前 0x30 内 LDRSW ((w>>22)==0x2E6) 反射 witness 装载
+                    // 语义串词表(RC 型): 与 F8v3 共用 cstring 扫, 深槽专属词表补
+                    //   customerinfo/receipt/verific/licens(F8v3 词表无这四个)
+                    // 与 F8 互补: F8=fan≥2 多路 accessor(Bool getter 判型);
+                    //   深槽链=单 fan 语义下游字段装载(RC 序列化判型)。
+                    // ============================================================
+                    {
+                        // ① 深槽词表串地址表(cstring 区一次线性扫, 与上面 semStrVM 分开)
+                        static const char *kDSWords[] = { "entitle", "subscri", "licens", "customerinfo", "receipt", "verific" };
+                        #define F10_MAXSTR 256
+                        static uint64_t dsStrVM[F10_MAXSTR]; int nDsStr = 0;
+                        const uint8_t *cb2 = (const uint8_t *)((uintptr_t)cstrVM + (uintptr_t)slide);
+                        uint64_t c2 = 0;
+                        while (c2 < cstrSize && nDsStr < F10_MAXSTR) {
+                            const char *s = (const char *)(cb2 + c2);
+                            size_t sl = strnlen(s, (size_t)(cstrSize - c2));
+                            if (sl >= 6 && sl < 96) {
+                                char low3[96]; unsigned li3 = 0;
+                                for (; li3 < sl && li3 < 95; li3++) { char ch = s[li3]; low3[li3] = (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch; }
+                                low3[li3] = 0;
+                                for (int w = 0; w < 6; w++)
+                                    if (strstr(low3, kDSWords[w])) { dsStrVM[nDsStr++] = cstrVM + c2; break; }
+                            }
+                            c2 += sl + 1;
+                        }
+                        if (nDsStr >= 2) {
+                            mfLog(@"[f10] 深槽语义串=%d", nDsStr);
+                            // ② 深槽语义函数集(adrp+add 目标命中 → 函数头归属, 与 F8v3 同法但独立集)
+                            #define F10_MAXFN 2048
+                            static uint64_t dsSemFn[F10_MAXFN]; int nDsSemFn = 0;
+                            for (uint64_t off = 0; off + 16 <= textSize && nDsSemFn < F10_MAXFN; off += 4) {
+                                uintptr_t a = (uintptr_t)textVM + (uintptr_t)slide + off;
+                                uint32_t ins1 = *(const uint32_t *)a;
+                                if ((ins1 & 0x9F000000) != 0x90000000) continue;
+                                int64_t imm = (int64_t)((((ins1 >> 5) & 0x7FFFF) << 2) | ((ins1 >> 29) & 3));
+                                if (imm & (1 << 20)) imm -= (int64_t)(1 << 21);
+                                uint64_t page = (textVM + off) & ~0xFFFULL;
+                                if (imm >= 0) page += (uint64_t)imm << 12; else page -= (uint64_t)(-imm) << 12;
+                                uint64_t tgt = 0; BOOL found = NO;
+                                for (int d2 = 4; d2 <= 12 && !found; d2 += 4) {
+                                    uint32_t ins2 = *(const uint32_t *)(a + d2);
+                                    if ((ins2 & 0xFFC00000) == 0x91000000) {
+                                        uint64_t add = ((ins2 >> 10) & 0xFFF) << ((ins2 >> 22) & 3);
+                                        tgt = page + add; found = YES;
+                                    }
+                                }
+                                if (!found) continue;
+                                BOOL hit = NO;
+                                for (int k = 0; k < nDsStr && !hit; k++) if (dsStrVM[k] == tgt) hit = YES;
+                                if (!hit) continue;
+                                uint64_t h = 0;
+                                for (int64_t back = 0; back < 0x10000 && off >= (uint64_t)back + 4; back += 4) {
+                                    uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back);
+                                    if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
+                                        ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
+                                        (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back + 4) == 0xD65F03C0))
+                                        { h = textVM + off - back; break; }
+                                }
+                                if (!h) continue;
+                                BOOL dup = NO;
+                                for (int k = 0; k < nDsSemFn; k++) if (dsSemFn[k] == h) { dup = YES; break; }
+                                if (!dup) dsSemFn[nDsSemFn++] = h;
+                            }
+                            mfLog(@"[f10] 深槽语义函数=%d", nDsSemFn);
+                            if (nDsSemFn >= 1) {
+                                // ③ L1 深槽点收集(LDUR 深槽 + 后4条内 STR reg-offset 同寄存器)
+                                //    + 宿主函数归属(bsearch fnHeads — F8v3 已收集, 有序)
+                                #define F10_MAXPT 512
+                                static uint64_t dsPts[F10_MAXPT]; int nDsPts = 0;
+                                static uint64_t dsHost[F10_MAXPT];   // 每点的宿主函数头
+                                for (uint64_t off = 0; off + 20 <= textSize && nDsPts < F10_MAXPT; off += 4) {
+                                    uintptr_t a = (uintptr_t)textVM + (uintptr_t)slide + off;
+                                    uint32_t w1 = *(const uint32_t *)a;
+                                    if ((w1 >> 22) != 0x3E1) continue;              // LDUR 64
+                                    if (((w1 >> 5) & 0x1F) != 29) continue;            // x29
+                                    if (((w1 >> 10) & 3) != 0) continue;               // opc=00
+                                    uint32_t imm9 = (w1 >> 12) & 0x1FF;                // bits20-12!
+                                    if (imm9 < 0xC0 || imm9 >= 0x180) continue;       // 深槽窗口
+                                    uint32_t xt = w1 & 0x1F;
+                                    BOOL store = NO;
+                                    for (int j = 1; j <= 4 && !store; j++) {
+                                        uint32_t w2 = *(const uint32_t *)(a + j * 4);
+                                        if ((w2 >> 22) == 0x3E0 && (w2 & 0x1F) == xt) store = YES;
+                                    }
+                                    if (!store) continue;
+                                    // 宿主函数头(线性回溯, 与 F8v3 同判)
+                                    uint64_t h = 0;
+                                    for (int64_t back = 0; back < 0x8000 && off >= (uint64_t)back + 4; back += 4) {
+                                        uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back);
+                                        if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
+                                            ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
+                                            (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back + 4) == 0xD65F03C0))
+                                            { h = textVM + off - back; break; }
+                                    }
+                                    if (h) { dsPts[nDsPts] = textVM + off; dsHost[nDsPts] = h; nDsPts++; }
+                                }
+                                mfLog(@"[f10] L1 深槽点=%d", nDsPts);
+                                // ④ L2: 宿主函数的 bl caller ∈ 深槽语义函数(含闭包归并 0x8000)
+                                //    ⑤ L3: caller bl 前 0x30 内 LDRSW → 终命中
+                                // bl 全图扫一次: 只记 (目标=宿主, caller) 对
+                                int nDS10 = 0;
+                                for (uint64_t off = 0; off + 4 <= textSize && nDS10 < 32; off += 4) {
+                                    uintptr_t a = (uintptr_t)textVM + (uintptr_t)slide + off;
+                                    uint32_t wb = *(const uint32_t *)a;
+                                    if ((wb & 0xFC000000) != 0x94000000) continue;    // bl
+                                    int64_t imm26 = (int64_t)(wb & 0x3FFFFFF);
+                                    if (imm26 & (1 << 25)) imm26 -= (1 << 26);
+                                    uint64_t tgt = textVM + off + ((uint64_t)imm26 << 2);
+                                    BOOL isHost = NO;
+                                    for (int k = 0; k < nDsPts; k++) if (dsHost[k] == tgt) { isHost = YES; break; }
+                                    if (!isHost) continue;
+                                    // caller 函数头
+                                    uint64_t cf = 0;
+                                    for (int64_t back = 0; back < 0x10000 && off >= (uint64_t)back + 4; back += 4) {
+                                        uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back);
+                                        if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
+                                            ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
+                                            (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back + 4) == 0xD65F03C0))
+                                            { cf = textVM + off - back; break; }
+                                    }
+                                    if (!cf) continue;
+                                    // 语义判定 + 闭包归并(0x8000 内向外层回溯)
+                                    BOOL sem = NO;
+                                    uint64_t cf2 = cf;
+                                    for (int depth = 0; depth < 8 && !sem; depth++) {
+                                        for (int k = 0; k < nDsSemFn; k++) if (dsSemFn[k] == cf2) { sem = YES; break; }
+                                        if (sem) break;
+                                        // 向外层函数头回溯(从 cf2 向下找最近函数头)
+                                        uint64_t outer = 0;
+                                        for (int64_t back = 4; back < 0x8000; back += 4) {
+                                            if (cf2 < (uint64_t)back + 4) break;
+                                            uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + cf2 - back);
+                                            if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
+                                                ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
+                                                (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + cf2 - back + 4) == 0xD65F03C0))
+                                                { outer = cf2 - back; break; }
+                                        }
+                                        if (!outer || cf2 - outer > 0x8000) break;
+                                        cf2 = outer;
+                                    }
+                                    if (!sem) continue;
+                                    // L3: bl 前 0x30 内 LDRSW ((w>>22)==0x2E6)
+                                    BOOL ldrsw = NO;
+                                    for (int64_t k = 4; k <= 0x30 && !ldrsw; k += 4) {
+                                        if (off < (uint64_t)k) break;
+                                        uint32_t w3 = *(const uint32_t *)(a - k);
+                                        if ((w3 >> 22) == 0x2E6) ldrsw = YES;
+                                    }
+                                    if (!ldrsw) continue;
+                                    // 命中: 宿主函数里挑该函数的深槽点(第一个)入库
+                                    uint64_t pt = 0;
+                                    for (int k = 0; k < nDsPts; k++) if (dsHost[k] == tgt) { pt = dsPts[k]; break; }
+                                    if (!pt) continue;
+                                    nDS10++;
+                                    mfLog(@"[f10] ★深槽装载点 @%#llx (host=%#llx caller=%#llx)", (unsigned long long)pt, (unsigned long long)tgt, (unsigned long long)cf);
+                                    [out addObject:@{
+                                        @"img": imgName,
+                                        @"sym": [NSString stringWithFormat:@"deepslot@%llx", (unsigned long long)(pt - textVM)],
+                                        @"vmaddr": @(pt),
+                                        @"slide": @((long)slide),
+                                        @"score": @(92),
+                                        @"calls": @(0),
+                                        @"shape": @"deepslot",
+                                    }];
+                                }
+                                mfLog(@"[f10] 深槽装载点=%d 个", nDS10);
+                            }
+                        }
+                    }
                     // v2.58.23: score 排序 + top12 截断 — mf_debug_23 定谳 205 个全量
                     // 入 entDumps 是噪声倾倒(真 oracle 1~3 个)。排序: score↓ → fan↓
                     // (f8v2 的 out 在此 return 前已 top12, 这里只截 f8v3 追加段)
@@ -1171,7 +1350,24 @@ NSDictionary *mfReconFingerprint(void) {
             NSDictionary *f8v2 = mfReconF8v2Scan();
             NSArray *cands = f8v2[@"cands"];
             if (cloudBrands.count) {
-                [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: 已抑制(%lu 个 F8v2 候选 — 云验证型判定在云端回包, patch 本地函数高危且无效, 主路线=subinject mock)", (unsigned long)([cands isKindOfClass:[NSArray class]] ? cands.count : 0)]];
+                // v2.58.40: F10 点位也要 merge 入库(云验证型专属判定点 — 深槽装载链)
+                NSUInteger nDeep = 0;
+                if ([cands isKindOfClass:[NSArray class]]) {
+                    NSMutableArray *deepOnly = [NSMutableArray array];
+                    for (NSDictionary *c in cands) if ([c[@"shape"] isEqualToString:@"deepslot"]) { [deepOnly addObject:c]; nDeep++; }
+                    if (deepOnly.count) {
+                        extern void mfAppPatchEntDumpsMerge(NSArray *);
+                        mfAppPatchEntDumpsMerge(deepOnly);
+                        [entFuncs addObjectsFromArray:deepOnly];
+                    }
+                }
+                if (nDeep) {
+                    [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个 F10 深槽装载点已入库 — 见实验模拟页 ⚡", (unsigned long)nDeep]];
+                    [lines addObject:@"解锁路线: 云端 mock(订阅注入开关) + ⚡深槽装载点 双因子 — F8v2 swifttext 点位对云验证型高危, 已抑制不入库"];
+                } else {
+                    [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: F10 未命中(无深槽装载链) — F8v2 swifttext %lu 候选对云验证型高危, 均不入库", (unsigned long)([cands isKindOfClass:[NSArray class]] ? cands.count : 0)]];
+                    [lines addObject:@"解锁路线: 云端 mock(订阅注入开关)单因子 — 深槽链不在本 app 判型内"];
+                }
             } else if ([cands isKindOfClass:[NSArray class]] && cands.count) {
                 extern void mfAppPatchEntDumpsMerge(NSArray *);
                 mfAppPatchEntDumpsMerge(cands);
@@ -1217,8 +1413,8 @@ NSDictionary *mfReconFingerprint(void) {
         if (srvHits >= 2 && !cloud && !mach && skLocal) serverSide = YES;
     }
     NSString *verdict;
-    if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, 先 mock 直试", cloudBrands.allObjects.firstObject];
-    else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 可直达", cloudBrands.allObjects.firstObject];
+    if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
+    else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
     else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, Reflix/ScriptingPass 同族) — EXCPROBE 应答器可复刻";
     else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
     else if (stateType)     verdict = @"状态型(UserDefaults 实存语义key) — 🧪实验模拟→F9 状态解锁 直写";

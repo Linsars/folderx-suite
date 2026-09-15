@@ -1550,9 +1550,10 @@ void mfShowLabPage(void) {
     [page addSubview:grp];
 
     // v2.50.0: 开关命名对齐侦查卡四态(绿卡云验证 / 蓝卡队列信任 / 蓝卡收据验证)
-    mfSubSwitchRow(page, 124, @"云验证 mock（RevenueCat 系）", mfSubInjectIsOn(),
+    // v2.58.40: 文案修正 — mock 是双因子之一(数据侧), 本地 licensed 字段走 F10 深槽点⚡
+    mfSubSwitchRow(page, 124, @"云验证 mock（回包数据·双因子其一）", mfSubInjectIsOn(),
         @selector(mfSubInjectSwitchChanged:),
-        [NSString stringWithFormat:@"对应侦查: 云验证 — RC/SW/Adapty 响应进程内伪造 · 命中 %ld", mfSubInjectHits()]);
+        [NSString stringWithFormat:@"对应侦查: 云验证 — RC/SW/Adapty 回包伪造 · 命中 %ld · 云验证型解锁=本开关+⚡F10深槽点(实验模拟页)", mfSubInjectHits()]);
     mfSubSwitchRow(page, 184, @"L0 队列伪造（队列信任型）", mfL0IsOn(),
         @selector(mfL0SwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 队列信任候选 — 点内购取消即翻转 · observers %ld", (long)mfL0ObserverCount()]);
