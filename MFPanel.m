@@ -1568,50 +1568,57 @@ static UIView *mfSubSwitchRow(UIView *page, CGFloat y, NSString *title,
 
 void mfShowLabPage(void) {
     UIView *page = mfMakePage(@"🧪 实验模拟", YES);
+    // v2.58.54: 实验页改滚动容器(用户: 引擎卡片越来越多, 固定布局必被截断) —
+    //   像产品 ID 列表那样滚动, 卡片动态堆叠永不互相覆盖
+    UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 42, g_mfCardW, g_mfCardH - 42)];
+    sv.showsVerticalScrollIndicator = YES;
 
     UIButton *scan = [UIButton buttonWithType:UIButtonTypeSystem];
-    scan.frame = CGRectMake(16, 46, g_mfCardW - 32, 40);
+    scan.frame = CGRectMake(16, 6, g_mfCardW - 32, 40);
     scan.backgroundColor = [UIColor systemGreenColor];
     scan.layer.cornerRadius = 9;
     [scan setTitle:@"🔍 去扫描购买（含侦查卡）" forState:UIControlStateNormal];
     [scan setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     scan.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
     [scan addTarget:g_mfCtrl action:@selector(mfShowScanPage) forControlEvents:UIControlEventTouchUpInside];
-    [page addSubview:scan];
+    [sv addSubview:scan];
 
     // —— 订阅模拟组(Reven 同款机制, 2026-09-02 逆向回流) ——
-    UILabel *grp = [[UILabel alloc] initWithFrame:CGRectMake(16, 94, g_mfCardW - 32, 20)];
+    UILabel *grp = [[UILabel alloc] initWithFrame:CGRectMake(16, 54, g_mfCardW - 32, 20)];
     grp.text = @"订阅模拟";
     grp.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
     grp.textColor = [UIColor secondaryLabelColor];
-    [page addSubview:grp];
+    [sv addSubview:grp];
 
     // v2.50.0: 开关命名对齐侦查卡四态(绿卡云验证 / 蓝卡队列信任 / 蓝卡收据验证)
     // v2.58.40: 文案修正 — mock 是双因子之一(数据侧), 本地 licensed 字段走 F10 深槽点⚡
-    mfSubSwitchRow(page, 124, @"云验证 mock（回包数据·双因子其一）", mfSubInjectIsOn(),
+    mfSubSwitchRow(sv, 84, @"云验证 mock（回包数据·双因子其一）", mfSubInjectIsOn(),
         @selector(mfSubInjectSwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 云验证 — RC/SW/Adapty 回包伪造 · 命中 %ld · 云验证型解锁=本开关+⚡F10深槽点(实验模拟页)", mfSubInjectHits()]);
-    mfSubSwitchRow(page, 184, @"L0 队列伪造（队列信任型）", mfL0IsOn(),
+    mfSubSwitchRow(sv, 144, @"L0 队列伪造（队列信任型）", mfL0IsOn(),
         @selector(mfL0SwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 队列信任候选 — 点内购取消即翻转 · observers %ld", (long)mfL0ObserverCount()]);
-    mfSubSwitchRow(page, 244, @"L1 收据伪造（收据验证型）", mfReceiptForgeIsOn(),
+    mfSubSwitchRow(sv, 204, @"L1 收据伪造（收据验证型）", mfReceiptForgeIsOn(),
         @selector(mfReceiptForgeSwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 收据验证型 — appStoreReceiptURL/transactionReceipt · 命中 %ld", mfReceiptForgeHits()]);
 
     // v2.56.3: 删除"mach 许可服务器应答器（demux 重绑）"开关 —— 三连失败已证伪
     //   (fishhook rebind 0×3, 样本 dlsym 动态解析 mach_msg_server; demux 是样本自身代码,
     //    且授权判定链 = keychain+cloudkit); mfMachRespHits 还误用了 g_excHitCount(虚报)。
-    
 
     // v2.56: patch 引擎(规则驱动: method swizzle / text vm_protect / keychain 授权豁免)
     //   ——学习自 ScriptingPass 判定链的落地容器。规则格式: mfAppPatchRules JSON
     //   [{"bid":"com.scripting.ios","ver":"","patches":[{"kind":"keychain"}]}]
-    CGFloat apY = 304;   // v2.57.1: L1 行(296 结束)+8 — 原mach应答器删除留下的 72px 死区收回
+    CGFloat apY = 264;   // v2.57.1: L1 行(256 结束)+8 — 原mach应答器删除留下的 72px 死区收回
     extern void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio);
-    mfAppPatchSectionInLabPage(page, &apY);
+    mfAppPatchSectionInLabPage(sv, &apY);
 
-    // v2.58.46: 自适应高度 — 实验页内容到 apY 为止, 不空占整屏
-    mfSetWantH(apY + 20);
+    // v2.58.54: 内容尾 = apY; 滚动区高度固定, 卡片全量可滚动
+    sv.contentSize = CGSizeMake(g_mfCardW, apY + 24);
+    [page addSubview:sv];
+
+    // 卡片高度不再按内容拉伸 — 滚动容器内固定可视高度
+    mfSetWantH(460);
     mfPushPage(page);
 }
 
