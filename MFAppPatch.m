@@ -976,12 +976,12 @@ static MFAPEntList *g_apEntList = nil;
     UIView *page = mfMakePage(@"🎯 判定点", YES);
     g_apEntList = [[MFAPEntList alloc] init];
     NSArray *rawItems = mfAppPatchEntDumps();
-    // v2.58.52: 支持 shape 过滤(通过 associatedObject 传入) — SK2 卡片只列 sk2ver,
+    // v2.58.52: 支持 shape 过滤(通过 associatedObject 传入) — SK2 卡片只列 sk2ver/sk2pro,
     //   不再与 F8v2 fixups 点混排(用户: "判定点串行了? 两个卡片都是 17 个")
     NSString *shapeFilter = objc_getAssociatedObject(self, "mfAPShapeFilter");
     if (shapeFilter.length) {
         rawItems = [rawItems filteredArrayUsingPredicate:
-            [NSPredicate predicateWithFormat:@"shape == %@", shapeFilter]];
+            [NSPredicate predicateWithFormat:@"shape IN %@", [shapeFilter componentsSeparatedByString:@"|"]]];
     }
     // v2.58.27: 按 score 降序显示 — 旧序=插入序(F8v2 旧候选堆在前), mf_debug_26 实锤
     // 8 个 ivarBoolGetter(score=94, 真判定层)排在第 13+ 位被埋, 用户惯性⚡旧 12 个全空转
@@ -1001,8 +1001,9 @@ static MFAPEntList *g_apEntList = nil;
     mfPushPage(page);
 }
 // v2.58.52: SK2 判别点专属列表 — 与 F8v2 点位分家(用户: "判定点串行了")
+// v2.58.54: 含 sk2pro(isPro 写入点) — 两类 SK2 点都在这张卡
 - (void)mfAPShowSk2List {
-    objc_setAssociatedObject(self, "mfAPShapeFilter", @"sk2ver", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(self, "mfAPShapeFilter", @"sk2ver|sk2pro", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [self mfAPShowEntDumps];
     objc_setAssociatedObject(self, "mfAPShapeFilter", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
@@ -1132,12 +1133,12 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
         st.numberOfLines = 2;
         st.minimumScaleFactor = 0.7;
-        // v2.58.52: 计数排除 sk2ver(已独立成 🛰 卡片) — 不再与 SK2 点混计
+        // v2.58.52/54: 计数排除 sk2ver/sk2pro(已独立成 🛰 卡片) — 不再混计
         NSUInteger nSk2x = [[mfAppPatchEntDumps() filteredArrayUsingPredicate:
-            [NSPredicate predicateWithFormat:@"shape == 'sk2ver'"]] count];
+            [NSPredicate predicateWithFormat:@"shape == 'sk2ver' OR shape == 'sk2pro'"]] count];
         st.text = [NSString stringWithFormat:@"侦查点位→左划[⚡patch][💾持久化] · 已存 %ld 点(%ld 持久)",
                    (long)(mfAppPatchEntDumpCount() - nSk2x), (long)[[mfAppPatchEntDumps() filteredArrayUsingPredicate:
-                        [NSPredicate predicateWithFormat:@"on == YES AND shape != 'sk2ver'"]] count]];
+                        [NSPredicate predicateWithFormat:@"on == YES AND shape != 'sk2ver' AND shape != 'sk2pro'"]] count]];
         st.font = [UIFont systemFontOfSize:10.5];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
@@ -1149,10 +1150,15 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     // v2.58.50: SK2 事务流伪造入口 — mf_debug_52(HostLog)定谳的新引擎类型:
     //   SK2 事务流验证型 = VerificationResult 判别在 async continuation 簇里,
     //   旧三路(F9 直写/F8 getter/读侧守卫)全证伪。判别点⚡ = 分支改 NOP 恒 verified。
-    // v2.58.52: 卡片只统计 sk2ver 点(不再与 F8v2 混计), 进过滤列表
+    // v2.58.52/54: 卡片统计 sk2ver + sk2pro 两类点(判别点+isPro写入点), 过滤列表分家
     {
-        NSUInteger nSk2 = [[mfAppPatchEntDumps() filteredArrayUsingPredicate:
+        NSArray *dumps = mfAppPatchEntDumps();
+        NSUInteger nSk2 = [[dumps filteredArrayUsingPredicate:
+            [NSPredicate predicateWithFormat:@"shape == 'sk2ver' OR shape == 'sk2pro'"]] count];
+        NSUInteger nSk2ver = [[dumps filteredArrayUsingPredicate:
             [NSPredicate predicateWithFormat:@"shape == 'sk2ver'"]] count];
+        NSUInteger nSk2pro = [[dumps filteredArrayUsingPredicate:
+            [NSPredicate predicateWithFormat:@"shape == 'sk2pro'"]] count];
         if (nSk2) {
             UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
             bar.backgroundColor = [UIColor systemIndigoColor];
@@ -1165,7 +1171,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
             UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
             st.numberOfLines = 2;
             st.minimumScaleFactor = 0.7;
-            st.text = [NSString stringWithFormat:@"SK2 判别点 %lu 个 → 左划⚡恒 verified · UserDefaults 直写对此型无效", (unsigned long)nSk2];
+            st.text = [NSString stringWithFormat:@"判别点 %lu · isPro写入点 %lu → 左划⚡ · UserDefaults 直写对此型无效", (unsigned long)nSk2ver, (unsigned long)nSk2pro];
             st.font = [UIFont systemFontOfSize:10.5];
             st.textColor = [UIColor whiteColor];
             [bar addSubview:st];

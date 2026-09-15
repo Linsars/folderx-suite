@@ -356,14 +356,31 @@ void mfStateReconCacheSet(NSArray *keys) {
 }
 NSArray *mfStateKeysForUI(void) {
     if (g_reconStateKeys.count) return g_reconStateKeys;
-    return mfStateProbeKeys();   // 兜底: 没跑侦查直接开 F9(不推荐, 侦查卡才是定性者)
+    return @[];   // v2.58.54: 缓存空 = 未跑侦查 — 页面触发统一采集器, 不再独立扫(用户定案回归)
 }
 
 void mfShowStatePage(void) {
     UIView *page = mfMakePage(@"🔓 状态解锁 F9", YES);
+    // v2.58.54: 缓存空 = 未跑侦查 → 现场触发统一采集器(mfReconFingerprint), 不再独立扫
+    extern NSDictionary *mfReconFingerprint(void);   // MFRecon.m 统一采集器
+    UILabel *hintWait = nil;
+    if (!g_reconStateKeys.count) {
+        hintWait = [[UILabel alloc] initWithFrame:CGRectMake(16, 46, g_mfCardW - 32, 30)];
+        hintWait.font = [UIFont systemFontOfSize:11];
+        hintWait.textColor = [UIColor secondaryLabelColor];
+        hintWait.text = @"侦查缓存为空 — 正在跑统一采集器(侦查=唯一采集器)…";
+        [page addSubview:hintWait];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            mfReconFingerprint();   // 统一采集器: 填 g_reconStateKeys + F8/F10 点位全链
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [hintWait removeFromSuperview];
+                mfShowStatePage();   // 重建页面(递归一次, 缓存已热)
+            });
+        });
+    }
     NSArray *keys = mfStateKeysForUI();
     mfLog(@"[f9] 侦查: %lu 个语义 key%@ (源: %@)", (unsigned long)keys.count, keys.count ? @"" : @"(无 — 该 app 非状态型判定)",
-        g_reconStateKeys.count ? @"侦查卡缓存" : @"F9 兜底独立扫(未跑侦查)");
+        g_reconStateKeys.count ? @"侦查卡缓存" : @"未跑侦查(等待统一采集器)");
     UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(16, 46, g_mfCardW - 32, 30)];
     hint.font = [UIFont systemFontOfSize:11];
     hint.textColor = [UIColor secondaryLabelColor];
