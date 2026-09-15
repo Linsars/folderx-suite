@@ -21,6 +21,74 @@ void mfStateBootReplay(void);
 BOOL mfStatePersistIsOn(void);
 void mfStateSetPersist(NSArray *keys, BOOL on);
 
+// 文件级前向声明(读侧守卫在文件头引用, 定义在下方)
+static NSString *statePrefsPath(void);
+static NSDictionary *stateStore(void);
+static NSString *stateWritesKey(void);
+static BOOL stateKeyIsDate(NSString *k);
+
+// v2.58.49: 读侧守卫 — SK2(JWS) 型 app 启动时用事务流重算覆写 UserDefaults,
+//   写侧直写被打回原形(mf_debug_51: 12 点位⚡+F9 直写全中, HostLog 仍不亮)。
+//   终局解法: 读侧拦截 — 对持久化守卫 key 恒返解锁值, app 写什么无所谓。
+static IMP g_orig_ud_objectForKey = NULL;
+static IMP g_orig_ud_boolForKey = NULL;
+static BOOL g_stateGuardOn = NO;
+
+static NSArray *stateGuardedKeys(void) {
+    id ks = stateStore()[stateWritesKey()];
+    return [ks isKindOfClass:[NSArray class]] ? ks : @[];
+}
+static BOOL stateGuardKeyReverse(NSString *k) {
+    static NSArray *inv = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        inv = @[@"missing", @"missed", @"lost", @"revok", @"block",
+                @"cancel", @"disabl", @"suspend", @"banned", @"expired"];
+    });
+    NSString *lk = k.lowercaseString;
+    for (NSString *w in inv) if ([lk containsString:w]) return YES;
+    return NO;
+}
+static id new_ud_objectForKey(id self, SEL _cmd, NSString *key) {
+    if (g_stateGuardOn && [key isKindOfClass:[NSString class]]) {
+        for (NSString *k in stateGuardedKeys()) {
+            if (![k isEqualToString:key]) continue;
+            if (stateGuardKeyReverse(k)) return nil;                  // 反向词: 不存在=解锁
+            return stateKeyIsDate(k) ? [NSDate distantFuture] : @YES; // Bool/Date 恒解锁值
+        }
+    }
+    return ((id(*)(id, SEL, id))g_orig_ud_objectForKey)(self, _cmd, key);
+}
+static BOOL new_ud_boolForKey(id self, SEL _cmd, NSString *key) {
+    if (g_stateGuardOn && [key isKindOfClass:[NSString class]]) {
+        for (NSString *k in stateGuardedKeys()) {
+            if (![k isEqualToString:key]) continue;
+            if (stateGuardKeyReverse(k)) return NO;
+            return YES;
+        }
+    }
+    return ((BOOL(*)(id, SEL, id))g_orig_ud_boolForKey)(self, _cmd, key);
+}
+void mfStateGuardInstall(void) {
+    if (g_stateGuardOn) return;
+    if (!stateGuardedKeys().count) return;   // 无持久化守卫列表, 不装
+    Class c = NSClassFromString(@"NSUserDefaults");
+    if (!c) return;
+    Method m1 = class_getInstanceMethod(c, @selector(objectForKey:));
+    Method m2 = class_getInstanceMethod(c, @selector(boolForKey:));
+    if (!m1 || !m2) return;
+    if (!g_orig_ud_objectForKey) {
+        g_orig_ud_objectForKey = method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)new_ud_objectForKey);
+    }
+    if (!g_orig_ud_boolForKey) {
+        g_orig_ud_boolForKey = method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)new_ud_boolForKey);
+    }
+    g_stateGuardOn = YES;
+    mfLog(@"[f9] 读侧守卫已装: %lu key — app 覆写无碍, 读取恒解锁值", (unsigned long)stateGuardedKeys().count);
+}
+
 // MFPanelCtrl 定义在 MFPanel.m — 最小前向声明让 category 可编译(MFAppPatch.m 同款)
 @interface MFPanelCtrl : NSObject @end
 // 声明段在前(UI 块的 [(id)g_mfCtrl mfStateZap:] 需要它), 实现段在本文件尾部
@@ -352,6 +420,7 @@ void mfStateSetPersist(NSArray *keys, BOOL on) {
         [d removeObjectForKey:stateWritesKey()];
     }
     stateStoreSet(d);
+    mfStateGuardInstall();   // v2.58.49: 持久化开关变化即时生效(不等冷启动)
 }
 void mfStateBootReplay(void) {
     NSArray *ks = stateStore()[stateWritesKey()];
@@ -373,6 +442,8 @@ void mfStateBootReplay(void) {
     long ok = 0;
     for (NSString *k in ks) if (mfStateUnlockApplyKey(k, YES)) ok++;
     mfLog(@"[f9] Boot 状态重打: ok=%ld/%lu", ok, (unsigned long)ks.count);
+    // v2.58.49: 重打之后装读侧守卫 — 写侧被 app 覆写时读侧仍是解锁值
+    mfStateGuardInstall();
 }
 BOOL mfStatePersistIsOn(void) {
     NSArray *ks = stateStore()[stateWritesKey()];
