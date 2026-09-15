@@ -535,7 +535,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     if ((i2 & 0xFFC00000) != 0x91000000) continue;      // add Xd,Xn,#imm12
                     int64_t imm = (int64_t)((((i1 >> 5) & 0x7FFFF) << 2) | ((i1 >> 29) & 3));
                     if (imm & (1 << 20)) imm -= (int64_t)(1 << 21);
-                    uint64_t page = ((textVM + off) & ~0xFFFULL) + ((uint64_t)imm << 12);
+                    // v2.58.55: 页基址必须含 slide — dyld 改写的是运行时立即数,
+                    //   目标页 = (运行时地址 & ~0xfff) + imm<<12。旧代码用无 slide 的
+                    //   textVM+off 当页基 → 解码出的目标永远比 strAbs 少一个 slide → 0 命中
+                    uint64_t page = (((uintptr_t)textVM + (uintptr_t)slide + off) & ~0xFFFULL) + ((uint64_t)imm << 12);
                     uint32_t rd = (i2 >> 5) & 0x1F, rn = i2 & 0x1F;
                     if (rd != rn) continue;
                     uint64_t tgt = page + (uint32_t)((i2 >> 10) & 0xFFF);
@@ -1749,6 +1752,12 @@ NSDictionary *mfReconFingerprint(void) {
                                                      withString:[NSString stringWithFormat:@"%@(疑似多 SDK)", names]];
     }
 
+    // v2.58.55: 本次会话侦查点位缓存 — 实验模拟页卡片只显示本次侦查结果,
+    //   不再直接读 entDumps 持久化(mf_debug_57 用户拍板: 没点侦查, 卡片不得有旧点位)
+    {
+        extern void mfAPReconEntCacheSet(NSArray *);
+        mfAPReconEntCacheSet(entFuncs);
+    }
     return @{@"verdict": verdict, @"lines": lines,
              @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide), @"sk": @(skLocal),
              @"sk2": @(sk2stream),

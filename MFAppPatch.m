@@ -496,6 +496,12 @@ static void apEntDumpsSave(void) {
                           [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]);
 }
 NSArray *mfAppPatchEntDumps(void) { apEntDumpsLoad(); return g_entDumps; }
+// v2.58.55: 本次会话侦查点位缓存 — 实验模拟页卡片只吃这个, 未侦查=空(不显示旧持久化点位)
+static NSArray *g_reconEntCache = nil;
+void mfAPReconEntCacheSet(NSArray *ents) {
+    g_reconEntCache = [ents copy];
+}
+NSArray *mfAPReconEntCache(void) { return g_reconEntCache; }
 // F8 扫描点位合并进持久存储(去重: img+sym 相同视为同点)
 void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
     if (![newOnes isKindOfClass:[NSArray class]]) return;
@@ -975,7 +981,19 @@ static MFAPEntList *g_apEntList = nil;
 - (void)mfAPShowEntDumps {
     UIView *page = mfMakePage(@"🎯 判定点", YES);
     g_apEntList = [[MFAPEntList alloc] init];
-    NSArray *rawItems = mfAppPatchEntDumps();
+    // v2.58.55: 列表只吃本次会话侦查缓存 — 未侦查=空列表+提示(mf_debug_57 用户拍板)
+    NSArray *rawItems = mfAPReconEntCache();
+    if (!rawItems) {
+        UILabel *e = [[UILabel alloc] initWithFrame:CGRectMake(16, 60, g_mfCardW - 32, 60)];
+        e.text = @"未侦查\n先到「扫描购买」页跑侦查卡, 本次点位才会出现在这里";
+        e.numberOfLines = 0;
+        e.textAlignment = NSTextAlignmentCenter;
+        e.font = [UIFont systemFontOfSize:12];
+        e.textColor = [UIColor secondaryLabelColor];
+        [page addSubview:e];
+        mfPushPage(page);
+        return;
+    }
     // v2.58.52: 支持 shape 过滤(通过 associatedObject 传入) — SK2 卡片只列 sk2ver/sk2pro,
     //   不再与 F8v2 fixups 点混排(用户: "判定点串行了? 两个卡片都是 17 个")
     NSString *shapeFilter = objc_getAssociatedObject(self, "mfAPShapeFilter");
@@ -1122,6 +1140,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     // v2.58.24: UI 合并(用户反馈) — 旧「🎯判定点按钮」+「🎯判定点卡片条」两个入口
     // 合成一个 F9 同款卡片式交互; 点卡片条直接进列表。规则表(高级)入口移除
     // (判定点主流程 v2.58 起不依赖规则表, 用户从未用过 — 编辑器代码保留, 入口撤)。
+    // v2.58.55: 计数只吃本次会话侦查缓存 — 未侦查显示"未侦查", 不展示旧持久化点位
     {
         UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
         bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
@@ -1133,12 +1152,14 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
         st.numberOfLines = 2;
         st.minimumScaleFactor = 0.7;
-        // v2.58.52/54: 计数排除 sk2ver/sk2pro(已独立成 🛰 卡片) — 不再混计
-        NSUInteger nSk2x = [[mfAppPatchEntDumps() filteredArrayUsingPredicate:
-            [NSPredicate predicateWithFormat:@"shape == 'sk2ver' OR shape == 'sk2pro'"]] count];
-        st.text = [NSString stringWithFormat:@"侦查点位→左划[⚡patch][💾持久化] · 已存 %ld 点(%ld 持久)",
-                   (long)(mfAppPatchEntDumpCount() - nSk2x), (long)[[mfAppPatchEntDumps() filteredArrayUsingPredicate:
-                        [NSPredicate predicateWithFormat:@"on == YES AND shape != 'sk2ver' AND shape != 'sk2pro'"]] count]];
+        NSArray *ses = mfAPReconEntCache();
+        NSUInteger nCode = 0;
+        if ([ses isKindOfClass:[NSArray class]]) {
+            nCode = [[ses filteredArrayUsingPredicate:
+                [NSPredicate predicateWithFormat:@"shape != 'sk2ver' AND shape != 'sk2pro' AND shape != 'deepslot'"]] count];
+        }
+        st.text = ses ? [NSString stringWithFormat:@"本次侦查点位 %lu 个 → 左划[⚡patch][💾持久化]", (unsigned long)nCode]
+                      : @"未侦查 — 先到扫描购买页跑侦查, 卡片才有本次点位";
         st.font = [UIFont systemFontOfSize:10.5];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
@@ -1151,15 +1172,19 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     //   SK2 事务流验证型 = VerificationResult 判别在 async continuation 簇里,
     //   旧三路(F9 直写/F8 getter/读侧守卫)全证伪。判别点⚡ = 分支改 NOP 恒 verified。
     // v2.58.52/54: 卡片统计 sk2ver + sk2pro 两类点(判别点+isPro写入点), 过滤列表分家
+    // v2.58.55: 计数只吃本次会话侦查缓存 — 未侦查不显示旧持久化点位
     {
-        NSArray *dumps = mfAppPatchEntDumps();
-        NSUInteger nSk2 = [[dumps filteredArrayUsingPredicate:
-            [NSPredicate predicateWithFormat:@"shape == 'sk2ver' OR shape == 'sk2pro'"]] count];
-        NSUInteger nSk2ver = [[dumps filteredArrayUsingPredicate:
-            [NSPredicate predicateWithFormat:@"shape == 'sk2ver'"]] count];
-        NSUInteger nSk2pro = [[dumps filteredArrayUsingPredicate:
-            [NSPredicate predicateWithFormat:@"shape == 'sk2pro'"]] count];
-        if (nSk2) {
+        NSArray *ses = mfAPReconEntCache();
+        NSUInteger nSk2 = 0, nSk2ver = 0, nSk2pro = 0;
+        if ([ses isKindOfClass:[NSArray class]]) {
+            nSk2 = [[ses filteredArrayUsingPredicate:
+                [NSPredicate predicateWithFormat:@"shape == 'sk2ver' OR shape == 'sk2pro'"]] count];
+            nSk2ver = [[ses filteredArrayUsingPredicate:
+                [NSPredicate predicateWithFormat:@"shape == 'sk2ver'"]] count];
+            nSk2pro = [[ses filteredArrayUsingPredicate:
+                [NSPredicate predicateWithFormat:@"shape == 'sk2pro'"]] count];
+        }
+        if (nSk2 || !ses) {
             UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
             bar.backgroundColor = [UIColor systemIndigoColor];
             bar.layer.cornerRadius = 10;
@@ -1171,7 +1196,8 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
             UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
             st.numberOfLines = 2;
             st.minimumScaleFactor = 0.7;
-            st.text = [NSString stringWithFormat:@"判别点 %lu · isPro写入点 %lu → 左划⚡ · UserDefaults 直写对此型无效", (unsigned long)nSk2ver, (unsigned long)nSk2pro];
+            st.text = ses ? [NSString stringWithFormat:@"判别点 %lu · isPro写入点 %lu → 左划⚡ · UserDefaults 直写对此型无效", (unsigned long)nSk2ver, (unsigned long)nSk2pro]
+                          : @"未侦查 — 先跑侦查卡, 本卡片才显示本次 SK2 点位";
             st.font = [UIFont systemFontOfSize:10.5];
             st.textColor = [UIColor whiteColor];
             [bar addSubview:st];
