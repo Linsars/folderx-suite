@@ -364,6 +364,63 @@ static NSDictionary *mfReconF8v2Scan(void) {
         return [a[@"calls"] intValue] <= [b[@"calls"] intValue] ? NSOrderedAscending : NSOrderedDescending;  // 并列时 calls 少的在前(判定函数调用点少, UI 函数调用点多)
     }];
 
+    // =====================================================================
+    // SK2 判别点扫描 (v2.58.50, mf_debug_52 定谳):
+    //   SK2 事务流验证型 app 的判定本体 = VerificationResult 枚举判别(verified/unverified),
+    //   在 async continuation 簇里, 形态 = witness 间接调用(blr x8)后紧跟
+    //   cmp wN,#1 + b.ne/b.eq(verified=1 落空穿行=成功路径, 分支=错误路径)。
+    //   patch = 分支指令改写 NOP → 恒走 verified 落空路径, app 自行完成快照/点亮。
+    //   数据源: 磁盘原始字节(铁律: 不读运行时内存)。
+    // =====================================================================
+    NSMutableArray *sk2pts = [NSMutableArray array];
+    {
+        int nSk2StreamCall = 0;
+        for (int i = 0; i < nCall; i++) {
+            const char *s = skStubNames[callSKIdx[i]];
+            if (!strstr(s, "currentEntitlements") && !strstr(s, "7updates") && !strstr(s, "6latest3for")) continue;
+            nSk2StreamCall++;
+            uint64_t pc = callPC[i];
+            // 窗口: 调用点 ±0x1000 内找判别形态
+            uint64_t lo = pc >= textVM + 0x1000 ? pc - 0x1000 : textVM;
+            uint64_t hi = pc + 0x1000;
+            if (hi > textVM + textSize) hi = textVM + textSize;
+            for (uint64_t a2 = lo + 4; a2 + 8 <= hi; a2 += 4) {
+                uint32_t wPrev = *(const uint32_t *)((uintptr_t)a2 - 4 + (uintptr_t)slide);
+                uint32_t wCmp  = *(const uint32_t *)((uintptr_t)a2 + (uintptr_t)slide);
+                uint32_t wBr   = *(const uint32_t *)((uintptr_t)a2 + 4 + (uintptr_t)slide);
+                // blr xN 前置(≤2 条): 判别前的 witness 间接调用
+                if ((wPrev & 0xFFFFFC1F) != 0xD63F0000) continue;
+                // cmp wN,#1 = 0x7100001F | (N<<5)
+                if ((wCmp & 0x7F1FFFFF) != 0x7100001F) continue;
+                // b.ne / b.eq = 0x54000000 | cond | imm19<<5
+                if ((wBr & 0xFF000010) != 0x54000000) continue;
+                uint32_t cond = wBr & 0xF;
+                if (cond != 1 && cond != 0) continue;   // 只收 ne/eq
+                // 去重(同函数窗口内可能多处命中, 收首个即可)
+                BOOL dup = NO;
+                for (NSDictionary *sp in sk2pts)
+                    if ([sp[@"vmaddr"] unsignedLongLongValue] == a2 + 4) { dup = YES; break; }
+                if (dup) continue;
+                uint32_t nop = 0xD503201F;
+                [sk2pts addObject:@{
+                    @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                    @"sym": [NSString stringWithFormat:@"sk2ver@%#llx", (unsigned long long)(a2 + 4 - textVM)],
+                    @"vmaddr": @(a2 + 4),
+                    @"slide": @((long)slide),
+                    @"score": @(95),
+                    @"calls": @(0),
+                    @"shape": @"sk2ver",
+                    @"kind": @"sk2ver",
+                    @"old": [NSString stringWithFormat:@"%08x", wBr],
+                    @"new": [NSString stringWithFormat:@"%08x", nop],
+                }];
+            }
+        }
+        mfLog(@"[f8v2] SK2 流消费点=%d → 判别点=%lu 个", nSk2StreamCall, (unsigned long)sk2pts.count);
+        for (NSDictionary *sp in sk2pts)
+            mfLog(@"[f8v2] ★sk2ver @%#llx (判别→恒verified)", (unsigned long long)[sp[@"vmaddr"] unsignedLongLongValue]);
+    }
+
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";
     NSMutableArray *out = [NSMutableArray array];
     // v2.58.16: top6→top12 + CE 消费者无条件保位 — mf_debug_16 实锤真判定函数
@@ -1071,7 +1128,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
         }
     }
     } // @autoreleasepool F8v3
-    return @{@"cands": out, @"ncalls": @(nCall), @"skstubs": @(nSkStub), @"skimports": @(nSkStub)};
+    return @{@"cands": out, @"ncalls": @(nCall), @"skstubs": @(nSkStub), @"skimports": @(nSkStub),
+             @"sk2pts": sk2pts};
     }
 }
 
@@ -1411,6 +1469,14 @@ NSDictionary *mfReconFingerprint(void) {
             {
             NSDictionary *f8v2 = mfReconF8v2Scan();
             NSArray *cands = f8v2[@"cands"];
+            NSArray *sk2pts = f8v2[@"sk2pts"];
+            // v2.58.50: SK2 判别点优先入库(恒 verified patch) — 见下方 sk2stream 判型
+            extern void mfAppPatchEntDumpsMerge(NSArray *);
+            if ([sk2pts isKindOfClass:[NSArray class]] && sk2pts.count) {
+                mfAppPatchEntDumpsMerge(sk2pts);
+                [entFuncs addObjectsFromArray:sk2pts];
+                [lines addObject:[NSString stringWithFormat:@"SK2 判别点: %lu 个已入库(VerificationResult 判别 → ⚡恒 verified) — 见实验模拟页", (unsigned long)sk2pts.count]];
+            }
             if (cloudBrands.count) {
                 // v2.58.40: F10 点位也要 merge 入库(云验证型专属判定点 — 深槽装载链)
                 NSUInteger nDeep = 0;
@@ -1445,13 +1511,28 @@ NSDictionary *mfReconFingerprint(void) {
 
     // ---- 判定(动态拼接, 可叠加: Reflix = 云+mach 双面) ----
     BOOL cloud = cloudBrands.count > 0;
+    // v2.58.50: SK2 事务流验证型 — mf_debug_52(HostLog)定谳: app 消费 SK2 事务流
+    //   (currentEntitlements/updates) + 本地复验(verification failed 串), 判定本体 =
+    //   VerificationResult 判别。UserDefaults key 只是镜像(直写被重算覆盖), F8 点位
+    //   是 UI getter — 两条旧路全证伪。解锁 = sk2ver 判别点⚡恒 verified。
+    //   优先级: 云 > mach > SK2 流型 > 服务器 > 状态型(状态型只看有无 SK2 流消费)。
+    BOOL sk2stream = NO;
+    {
+        NSUInteger nSk2 = 0;
+        for (NSDictionary *f in entFuncs) if ([f[@"shape"] isEqualToString:@"sk2ver"]) nSk2++;
+        // 复验串 = app 自己二次验证事务("verification failed"/"could not be verified")
+        BOOL reverify = mfRecFind(p, n, "verification failed") || mfRecFind(p, n, "could not be verified")
+                     || mfRecFind(p, n, "snapshot verification");
+        if (!cloud && !mach && nSk2 >= 1 && reverify) sk2stream = YES;
+    }
     // v2.58.35: 云验证优先级定案(用户架构: 侦查卡是定性器) — RC/Adapty 等云 SDK 在场时
     //   判定本体在云端回包, UserDefaults 状态 key 只是缓存镜像(直写有概率生效但不定死
     //   类型)。verdict 云分支前置, 状态型只作 lines 里的辅助线索(实存 key 才标注)。
     BOOL stateType = NO;
     {
         // 状态型 = 无云无 mach + 实存语义 key 数量 ≥2(静态死串不算, Reflix 76 假案定谳)
-        if (!cloud && !mach) {
+        // v2.58.50: SK2 流型在场时状态 key 是镜像 — 降级为线索, 不判状态型
+        if (!cloud && !mach && !sk2stream) {
             NSUInteger live = 0;
             for (NSDictionary *d in stateKeys) if ([d isKindOfClass:[NSDictionary class]] && [d[@"live"] boolValue]) live++;
             if (live >= 2) stateType = YES;
@@ -1478,6 +1559,8 @@ NSDictionary *mfReconFingerprint(void) {
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
     else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, Reflix/ScriptingPass 同族) — EXCPROBE 应答器可复刻";
+    // v2.58.50: SK2 事务流验证型(HostLog 定谳) — 状态 key 是镜像, 旧三路(F9/F8/读侧守卫)全证伪
+    else if (sk2stream)     verdict = @"SK2 事务流验证型(JWS 事务流消费 + 本地复验) — UserDefaults 是镜像, 解锁=实验模拟页⚡SK2 判别点(恒 verified)";
     else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
     else if (stateType)     verdict = @"状态型(UserDefaults 实存语义key) — 🧪实验模拟→F9 状态解锁 直写";
     // v2.58.7: 纯 StoreKit 本地校验型分支(2.58.6 缺失 — SK2 明明已判定却显示"未发现订阅验证 SDK"兜底文案)
@@ -1491,6 +1574,7 @@ NSDictionary *mfReconFingerprint(void) {
 
     return @{@"verdict": verdict, @"lines": lines,
              @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide), @"sk": @(skLocal),
+             @"sk2": @(sk2stream),
              @"sktype": skType, @"validator": validator,
              @"entFuncs": entFuncs,
              @"stateKeys": stateKeys};   // v2.58.35: 侦查=唯一采集器 — F9 卡片吃这个, 不独立扫

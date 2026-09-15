@@ -570,6 +570,12 @@ void apEntDumpsApply(void) {
             if (rt > 30) rt = 9;    // 容错: 解析失败回落 x9(gooby 实证寄存器)
             uint32_t movx = 0xd2800000u | (1u << 5) | rt;
             newBytes = [NSData dataWithBytes:&movx length:4];
+        } else if ([d[@"sym"] hasPrefix:@"sk2ver@"]) {
+            // v2.58.50: SK2 判别点 — 分支指令改 NOP → 恒走 verified 落空路径
+            //   点位即分支指令本身(侦查卡扫描时已存 old/new 字节)
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"1f2003d5");   // nop
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         if (apSwiftTextPatchDump(d, nil, newBytes, &err)) {
             g_apHits++;
@@ -1010,6 +1016,11 @@ static MFAPEntList *g_apEntList = nil;
             if (rt > 30) rt = 9;
             uint32_t movx = 0xd2800000u | (1u << 5) | rt;
             newBytes = [NSData dataWithBytes:&movx length:4];
+        } else if ([sym hasPrefix:@"sk2ver@"]) {
+            // v2.58.50: SK2 判别点 — 分支指令改 NOP → 恒走 verified 落空路径
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"1f2003d5");
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }
@@ -1104,6 +1115,34 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         [bar addGestureRecognizer:tap];
         [page addSubview:bar];
         y += 56;
+    }
+    // v2.58.50: SK2 事务流伪造入口 — mf_debug_52(HostLog)定谳的新引擎类型:
+    //   SK2 事务流验证型 = VerificationResult 判别在 async continuation 簇里,
+    //   旧三路(F9 直写/F8 getter/读侧守卫)全证伪。判别点⚡ = 分支改 NOP 恒 verified。
+    {
+        NSUInteger nSk2 = [[mfAppPatchEntDumps() filteredArrayUsingPredicate:
+            [NSPredicate predicateWithFormat:@"shape == 'sk2ver'"]] count];
+        if (nSk2) {
+            UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
+            bar.backgroundColor = [UIColor systemIndigoColor];
+            bar.layer.cornerRadius = 10;
+            UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 5, g_mfCardW - 46, 22)];
+            l.text = @"🛰 SK2 事务流伪造(JWS 事务流验证型)";
+            l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+            l.textColor = [UIColor whiteColor];
+            [bar addSubview:l];
+            UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
+            st.numberOfLines = 2;
+            st.minimumScaleFactor = 0.7;
+            st.text = [NSString stringWithFormat:@"判别点 %lu 个 → 左划⚡恒 verified · UserDefaults 直写对此型无效", (unsigned long)nSk2];
+            st.font = [UIFont systemFontOfSize:10.5];
+            st.textColor = [UIColor whiteColor];
+            [bar addSubview:st];
+            UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:g_mfCtrl action:@selector(mfAPShowEntDumps)];
+            [bar addGestureRecognizer:tap];
+            [page addSubview:bar];
+            y += 56;
+        }
     }
     // v2.58 占位: 自签票据写入 app keychain(样本链B手法 — 无插件也亮)
     //   参数已逆向齐: kcp.ent.snapshot.v1 / DeviceSecret kcp.v3.nx7.p0.7f1a / LZFSE+HMAC-SHA256(psc.dv.s1)
