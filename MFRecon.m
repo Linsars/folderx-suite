@@ -904,12 +904,36 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     uint32_t imm9 = (w1 >> 12) & 0x1FF;                // bits20-12!
                                     if (imm9 < 0xC0 || imm9 >= 0x180) continue;       // 深槽窗口
                                     uint32_t xt = w1 & 0x1F;
-                                    BOOL store = NO;
+                                    BOOL store = NO; uint32_t rm = 0;
                                     for (int j = 1; j <= 4 && !store; j++) {
                                         uint32_t w2 = *(const uint32_t *)(a + j * 4);
-                                        if ((w2 >> 22) == 0x3E0 && (w2 & 0x1F) == xt) store = YES;
+                                        // v2.58.43: STR reg-offset 与 STUR 同顶10位(0x3E0),
+                                        //   分水岭 = bits11-10: STR=10, STUR=00。旧版漏判把
+                                        //   "ldur→stur 帧槽暂存"当字段装载(mf_debug_44 三点位错)。
+                                        if ((w2 >> 22) == 0x3E0 && ((w2 >> 10) & 3) == 2 && (w2 & 0x1F) == xt) {
+                                            store = YES;
+                                            rm = (w2 >> 16) & 0x1F;   // STR 的偏移寄存器
+                                        }
                                     }
                                     if (!store) continue;
+                                    // v2.58.43: 偏移寄存器必须来自 adrp+ldr 偏移表(直接结构字段写),
+                                    //   排除 ldrsw witness 反射写(0x1420f60 案)与 ldur 深槽混用(0x12e17e0 案)
+                                    //   真点 0x14211bc: ldr x8,[x8,#0x878] → ldur → str x9,[x0,x8]
+                                    //   查 ldur 前 8 字节与后 4 字节窗口(排除 ldur 自身)
+                                    BOOL offTbl = NO;
+                                    if (off >= 8) {
+                                        for (int64_t back2 = 4; back2 <= 8 && !offTbl; back2 += 4) {
+                                            uint32_t qm = *(const uint32_t *)(a - back2);
+                                            if ((qm & 0xFFC00000) == 0xF9400000 && (qm & 0x1F) == rm) offTbl = YES;   // ldr Xt,[Xn,#imm12]
+                                        }
+                                    }
+                                    if (!offTbl) {
+                                        for (int f2 = 4; f2 <= 8 && !offTbl; f2 += 4) {
+                                            uint32_t qm = *(const uint32_t *)(a + f2);
+                                            if ((qm & 0xFFC00000) == 0xF9400000 && (qm & 0x1F) == rm) offTbl = YES;
+                                        }
+                                    }
+                                    if (!offTbl) continue;
                                     // 宿主函数头: 紧判据回溯(stp 预索引 + 8条内 add x29,sp)
                                     uint64_t h = 0;
                                     for (int64_t back = 0; back < 0x8000 && off >= (uint64_t)back + 12; back += 4) {
