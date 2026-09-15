@@ -868,12 +868,15 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                 for (int k = 0; k < nDsStr && !hit; k++) if (dsStrVM[k] == tgt) hit = YES;
                                 if (!hit) continue;
                                 uint64_t h = 0;
-                                for (int64_t back = 0; back < 0x10000 && off >= (uint64_t)back + 4; back += 4) {
-                                    uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back);
-                                    if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
-                                        ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
-                                        (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back + 4) == 0xD65F03C0))
-                                        { h = textVM + off - back; break; }
+                                for (int64_t back = 0; back < 0x10000 && off >= (uint64_t)back + 12; back += 4) {
+                                    uintptr_t qa = (uintptr_t)textVM + (uintptr_t)slide + off - back;
+                                    uint32_t q = *(const uint32_t *)qa;
+                                    if ((q & 0x7FC00000) != 0x29800000 || ((q >> 5) & 0x1F) != 31) continue;
+                                    for (int d3 = 4; d3 <= 32; d3 += 4) {
+                                        uint32_t q2 = *(const uint32_t *)(qa + d3);
+                                        if ((q2 & 0xFFC003FF) == 0x910003FD) { h = qa; break; }
+                                    }
+                                    if (h) break;
                                 }
                                 if (!h) continue;
                                 BOOL dup = NO;
@@ -884,10 +887,14 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             if (nDsSemFn >= 1) {
                                 // ③ L1 深槽点收集(LDUR 深槽 + 后4条内 STR reg-offset 同寄存器)
                                 //    + 宿主函数归属(bsearch fnHeads — F8v3 已收集, 有序)
-                                #define F10_MAXPT 512
+                                #define F10_MAXPT 2048
                                 static uint64_t dsPts[F10_MAXPT]; int nDsPts = 0;
                                 static uint64_t dsHost[F10_MAXPT];   // 每点的宿主函数头
                                 static uint32_t dsPtRt[F10_MAXPT];    // v2.58.40.1: LDUR 目标寄存器(跨 app 正确性 — 不一定是 x9)
+                                // v2.58.41: prologue 紧判据(mf_debug_42 定谳 0 命中根因) —
+                                //   C 版宽判据(含 sub sp/nop)回溯停在 prologue 中间(0x14208e8),
+                                //   真函数头 0x14208cc 反而漏掉 → 宿主归属错 → L2 全 miss。
+                                //   紧判据 = Python 版同款: stp 任意对 pre-index 到 sp + 8条内 add x29,sp。
                                 for (uint64_t off = 0; off + 20 <= textSize && nDsPts < F10_MAXPT; off += 4) {
                                     uintptr_t a = (uintptr_t)textVM + (uintptr_t)slide + off;
                                     uint32_t w1 = *(const uint32_t *)a;
@@ -903,14 +910,17 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                         if ((w2 >> 22) == 0x3E0 && (w2 & 0x1F) == xt) store = YES;
                                     }
                                     if (!store) continue;
-                                    // 宿主函数头(线性回溯, 与 F8v3 同判)
+                                    // 宿主函数头: 紧判据回溯(stp 预索引 + 8条内 add x29,sp)
                                     uint64_t h = 0;
-                                    for (int64_t back = 0; back < 0x8000 && off >= (uint64_t)back + 4; back += 4) {
-                                        uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back);
-                                        if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
-                                            ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
-                                            (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back + 4) == 0xD65F03C0))
-                                            { h = textVM + off - back; break; }
+                                    for (int64_t back = 0; back < 0x8000 && off >= (uint64_t)back + 12; back += 4) {
+                                        uintptr_t qa = (uintptr_t)textVM + (uintptr_t)slide + off - back;
+                                        uint32_t q = *(const uint32_t *)qa;
+                                        if ((q & 0x7FC00000) != 0x29800000 || ((q >> 5) & 0x1F) != 31) continue;
+                                        for (int d3 = 4; d3 <= 32; d3 += 4) {
+                                            uint32_t q2 = *(const uint32_t *)(qa + d3);
+                                            if ((q2 & 0xFFC003FF) == 0x910003FD) { h = qa; break; }   // add x29,sp,#imm
+                                        }
+                                        if (h) break;
                                     }
                                     if (h) { dsPts[nDsPts] = textVM + off; dsHost[nDsPts] = h; dsPtRt[nDsPts] = xt; nDsPts++; }
                                 }
@@ -929,31 +939,38 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     BOOL isHost = NO;
                                     for (int k = 0; k < nDsPts; k++) if (dsHost[k] == tgt) { isHost = YES; break; }
                                     if (!isHost) continue;
-                                    // caller 函数头
+                                    // caller 函数头(紧判据)
                                     uint64_t cf = 0;
-                                    for (int64_t back = 0; back < 0x10000 && off >= (uint64_t)back + 4; back += 4) {
-                                        uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back);
-                                        if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
-                                            ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
-                                            (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back + 4) == 0xD65F03C0))
-                                            { cf = textVM + off - back; break; }
+                                    for (int64_t back = 0; back < 0x10000 && off >= (uint64_t)back + 12; back += 4) {
+                                        uintptr_t qa = (uintptr_t)textVM + (uintptr_t)slide + off - back;
+                                        uint32_t q = *(const uint32_t *)qa;
+                                        if ((q & 0x7FC00000) != 0x29800000 || ((q >> 5) & 0x1F) != 31) continue;
+                                        for (int d3 = 4; d3 <= 32; d3 += 4) {
+                                            uint32_t q2 = *(const uint32_t *)(qa + d3);
+                                            if ((q2 & 0xFFC003FF) == 0x910003FD) { cf = qa; break; }
+                                        }
+                                        if (cf) break;
                                     }
                                     if (!cf) continue;
-                                    // 语义判定 + 闭包归并(0x8000 内向外层回溯)
+                                    // 语义判定 + 闭包归并(0x8000 总跨度内向外层回溯, 深 32 层 — gooby 大函数夹 10 假头, 8 层不够)
                                     BOOL sem = NO;
                                     uint64_t cf2 = cf;
-                                    for (int depth = 0; depth < 8 && !sem; depth++) {
+                                    for (int depth = 0; depth < 32 && !sem; depth++) {
                                         for (int k = 0; k < nDsSemFn; k++) if (dsSemFn[k] == cf2) { sem = YES; break; }
                                         if (sem) break;
-                                        // 向外层函数头回溯(从 cf2 向下找最近函数头)
+                                        if (cf - cf2 > 0x8000) break;   // 总跨度上限
+                                        // 向外层函数头回溯(紧判据, 从 cf2 向下找最近函数头)
                                         uint64_t outer = 0;
                                         for (int64_t back = 4; back < 0x8000; back += 4) {
-                                            if (cf2 < (uint64_t)back + 4) break;
-                                            uint32_t q = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + cf2 - back);
-                                            if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
-                                                ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) ||
-                                                (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + cf2 - back + 4) == 0xD65F03C0))
-                                                { outer = cf2 - back; break; }
+                                            if (cf2 < (uint64_t)back + 12) break;
+                                            uintptr_t qa = (uintptr_t)textVM + (uintptr_t)slide + cf2 - back;
+                                            uint32_t q = *(const uint32_t *)qa;
+                                            if ((q & 0x7FC00000) != 0x29800000 || ((q >> 5) & 0x1F) != 31) continue;
+                                            for (int d3 = 4; d3 <= 32; d3 += 4) {
+                                                uint32_t q2 = *(const uint32_t *)(qa + d3);
+                                                if ((q2 & 0xFFC003FF) == 0x910003FD) { outer = qa; break; }
+                                            }
+                                            if (outer) break;
                                         }
                                         if (!outer || cf2 - outer > 0x8000) break;
                                         cf2 = outer;
