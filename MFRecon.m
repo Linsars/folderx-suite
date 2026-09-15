@@ -117,13 +117,13 @@ static NSDictionary *mfReconF8v2Scan(void) {
 
     // ---- LC: __text/__stubs section(rev2 不再需要 fixups 表) ----
     const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
-    uint64_t textVM = 0, textSize = 0, stubVM = 0, stubSize = 0;
+    uint64_t textVM = 0, textSize = 0, stubVM = 0, stubSize = 0, textFileOff = 0;
     for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
         if (lc->cmd != LC_SEGMENT_64) continue;
         const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
         const struct section_64 *sc = (const struct section_64 *)((const uint8_t *)sg + sizeof(struct segment_command_64));
         for (uint32_t s = 0; s < sg->nsects; s++, sc++) {
-            if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__text")) { textVM = sc->addr; textSize = sc->size; }
+            if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__text")) { textVM = sc->addr; textSize = sc->size; textFileOff = sc->offset; }
             if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__stubs")) { stubVM = sc->addr; stubSize = sc->size; }
         }
     }
@@ -895,9 +895,20 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                 //   C 版宽判据(含 sub sp/nop)回溯停在 prologue 中间(0x14208e8),
                                 //   真函数头 0x14208cc 反而漏掉 → 宿主归属错 → L2 全 miss。
                                 //   紧判据 = Python 版同款: stp 任意对 pre-index 到 sp + 8条内 add x29,sp。
+                                // v2.58.44: L1 形态判定改读磁盘文件原始字节 — mf_debug_45 定谳:
+                                //   INLINE-PATCH(2.58.39 定版资产)在 ctor 已把真点 0x14211bc
+                                //   运行时改写为 mov x9,#1(0xd2800029), 运行时内存读不到原始
+                                //   ldur → 真点隐形, 只剩未被 patch 的 0x11d5398 命中(点位不对)。
+                                //   磁盘文件不受运行时 patch 影响, 读文件 = 读原始指令。
+                                NSData *f10exe = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:mainPath] options:NSDataReadingMappedIfSafe error:NULL];
+                                const uint8_t *f10p = f10exe.bytes;
+                                BOOL f10fileOK = (f10p != NULL && (uint64_t)f10exe.length >= textFileOff + textSize);
+                                if (!f10fileOK)
+                                    mfLog(@"[f10] 主二进制文件读取失败(len=%lu need=%llu) — L1 用运行时内存", (unsigned long)f10exe.length, (unsigned long long)(textFileOff + textSize));
                                 for (uint64_t off = 0; off + 20 <= textSize && nDsPts < F10_MAXPT; off += 4) {
                                     uintptr_t a = (uintptr_t)textVM + (uintptr_t)slide + off;
-                                    uint32_t w1 = *(const uint32_t *)a;
+                                    uint32_t w1 = f10fileOK ? *(const uint32_t *)(f10p + textFileOff + off)
+                                                             : *(const uint32_t *)a;
                                     if ((w1 >> 22) != 0x3E1) continue;              // LDUR 64
                                     if (((w1 >> 5) & 0x1F) != 29) continue;            // x29
                                     if (((w1 >> 10) & 3) != 0) continue;               // opc=00
@@ -906,7 +917,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     uint32_t xt = w1 & 0x1F;
                                     BOOL store = NO; uint32_t rm = 0;
                                     for (int j = 1; j <= 4 && !store; j++) {
-                                        uint32_t w2 = *(const uint32_t *)(a + j * 4);
+                                        uint32_t w2 = f10fileOK ? *(const uint32_t *)(f10p + textFileOff + off + j * 4)
+                                                                 : *(const uint32_t *)(a + j * 4);
                                         // v2.58.43: STR reg-offset 与 STUR 同顶10位(0x3E0),
                                         //   分水岭 = bits11-10: STR=10, STUR=00。旧版漏判把
                                         //   "ldur→stur 帧槽暂存"当字段装载(mf_debug_44 三点位错)。
@@ -923,13 +935,15 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     BOOL offTbl = NO;
                                     if (off >= 8) {
                                         for (int64_t back2 = 4; back2 <= 8 && !offTbl; back2 += 4) {
-                                            uint32_t qm = *(const uint32_t *)(a - back2);
+                                            uint32_t qm = f10fileOK ? *(const uint32_t *)(f10p + textFileOff + off - back2)
+                                                                     : *(const uint32_t *)(a - back2);
                                             if ((qm & 0xFFC00000) == 0xF9400000 && (qm & 0x1F) == rm) offTbl = YES;   // ldr Xt,[Xn,#imm12]
                                         }
                                     }
                                     if (!offTbl) {
                                         for (int f2 = 4; f2 <= 8 && !offTbl; f2 += 4) {
-                                            uint32_t qm = *(const uint32_t *)(a + f2);
+                                            uint32_t qm = f10fileOK ? *(const uint32_t *)(f10p + textFileOff + off + f2)
+                                                                     : *(const uint32_t *)(a + f2);
                                             if ((qm & 0xFFC00000) == 0xF9400000 && (qm & 0x1F) == rm) offTbl = YES;
                                         }
                                     }
