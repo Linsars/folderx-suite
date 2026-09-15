@@ -978,7 +978,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                         @"sym": [NSString stringWithFormat:@"deepslot@%llx.%u", (unsigned long long)(pt - textVM), ptRt],
                                         @"vmaddr": @(pt),
                                         @"slide": @((long)slide),
-                                        @"score": @(92),
+                                        @"score": @(93),
                                         @"calls": @(0),
                                         @"shape": @"deepslot",
                                     }];
