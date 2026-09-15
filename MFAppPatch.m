@@ -562,10 +562,14 @@ void apEntDumpsApply(void) {
             uint32_t movz = 0x52800020u | rt;
             newBytes = [NSData dataWithBytes:&movz length:4];
         } else if ([d[@"sym"] hasPrefix:@"deepslot@"]) {
-            // v2.58.40: F10 深槽装载点 — ldur x9,[x29,#-imm] → mov x9,#1(0xd2800029)
-            //   与 Reflix 2.46.0 INLINE-PATCH 同款语义(字段恒 licensed), 64 位 MOVZ
-            uint32_t movx9 = 0xd2800029u;
-            newBytes = [NSData dataWithBytes:&movx9 length:4];
+            // v2.58.40: F10 深槽装载点 — ldur x<Rt>,[x29,#-imm] → mov x<Rt>,#1
+            //   sym 格式 deepslot@0x<off>.<Rt> — MOVZ X<Rt>,#1 = 0xd2800000 | (1<<5) | Rt
+            unsigned rt = 9;
+            NSRange dot = [d[@"sym"] rangeOfString:@"." options:NSBackwardsSearch];
+            if (dot.location != NSNotFound) rt = (unsigned)[[d[@"sym"] substringFromIndex:dot.location + 1] intValue];
+            if (rt > 30) rt = 9;    // 容错: 解析失败回落 x9(gooby 实证寄存器)
+            uint32_t movx = 0xd2800000u | (1u << 5) | rt;
+            newBytes = [NSData dataWithBytes:&movx length:4];
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         if (apSwiftTextPatchDump(d, nil, newBytes, &err)) {
             g_apHits++;
@@ -998,9 +1002,14 @@ static MFAPEntList *g_apEntList = nil;
             uint32_t movz = 0x52800020u | rt;   // (imm16=1)<<5 | Rd
             newBytes = [NSData dataWithBytes:&movz length:4];
         } else if ([sym hasPrefix:@"deepslot@"]) {
-            // v2.58.40: F10 深槽装载点 — ldur x9,[x29,#-imm] → mov x9,#1
-            uint32_t movx9 = 0xd2800029u;      // MOVZ x9,#1 (64 位, licensed 字段恒真)
-            newBytes = [NSData dataWithBytes:&movx9 length:4];
+            // v2.58.40: F10 深槽装载点 — ldur x<Rt>,[x29,#-imm] → mov x<Rt>,#1
+            //   sym 格式 deepslot@0x<off>.<Rt> — MOVZ X<Rt>,#1 = 0xd2800000 | (1<<5) | Rt
+            unsigned rt = 9;
+            NSRange dot = [sym rangeOfString:@"." options:NSBackwardsSearch];
+            if (dot.location != NSNotFound) rt = (unsigned)[[sym substringFromIndex:dot.location + 1] intValue];
+            if (rt > 30) rt = 9;
+            uint32_t movx = 0xd2800000u | (1u << 5) | rt;
+            newBytes = [NSData dataWithBytes:&movx length:4];
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }

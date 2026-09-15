@@ -887,6 +887,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                 #define F10_MAXPT 512
                                 static uint64_t dsPts[F10_MAXPT]; int nDsPts = 0;
                                 static uint64_t dsHost[F10_MAXPT];   // 每点的宿主函数头
+                                static uint32_t dsPtRt[F10_MAXPT];    // v2.58.40.1: LDUR 目标寄存器(跨 app 正确性 — 不一定是 x9)
                                 for (uint64_t off = 0; off + 20 <= textSize && nDsPts < F10_MAXPT; off += 4) {
                                     uintptr_t a = (uintptr_t)textVM + (uintptr_t)slide + off;
                                     uint32_t w1 = *(const uint32_t *)a;
@@ -911,7 +912,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                             (q == 0x52800020 && *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off - back + 4) == 0xD65F03C0))
                                             { h = textVM + off - back; break; }
                                     }
-                                    if (h) { dsPts[nDsPts] = textVM + off; dsHost[nDsPts] = h; nDsPts++; }
+                                    if (h) { dsPts[nDsPts] = textVM + off; dsHost[nDsPts] = h; dsPtRt[nDsPts] = xt; nDsPts++; }
                                 }
                                 mfLog(@"[f10] L1 深槽点=%d", nDsPts);
                                 // ④ L2: 宿主函数的 bl caller ∈ 深槽语义函数(含闭包归并 0x8000)
@@ -967,14 +968,14 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     }
                                     if (!ldrsw) continue;
                                     // 命中: 宿主函数里挑该函数的深槽点(第一个)入库
-                                    uint64_t pt = 0;
-                                    for (int k = 0; k < nDsPts; k++) if (dsHost[k] == tgt) { pt = dsPts[k]; break; }
+                                    uint64_t pt = 0; uint32_t ptRt = 9;
+                                    for (int k = 0; k < nDsPts; k++) if (dsHost[k] == tgt) { pt = dsPts[k]; ptRt = dsPtRt[k]; break; }
                                     if (!pt) continue;
                                     nDS10++;
-                                    mfLog(@"[f10] ★深槽装载点 @%#llx (host=%#llx caller=%#llx)", (unsigned long long)pt, (unsigned long long)tgt, (unsigned long long)cf);
+                                    mfLog(@"[f10] ★深槽装载点 @%#llx x%u (host=%#llx caller=%#llx)", (unsigned long long)pt, ptRt, (unsigned long long)tgt, (unsigned long long)cf);
                                     [out addObject:@{
                                         @"img": imgName,
-                                        @"sym": [NSString stringWithFormat:@"deepslot@%llx", (unsigned long long)(pt - textVM)],
+                                        @"sym": [NSString stringWithFormat:@"deepslot@%llx.%u", (unsigned long long)(pt - textVM), ptRt],
                                         @"vmaddr": @(pt),
                                         @"slide": @((long)slide),
                                         @"score": @(92),
