@@ -699,7 +699,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         if (![shape2 isEqualToString:@"ptr"] && accFan[k] <= 500) {
                             if (boolTail2) gateOK = YES;                          // 尾 and w0,#1 — 判定尾巴(最稀有)
                             else if (ldrbTail2) gateOK = YES;                     // v2.58.26: ldrb w0 尾 — Bool ivar getter(@Observable 形态)
-                            else if (accFan[k] >= 2 && [shape2 isEqualToString:@"bool"]) gateOK = YES;  // 共享 Bool
+                            // v2.58.47: 共享 bool 加 fan≤64 门 — mf_debug_49(HostLog)实锤
+                            //   fan=211/41/26/24 无尾巴共享 helper 是 UI/基础库噪声;
+                            //   真判定 accessor fan 天花板几十(yimuliaoran 17 调用者)
+                            else if (accFan[k] >= 2 && accFan[k] <= 64 && [shape2 isEqualToString:@"bool"]) gateOK = YES;
                         }
                         if (gateOK) {
                             nShared++;
@@ -1055,7 +1058,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             // top12 removeLast 恰好删掉 ivarBoolGetter(94)真判定层, mf_debug_26 实锤
                             int d = [b[@"score"] intValue] - [a[@"score"] intValue];
                             if (d) return d < 0 ? NSOrderedAscending : NSOrderedDescending;
-                            int c = [b[@"calls"] intValue] - [a[@"calls"] intValue];
+                            // v2.58.47: 并列改 calls 升序 — mf_debug_49(HostLog)实锤: 91分共享bool
+                            //   按 calls 降序补位 = fan=211/41/26/24 基础库 helper 混进 top12;
+                            //   判定函数调用点少, UI/基础库 helper 调用点多(与 F8v2 内部排序同原则)
+                            int c = [a[@"calls"] intValue] - [b[@"calls"] intValue];
                             return c < 0 ? NSOrderedAscending : NSOrderedDescending;
                         }];
                         while (mo.count > 12) [mo removeLastObject];
