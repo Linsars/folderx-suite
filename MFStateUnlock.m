@@ -169,21 +169,51 @@ NSArray *mfStateProbeKeys(void) {
     }
 }
 
-// —— 解锁: 单 key 直写(Bool→YES / Date→distantFuture) ——
+// —— 解锁: 单 key 直写(Bool→YES / Date→distantFuture / 反向词→删 / 容器→跳过) ——
 long mfStateUnlockApplyKey(NSString *key, BOOL on) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    if (on) {
-        if (stateKeyIsDate(key)) {
-            // distantFuture = 9999-12-31 — Date 比较恒成立
-            [ud setObject:[NSDate distantFuture] forKey:key];
-        } else {
-            [ud setBool:YES forKey:key];
-        }
-    } else {
+    if (!on) {
         [ud removeObjectForKey:key];
+        [ud synchronize];
+        mfLog(@"[f9] ⚡状态直写 %@ = remove → (已删)", key);
+        return 1;
+    }
+    // v2.58.47: 反向语义词表 — missing/lost/revok 类 key **存在本身 = 锁定态**,
+    //   写 YES/distantFuture 恰好强化"缺失中"(mf_debug_50: missingSince 写 YES 不亮)。
+    //   正确解锁 = 删 key(缺失记录不存在 = 从未缺失)。
+    static NSArray *invWords = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        invWords = @[@"missing", @"missed", @"lost", @"revok", @"block",
+                     @"cancel", @"disabl", @"suspend", @"banned", @"expired"];
+    });
+    NSString *lk = key.lowercaseString;
+    for (NSString *w in invWords) {
+        if ([lk containsString:w]) {
+            [ud removeObjectForKey:key];
+            [ud synchronize];
+            mfLog(@"[f9] ⚡状态直写 %@ = REMOVE(反向语义词 %@ — 存在=锁定, 删=解锁)", key, w);
+            return 1;
+        }
+    }
+    // v2.58.47: 容器类型跳过 — records/transactions 类 key 实存 dict/array,
+    //   写 Bool 毁类型, app 解析失败等于白写(mf_debug_50: verifiedRecords 写 YES 不亮)。
+    //   记录集无法凭空伪造 — 该 app 解锁走 F8 代码点位(8 个尾and 判定尾巴)。
+    id cur = [ud objectForKey:key];
+    if (cur && ([cur isKindOfClass:[NSDictionary class]] || [cur isKindOfClass:[NSArray class]])) {
+        mfLog(@"[f9] ⚡状态直写 %@ 跳过 — 实存类型 %@(容器记录集, 伪造无意义)", key, NSStringFromClass([cur class]));
+        return 1;
+    }
+    if (stateKeyIsDate(key)) {
+        // distantFuture = 9999-12-31 — Date 比较恒成立
+        [ud setObject:[NSDate distantFuture] forKey:key];
+    } else {
+        [ud setBool:YES forKey:key];
     }
     [ud synchronize];
-    mfLog(@"[f9] ⚡状态直写 %@ = %@ → %@", key, on ? @"YES/distantFuture" : @"remove", [[ud objectForKey:key] description]);
+    id after = [ud objectForKey:key];
+    mfLog(@"[f9] ⚡状态直写 %@ = %@ → %@ (落盘类型:%@)", key, on ? @"YES/distantFuture" : @"remove",
+          [after description], after ? NSStringFromClass([after class]) : @"nil");
     return 1;
 }
 
