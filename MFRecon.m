@@ -390,8 +390,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 uint32_t wBr   = *(const uint32_t *)((uintptr_t)a2 + 4 + (uintptr_t)slide);
                 // blr xN 前置(≤2 条): 判别前的 witness 间接调用
                 if ((wPrev & 0xFFFFFC1F) != 0xD63F0000) continue;
-                // cmp wN,#1 = 0x7100001F | (N<<5)
-                if ((wCmp & 0x7F1FFFFF) != 0x7100001F) continue;
+                // cmp wN,#1: opcode 固定位(31-22 + 4-0)比对, imm12(21-10)单查 #1
+                // v2.58.51: 旧掩码 0x7F1FFFFF 把 imm 位漏进比较 → 0x7100041F 判死 → 0 命中
+                if ((wCmp & 0x7F20001F) != 0x7100001F) continue;
+                if (((wCmp >> 10) & 0xFFF) != 1) continue;   // 只收 cmp wN,#1(verified tag)
                 // b.ne / b.eq = 0x54000000 | cond | imm19<<5
                 if ((wBr & 0xFF000010) != 0x54000000) continue;
                 uint32_t cond = wBr & 0xF;
