@@ -637,6 +637,7 @@ void mfShowNetworkCapturePage(void) {
 }
 // ====== 数据分析页（7 宫格——解密捕获已迁网络分析 v1.9.3） ======
 void mfShowDataAnalysisPage(void) {
+    mfSetWantH(340);   // v2.58.46: 3行网格 48+92*3=324 + 余量
     UIView *page = mfMakePage(@"数据分析", YES);
     CGFloat gw = (g_mfCardW - 32 - 12) / 2;
     CGFloat gy = 48;

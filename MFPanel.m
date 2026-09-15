@@ -15,7 +15,9 @@ CGFloat g_mfCardW = 0, g_mfCardH = 0;
 UIView *g_mfCardContentView = nil;  // card.contentView——子页挂这里
 UIView *g_mfHomePage = nil;         // 主页内容容器——push 子页时隐藏
 UIVisualEffectView *g_mfCardView = nil;  // 卡片引用——动态伸缩用
-CGFloat g_mfHomeCardH = 300;        // 主页卡片高度
+CGFloat g_mfHomeCardH = 240;        // 主页卡片内容高(v2.58.46: 2行网格自适应)
+static CGFloat g_mfWantH = 0;       // v2.58.46: 下一 push 页期望内容高度(0=默认拉满)
+static CGFloat g_mfBottomInset = 0; // v2.58.46: 底部安全区(Home Indicator)
 
 // ====== 日志 ======
 void mfLog(NSString *fmt, ...) {
@@ -94,11 +96,15 @@ extern void mfSaveRules(void);
 extern void mfAddRule(NSString *pattern, NSString *matchType, NSString *action);
 
 // ====== 页面导航 ======
+// v2.58.46: 自适应高度 — 页面在 mfMakePage 前调 mfSetWantH(h) 声明内容高度
+void mfSetWantH(CGFloat h) { g_mfWantH = h; }
+
 UIView *mfMakePage(NSString *title, BOOL showBack) {
-    // 子页统一拉长卡片（主页不经过这里）
+    // 子页高度: mfSetWantH 声明过 → 自适应; 否则拉满(表驱动页)
     if (g_mfPanelOverlay) {
         CGFloat maxH = MIN(560, g_mfPanelOverlay.bounds.size.height - 100);
-        if (g_mfCardH < maxH) mfSetCardHeight(maxH);
+        CGFloat want = g_mfWantH > 0 ? MIN(g_mfWantH, maxH) : maxH;
+        if (fabs(g_mfCardH - want) > 1) mfSetCardHeight(want);
     }
     UIView *page = [[UIView alloc] initWithFrame:CGRectMake(0, 0, g_mfCardW, g_mfCardH)];
     page.backgroundColor = [UIColor clearColor];
@@ -134,7 +140,11 @@ void mfToast(NSString *msg) {
         for (UIWindow *w in [UIApplication sharedApplication].windows)
             if (w.isKeyWindow) { win = w; break; }
         if (!win) return;
-        UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(20, win.bounds.size.height - 160, win.bounds.size.width - 40, 40)];
+        // v2.58.46: 底部卡片会挡住原位置 — 动态上移(面板开=卡高+60, 关=屏底-160)
+        CGFloat toastY = win.bounds.size.height - 160;
+        if (g_mfPanelOverlay && g_mfCardView)
+            toastY = win.bounds.size.height - g_mfCardView.frame.size.height - 64;
+        UILabel *lb = [[UILabel alloc] initWithFrame:CGRectMake(20, toastY, win.bounds.size.width - 40, 40)];
         lb.text = msg;
         lb.font = [UIFont boldSystemFontOfSize:14];
         lb.textAlignment = NSTextAlignmentCenter;
@@ -160,12 +170,14 @@ void mfSetCardHeight(CGFloat h) {
     if (!g_mfCardView || !g_mfPanelOverlay) return;
     CGRect sb = g_mfPanelOverlay.bounds;
     CGRect f = g_mfCardView.frame;
-    f.size.height = h;
-    f.origin.y = (sb.size.height - h) / 2;
-    g_mfCardView.frame = f;
+    f.size.height = h + g_mfBottomInset;
+    f.origin.y = sb.size.height - f.size.height;   // 底部贴边
+    [UIView animateWithDuration:0.25 animations:^{
+        g_mfCardView.frame = f;
+    }];
     g_mfCardH = h;
     g_mfCardContentView.frame = CGRectMake(0, 0, f.size.width, h);
-    mfLog(@"card height -> %.0f", h);
+    mfLog(@"card height -> %.0f (bottom sheet)", h);
 }
 
 void mfPushPage(UIView *page) {
@@ -173,12 +185,17 @@ void mfPushPage(UIView *page) {
     // 隐藏主页和所有已存在子页
     if (g_mfHomePage) g_mfHomePage.hidden = YES;
     for (UIView *p in g_mfPages) p.hidden = YES;
-    // 子页自动拉长卡片（最高 560 或屏高-100）
-    if (g_mfPanelOverlay) {
+    // v2.58.46: 页面自适应高度 — 若调用方在 mfMakePage 之后才算出高度(如 lab 页 apY),
+    //   在此处落地; 已在 mfMakePage 里应用的则等值跳过
+    if (g_mfWantH > 0) {
         CGFloat maxH = MIN(560, g_mfPanelOverlay.bounds.size.height - 100);
-        if (g_mfCardH < maxH) mfSetCardHeight(maxH);
+        CGFloat want = MIN(g_mfWantH, maxH);
+        if (fabs(g_mfCardH - want) > 1) mfSetCardHeight(want);
+        g_mfWantH = 0;
     }
     page.frame = CGRectMake(0, 0, g_mfCardW, g_mfCardH);
+    // 记住本页高度——pop 回上一页时恢复
+    objc_setAssociatedObject(page, "mfPageH", @(g_mfCardH), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIView *container = g_mfCardContentView ?: g_mfPanelOverlay;
     [container addSubview:page];
     [g_mfPages addObject:page];
@@ -190,8 +207,11 @@ void mfPopPage(void) {
     [top removeFromSuperview];
     [g_mfPages removeLastObject];
     if (g_mfPages.count > 0) {
-        [[g_mfPages lastObject] setHidden:NO];
-        // 子页还在——保持拉长
+        UIView *prev = [g_mfPages lastObject];
+        prev.hidden = NO;
+        // v2.58.46: 恢复上一页自己的高度(不再是统一拉长)
+        NSNumber *ph = objc_getAssociatedObject(prev, "mfPageH");
+        if (ph) mfSetCardHeight([ph doubleValue]);
     } else if (g_mfHomePage) {
         g_mfHomePage.hidden = NO;
         // 回主页——恢复紧凑高度
@@ -203,7 +223,15 @@ void mfPopPage(void) {
 void mfClosePanel(void) {
     if (g_mfPanelOverlay) {
         UIView *ov = g_mfPanelOverlay;
-        [UIView animateWithDuration:0.2 animations:^{ ov.alpha = 0; } completion:^(BOOL f) {
+        UIView *cv = g_mfCardView;
+        CGRect end = cv ? cv.frame : CGRectZero;
+        end.origin.y = ov.bounds.size.height;   // 滑出屏幕底部
+        [UIView animateWithDuration:0.22 animations:^{
+            ov.alpha = 0;
+            if (cv) cv.frame = end;
+        } completion:^(BOOL f) {
+            [[NSNotificationCenter defaultCenter] removeObserver:g_mfCtrl name:UIKeyboardWillShowNotification object:nil];
+            [[NSNotificationCenter defaultCenter] removeObserver:g_mfCtrl name:UIKeyboardWillHideNotification object:nil];
             [ov removeFromSuperview];
             g_mfPanelWindow.hidden = YES; // v2.6.2
             g_mfPanelOverlay = nil;
@@ -1413,6 +1441,7 @@ void mfShowScanPage(void) {
 
 // 手动购买页
 void mfShowManualBuyPage(void) {
+    mfSetWantH(244);   // v2.58.46: 内容到 224 + 底部余量
     UIView *page = mfMakePage(@"手动购买", YES);
     UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(16, 56, g_mfCardW - 32, 42)];
     tf.borderStyle = UITextBorderStyleRoundedRect;
@@ -1446,10 +1475,17 @@ void mfShowManualBuyPage(void) {
 
 // 图标解锁页
 void mfShowIconPage(void) {
-    UIView *page = mfMakePage(@"图标解锁", YES);
     NSDictionary *info = [[NSBundle mainBundle] infoDictionary];
     NSDictionary *alt = info[@"CFBundleIcons"][@"CFBundleAlternateIcons"];
     NSArray *names = [alt allKeys];
+    // v2.58.46: 自适应高度 — 行数按图标数算
+    if (names.count > 0) {
+        NSInteger rows = (names.count + 1) / 2;
+        mfSetWantH(42 + rows * 62 + 26);
+    } else {
+        mfSetWantH(160);   // 空态只有一行提示
+    }
+    UIView *page = mfMakePage(@"图标解锁", YES);
     UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 42, g_mfCardW, g_mfCardH - 42)];
     if (names.count == 0) {
         UILabel *e = [[UILabel alloc] initWithFrame:CGRectMake(16, 60, g_mfCardW - 32, 40)];
@@ -1479,6 +1515,7 @@ void mfShowIconPage(void) {
 
 // Product 子页
 void mfShowProductPage(void) {
+    mfSetWantH(244);   // v2.58.46: 2行网格 48+92*2=232 + 余量
     UIView *page = mfMakePage(@"Product", YES);
     CGFloat gw = (g_mfCardW - 32 - 12) / 2;
     CGFloat gy = 48;
@@ -1573,6 +1610,8 @@ void mfShowLabPage(void) {
     extern void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio);
     mfAppPatchSectionInLabPage(page, &apY);
 
+    // v2.58.46: 自适应高度 — 实验页内容到 apY 为止, 不空占整屏
+    mfSetWantH(apY + 20);
     mfPushPage(page);
 }
 
@@ -1582,6 +1621,27 @@ void mfShowLabPage(void) {
 @implementation MFPanelCtrl
 - (void)mfPopPage { mfPopPage(); }
 - (void)mfClosePanel { mfClosePanel(); }
+// v2.58.46: 键盘避让 — 底部卡片会被键盘遮住(居中卡片无此问题)
+- (void)mfKbWillShow:(NSNotification *)n {
+    if (!g_mfCardView || !g_mfPanelOverlay) return;
+    CGRect kf = [n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGFloat kbTop = kf.origin.y;
+    CGFloat cardBottom = g_mfCardView.frame.origin.y + g_mfCardView.frame.size.height;
+    if (kbTop >= cardBottom) return;
+    [UIView animateWithDuration:0.25 animations:^{
+        CGRect f = g_mfCardView.frame;
+        f.origin.y = kbTop - f.size.height;
+        g_mfCardView.frame = f;
+    }];
+}
+- (void)mfKbWillHide:(NSNotification *)n {
+    if (!g_mfCardView || !g_mfPanelOverlay) return;
+    [UIView animateWithDuration:0.25 animations:^{
+        CGRect f = g_mfCardView.frame;
+        f.origin.y = g_mfPanelOverlay.bounds.size.height - f.size.height;
+        g_mfCardView.frame = f;
+    }];
+}
 
 
 // 页面入口
@@ -2131,9 +2191,12 @@ static void iaphShowPanel(UIViewController *vc) {
         mfLog(@"PANEL STEP 2: keyWin=%@", keyWin);
 
         CGRect sb = keyWin.bounds;
+        // v2.58.46: 底部安全区(Home Indicator)——卡片内容下沿留白
+        g_mfBottomInset = 0;
+        if (@available(iOS 11.0, *)) g_mfBottomInset = keyWin.safeAreaInsets.bottom;
         UIView *overlay = [[UIView alloc] initWithFrame:sb];
         overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        mfLog(@"PANEL STEP 3: overlay created");
+        mfLog(@"PANEL STEP 3: overlay created (bottomInset=%.0f)", g_mfBottomInset);
 
         UIButton *mask = [UIButton buttonWithType:UIButtonTypeCustom];
         mask.frame = overlay.bounds;
@@ -2143,18 +2206,20 @@ static void iaphShowPanel(UIViewController *vc) {
         [overlay addSubview:mask];
         mfLog(@"PANEL STEP 4: mask added");
 
-        CGFloat cardW = sb.size.width - 32;
-        CGFloat cardH = 300;  // 主页紧凑——子页 push 时自动拉长
+        CGFloat cardW = sb.size.width;
+        CGFloat cardH = 232;  // 主页内容高(2行网格)——子页自适应
         g_mfCardW = cardW; g_mfCardH = cardH;
         g_mfHomeCardH = cardH;
-        UIVisualEffectView *card = [[UIVisualEffectView alloc] initWithFrame:CGRectMake(16, (sb.size.height - cardH)/2, cardW, cardH)];
+        UIVisualEffectView *card = [[UIVisualEffectView alloc] initWithFrame:CGRectMake(0, sb.size.height, cardW, cardH + g_mfBottomInset)];
         card.effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial];
         card.layer.cornerRadius = 22;
+        // v2.58.46: 只圆上两角(底部贴边)
+        card.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
         card.clipsToBounds = YES;
         g_mfCardView = card;
         UIView *content = card.contentView;
         g_mfCardContentView = content;
-        mfLog(@"PANEL STEP 5: card created");
+        mfLog(@"PANEL STEP 5: bottom card created");
 
         // 主页内容容器——push 子页时隐藏它
         UIView *home = [[UIView alloc] initWithFrame:content.bounds];
@@ -2162,13 +2227,19 @@ static void iaphShowPanel(UIViewController *vc) {
         [content addSubview:home];
         g_mfHomePage = home;
 
-        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 12, 200, 26)];
+        // v2.58.46: 顶部把手(拖动指示器) — 挂在主页上, 子页有自己的标题栏
+        UIView *grabber = [[UIView alloc] initWithFrame:CGRectMake((cardW - 36)/2, 7, 36, 5)];
+        grabber.backgroundColor = [UIColor tertiaryLabelColor];
+        grabber.layer.cornerRadius = 2.5;
+        [home addSubview:grabber];
+
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 20, 200, 26)];
         title.text = @"IAP工具箱";
         title.font = [UIFont boldSystemFontOfSize:18];
         title.textColor = [UIColor labelColor];
         [home addSubview:title];
         UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        closeBtn.frame = CGRectMake(cardW - 44, 10, 32, 32);
+        closeBtn.frame = CGRectMake(cardW - 44, 18, 32, 32);
         [closeBtn setTitle:@"✕" forState:UIControlStateNormal];
         closeBtn.titleLabel.font = [UIFont systemFontOfSize:17];
         [closeBtn addTarget:g_mfCtrl action:NSSelectorFromString(@"mfClosePanel") forControlEvents:UIControlEventTouchUpInside];
@@ -2192,6 +2263,10 @@ static void iaphShowPanel(UIViewController *vc) {
         g_mfPanelRootVC = vc;
         mfLog(@"PANEL STEP 8: overlay stored, g_mfCtrl=%p g_mfPanelOverlay=%p", g_mfCtrl, g_mfPanelOverlay);
 
+        // v2.58.46: 键盘避让通知(手动购买等输入页)
+        [[NSNotificationCenter defaultCenter] addObserver:g_mfCtrl selector:@selector(mfKbWillShow:) name:UIKeyboardWillShowNotification object:nil];
+        [[NSNotificationCenter defaultCenter] addObserver:g_mfCtrl selector:@selector(mfKbWillHide:) name:UIKeyboardWillHideNotification object:nil];
+
         // v2.6.2: 独立 UIWindow——彻底解决 Telegram 等复杂 window 层级的触摸穿透
         {
             UIWindowScene *panelScene = keyWin.windowScene;
@@ -2208,8 +2283,14 @@ static void iaphShowPanel(UIViewController *vc) {
         mfLog(@"PANEL STEP 9: standalone UIWindow level=%.0f", g_mfPanelWindow.windowLevel);
 
         overlay.alpha = 0;
-        [UIView animateWithDuration:0.25 animations:^{ overlay.alpha = 1; }];
-        mfLog(@"PANEL STEP 10: animation started — DONE");
+        // v2.58.46: 底部滑入动画 — 卡片从屏幕下沿滑进, 遮罩同步淡入
+        CGRect restFrame = card.frame;
+        restFrame.origin.y = sb.size.height - restFrame.size.height;
+        [UIView animateWithDuration:0.28 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+            overlay.alpha = 1;
+            card.frame = restFrame;
+        } completion:nil];
+        mfLog(@"PANEL STEP 10: slide-up animation started — DONE");
     } @catch (NSException *e) {
         mfLog(@"PANEL EXCEPTION: %@ %@\n%@", e.name, e.reason, e.callStackSymbols);
     }

@@ -19,6 +19,7 @@ extern UIView *g_mfHomePage;
 extern UIVisualEffectView *g_mfCardView;
 extern CGFloat g_mfHomeCardH;
 void mfSetCardHeight(CGFloat h);
+void mfSetWantH(CGFloat h);        // v2.58.46: 自适应卡高——mfMakePage 前声明内容高度
 
 // ====== 轻提示 ======
 void mfToast(NSString *msg);

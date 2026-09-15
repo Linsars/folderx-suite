@@ -5,6 +5,7 @@
 #pragma mark - 页面
 
 void mfShowNetAnalyzerPage(void) {
+    mfSetWantH(244);   // v2.58.46: 内容到 226 + 余量
     UIView *page = mfMakePage(@"🌐 网络分析", YES);
     CGFloat gw = g_mfCardW - 32;
 
