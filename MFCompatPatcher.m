@@ -377,7 +377,7 @@ typedef SEL (*mfSelRegT)(const char *);
 typedef BOOL (*mfAddMethodT)(id, SEL, IMP, const char *);
 typedef void *(*mfGetInstMethodT)(void *, void *);   // Method 返回值绝不声明 id: ARC 会插入 objc_retain 打死非对象指针
 typedef IMP (*mfSetImpT)(Method, IMP);
-// v2.53: 标本通用化扩展(Reflix 授权体系同款符号)
+// v2.53: 标本通用化扩展(同款授权体系符号)
 typedef void *(*mfDlsymT)(void *, const char *);
 typedef int (*mfVmProtectT)(void *, unsigned long, unsigned long, int, int);
 typedef int (*mfSysctlT)(const char *, void *, unsigned long *, void *, unsigned long);
@@ -490,7 +490,7 @@ static boolean_t mfMachAuthDemux(mach_msg_header_t *in, mach_msg_header_t *out) 
 }
 // v2.56.12 错误修正：t_dlsym 双拦截(mach_msg_server)阻止样本起许可服务器。
 // 样本本身就是授权组件，样本挂上=亮(样本自己判定)。我们的 hook 反而干扰样本。
-// 本版恢复透传(让样本自己跑)，并逆向 ScriptingPass.dylib 确定 keychain 条目格式。
+// 本版恢复透传(让样本自己跑)，并逆向样本 dylib 确定 keychain 条目格式。
 static int (*g_realSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 static int mfObsKeychainN = 0;
 // 透传: 让样本自己跑(样本挂上=亮)。记录真实条目(若存在)。
@@ -632,10 +632,9 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
         if ((const struct mach_header_64 *)_dyld_get_image_header(i) != m64) continue;
         const char *nm = _dyld_get_image_name(i);
         // v2.55.2: 标本路径匹配通用化——观察目录内任意 dylib 都算(不再硬编码旧路径/文件名)。
-        //   旧判断只认 FixCrash.dylib / ScriptingPass.dylib / "MinisFix/" 段,
+        //   旧判断只认若干固定 dylib 名 / "MinisFix/" 段,
         //   而 v2.55 后标本在 /var/jb/var/mobile/minisfix/ 下(路径 minisfix/ 无 MinisFix/ 大写段) → 匹配失败。
-        if (nm && (strstr(nm, "FixCrash.dylib") || strstr(nm, "ScriptingPass.dylib")
-                   || strstr(nm, "minisfix/") || strstr(nm, "MinisFix/") || strstr(nm, "minisfix"))) ours = YES;
+        if (nm && (strstr(nm, "minisfix/") || strstr(nm, "MinisFix/") || strstr(nm, "minisfix"))) ours = YES;
         break;
     }
     if (!ours) return;
@@ -653,7 +652,7 @@ static void mfXrayAddImage(const struct mach_header *mh, intptr_t slide) {
         {"_class_addMethod",           (void **)&o_addMethod,      (void *)t_addMethod},
         {"_class_getInstanceMethod",   (void **)&o_getInstMethod,  (void *)t_getInstMethod},
         {"_method_setImplementation",  (void **)&o_setImp,         (void *)t_setImp},
-        // v2.53: 授权体系观测(Reflix 同款架构——mach 服务器/补丁/指纹/拉件)
+        // v2.53: 授权体系观测(同款架构——mach 服务器/补丁/指纹/拉件)
         {"_dlsym",                     (void **)&o_dlsym,          (void *)t_dlsym},
         {"_vm_protect",                (void **)&o_vmProtect,      (void *)t_vmProtect},
         {"_sysctlbyname",              (void **)&o_sysctl,         (void *)t_sysctl},

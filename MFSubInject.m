@@ -4,7 +4,7 @@
 // 商品 ID 来自 SK1 扫描列表(SavedIAPIDs), 无 per-app 硬编码
 // schema 来源: Reven 网关实测(2026-08-31) + SatellaJailed ServerVerificationHooks
 // v2.18.0 (Reven 逆向回流, 2026-09-02 实测):
-//   1. entitlement 名自动发现——硬编码 "pro" 是盲区(Reflix 用 com.magicgroot.reflix.entitlements)
+//   1. entitlement 名自动发现——硬编码 "pro" 是盲区(实测目标用反向域名式 entitlement 名)
 //      来源①: RC SDK NSUserDefaults 缓存 com.revenuecat.userdefaults.productEntitlementMapping
 //      来源②: 主二进制字符串扫 *.entitlements 后缀标识符
 //   2. lifetime 型产品进 non_subscriptions(RC 官方规范, Reven auto 策略同款), 不带 expires_date
@@ -246,7 +246,7 @@ static BOOL mfSubIsTarget(NSURL *u) {
     NSString *h = u.host.lowercaseString, *p = u.path ?: @"";
     if (mfSubIsRCHost(h)) {
         // v2.18.1: /offerings 是产品目录 + offline entitlements 映射(SDK5 SK2 模式靠它本地算 entitlements),
-        // 吞掉 = 目录加载报废 + 离线映射永不缓存 + 自家 mfprobe 扫描被打死(Reflix 实录), 只放行 subscribers GET 与 receipts POST
+        // 吞掉 = 目录加载报废 + 离线映射永不缓存 + 自家 mfprobe 扫描被打死(实测录), 只放行 subscribers GET 与 receipts POST
         if ([p containsString:@"/offerings"]) return NO;
         return [p containsString:@"/subscribers"] || [p hasSuffix:@"/receipts"];
     }
@@ -280,7 +280,7 @@ static NSArray *mfEntsFromRCCache(void) {
     return out;
 }
 
-// 来源②: 主二进制扫 "...entitlements" 标识符(Reflix 实测: com.magicgroot.reflix.entitlements)
+// 来源②: 主二进制扫 "...entitlements" 标识符(实测目标: <反向域名>.entitlements)
 static NSArray *mfEntsFromBinaryScan(void) {
     NSMutableArray *out = [NSMutableArray array];
     @try {

@@ -1,12 +1,12 @@
 // MFRecon.m — 内购模式一次性侦查(扫描时点指纹, 零 hook 零常驻, 纯读)
-// 判据 v2(2026-09-05 用户 Reflix 实测纠偏):
+// 判据 v2(2026-09-05 实测纠偏):
 //   云验证类   — RC/SW/Adapty 等订阅 SDK 品牌串/域名串/RC 缓存 → MFSubInject mock 直达
 //   mach 协议类 — ★ 判据收紧: 进程异常端口表里存在【独立 BREAKPOINT 条目】(mask==0x40
 //               且 beh==MACH_EXCEPTION_CODES|EXCEPTION_STATE 且 flv==ARM_THREAD_STATE64)
 //               = 伴侣 dylib 注册的本地许可服务器(2.38.4 实测指纹 mask=0x40 beh=-2147483646 flv=6)
 //   ✗ 已废弃 brk 大立即数判据 — 2.39.7 旧注释"app 查询=brk #0x965…"系误读, 终案实锤陷阱为
 //     vendor 运行时写入的常规 brk, 静态二进制无此指纹(用户实测 29639 brk 全编译器常规)
-//   ✗ 系统级 crash handler(mask 混合 0x104e/IDENTITY/flv5)不再误标 — Reflix 型必须是独立条目
+//   ✗ 系统级 crash handler(mask 混合 0x104e/IDENTITY/flv5)不再误标 — 目标型必须是独立条目
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -394,8 +394,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
     // =====================================================================
     {
         // v2.58.68: 词表驱动(用户纠偏: "都是 sk2 类型, 换个 app 就识别不对? 硬编码特征了?")
-        //   —— 旧版门 = 字面串 "Pro state changed"(只有 HostLog 有) → 换 app 整块死。
-        //   实测三样本: HostLog 1 命中 / WorkingCopy 0 / Uncover 0 —— 单串门 = 过度拟合。
+        //   —— 旧版门 = 单个字面串(只有特定 app 有) → 换 app 整块死。
+        //   实测三样本: 目标 1 命中 / 另两个 0 —— 单串门 = 过度拟合。
         //   改为: __cstring 扫"状态变更播报"语义族(oslog 记录状态翻转) → 取全部命中,
         //   逐个走同一条定位链。词表覆盖 pro/premium/unlock/entitle/subscri + state/changed。
         static const char *kProTagWords[] = { "pro state", "premium state", "unlock state",
@@ -602,7 +602,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 //   读侧才是 UI 真入口: 3 个 @Observable getter(ldrb w0,[xN,#0x10] 尾)
                 //   → 恒 true。由 UD 镜像 key 串定位确认偏移(防布局漂移)。
                 {
-                    // v2.58.68: UD 镜像 key 也去硬编码(旧版写死 "HostLog.entitlement.isPro.v1";
+                    // v2.58.68: UD 镜像 key 也去硬编码(旧版写死单个目标 key;
                     //   换 app 永远 0 命中)。改为通用: 扫"点分命名 + 权益语义族"的 key 串,
                     //   取命中数最多的族作布局锚(镜像 key 是 UI 读侧的真实 key)。
                     static const char *kProKeyWords[] = { "ispro", "entitle", "isvip", "premium",
@@ -897,7 +897,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         if (!dup && nSKFn < F8V3_MAXFN/2) skFn[nSKFn++] = skuFn[i2];
                     }
                     (void)nSK;
-                    // v2.58.33: idxOf 改二分 — mf_debug_33 定谳: gooby 语义函数 192 个,
+                    // v2.58.33: idxOf 改二分 — 实测定谳: 语义函数 192 个,
                     // S∪K bl 扫里每条 bl 都 idxOf(t2) O(nFn=4096) 线性搜 → 4万 bl × 4096
                     // ≈ 1.7亿比较, 侦查卡死在"语义引用函数=192"行后(与 2.58.31 停点相同 —
                     // 形态分类修了, W 展开段的 idxOf 是下一个 O(N×M) 炸弹)。
@@ -988,7 +988,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     // ldur xN,[x0,#-8](指针消费) — 双信号定返回类型。
                     // (占位行已删 — 分类逻辑在第二遍统一做)
                     // v2.58.19 单遍: 门控(fan≥2 或 fan≥1+bool)+形态分类+输出
-                    // v2.58.32: 调用侧形态(ptr/bool)反转循环 — mf_debug_32 定谳: gooby
+                    // v2.58.32: 调用侧形态(ptr/bool)反转循环 — 实测定谳:
                     // 语义引用函数=192(大小写修复后大 app 真实规模) → nAcc 池 256 满 →
                     // 旧"每候选独立全 text 扫 bl 调用点" = 256×textSize/4 ≈ 2.5亿迭代,
                     // 主线程分钟级卡死, 侦查页 4 次全停在同一日志行。改单次全扫+查表,
@@ -1046,7 +1046,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         // 旧门 fan≥2 || shape=bool 在 Swift 上 = 基础库 helper 全中(String
                         // 格式化/enum accessor 被 S 集共享), 真 oracle 1~3 个。
                         // 新门(从严): ptr 杀; (fan≥2 && bool) 收; 尾and 收; 其余杀。
-                        // v2.58.34: fan>500 拦 — mf_debug_34 gooby 崩溃定谳(ips: Firebase
+                        // v2.58.34: fan>500 拦 — 实测崩溃定谳(ips: Firebase
                         // worker 线程 _SwiftDeferredNSDictionary 桥接 ldur[x0-8] 解引用
                         // 0xfff...f9 = ptr 型被 mov w0,#1): 192 语义函数大池把 String 桥接/
                         // 格式化 helper 全放进门(fan=13674/2381), 真 oracle 的 fan 天花
@@ -1167,7 +1167,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         }
                     }
                     // ============================================================
-                    // v2.58.40: F10 深槽字段装载链(静态可行已三样本实证 — gooby 真目标
+                    // v2.58.40: F10 深槽字段装载链(静态可行已三样本实证 — 真目标
                     // 0x14211bc 回归命中, Blink×3 构建逐点恒差-8 对齐, 61→3 收敛零噪声)。
                     // 算法(deepslot_fast.py 同款):
                     //   L1 深槽ldur→str[reg]: LDUR Xt,[x29,#-imm9] imm9∈[0xC0,0x180)
@@ -1175,7 +1175,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     //       + 后4条内 STR Xt,[Xn,Xm] reg-offset ((w>>22)==0x3E0)
                     //   L2 宿主函数的 bl caller ∈ 语义函数 + 闭包归并(caller 段无词表串
                     //       时 0x8000 内向外层函数头回溯 — Swift async 闭包 outline 假头,
-                    //       gooby 0x11d4af4→0x11d2980 实锤)
+                    //       实测: 闭包假头→外层语义函数 归并)
                     //   L3 caller bl 前 0x30 内 LDRSW ((w>>22)==0x2E6) 反射 witness 装载
                     // 语义串词表(RC 型): 与 F8v3 共用 cstring 扫, 深槽专属词表补
                     //   customerinfo/receipt/verific/licens(F8v3 词表无这四个)
@@ -1349,7 +1349,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                         if (cf) break;
                                     }
                                     if (!cf) continue;
-                                    // 语义判定 + 闭包归并(0x8000 总跨度内向外层回溯, 深 32 层 — gooby 大函数夹 10 假头, 8 层不够)
+                                    // 语义判定 + 闭包归并(0x8000 总跨度内向外层回溯, 深 32 层 — 大函数夹 10 假头, 8 层不够)
                                     BOOL sem = NO;
                                     uint64_t cf2 = cf;
                                     for (int depth = 0; depth < 32 && !sem; depth++) {
@@ -1487,7 +1487,7 @@ NSDictionary *mfReconFingerprint(void) {
     // ---- F1.5 Xray 采集残留(CompatPatcher 观察机若在本 app 采集过标本, 其授权形态可直接引用) ----
     {
         // v2.53.5: 侦查卡↔Xray 联动——读沙盒 mfcompat_xray.log 的 SUMMARY 行
-        // mach=1 说明有本地许可服务器在场(Reflix/ScriptingPass 型); vmprot=1 说明有内联补丁动作
+        // mach=1 说明有本地许可服务器在场(样本型); vmprot=1 说明有内联补丁动作
         NSString *home = NSHomeDirectory();
         NSString *xp = [home stringByAppendingPathComponent:@"Documents/mfcompat_xray.log"];
         NSString *xd = [NSString stringWithContentsOfFile:xp encoding:NSUTF8StringEncoding error:nil];
@@ -1522,7 +1522,7 @@ NSDictionary *mfReconFingerprint(void) {
             for (mach_msg_type_number_t i = 0; i < cnt; i++) {
                 if (ports[i] == MACH_PORT_NULL) continue;
                 found = YES;
-                // Reflix 型强指纹: 独立 BREAKPOINT 条目 + MACH_EXCEPTION_CODES|EXCEPTION_STATE + ARM_THREAD_STATE64
+                // 目标型强指纹: 独立 BREAKPOINT 条目 + MACH_EXCEPTION_CODES|EXCEPTION_STATE + ARM_THREAD_STATE64
                 if (g_mitmMyPort != MACH_PORT_NULL && ports[i] == g_mitmMyPort) {
                     [lines addObject:@"EXCPORTS: 自家 EXCPROBE 端口(本插件侦查系统自身), 已剔除"];
                     continue;
@@ -1538,7 +1538,7 @@ NSDictionary *mfReconFingerprint(void) {
             }
             if (!found) [lines addObject:@"EXCPORTS: 全空(无异常端口注册者)"];
         }
-        // v2.58 定位修正(用户判定): EXCPORTS=检测"别家 mach 许可服务器"的观察判据(样本/Reflix 型),
+        // v2.58 定位修正(用户判定): EXCPORTS=检测"别家 mach 许可服务器"的观察判据(样本型),
         //   不是本插件 patch 流程的一环 — 只在 mach 命中时作为旁证输出, 不再当主判定展示。
     }
 
@@ -1755,7 +1755,7 @@ NSDictionary *mfReconFingerprint(void) {
             stateKeys = mfStateProbeKeys();          // 采集(函数级变量, 局部接住教训仍守: 不在参数位内联)
             mfStateReconCacheSet(stateKeys);                  // F9 卡片吃缓存, 不再独立扫
             // v2.58.35: 状态型判定升级 — 仅静态命中(全是 __cstring 里的死串)不算状态型:
-            //   Reflix 76 key 全静态(i18n 文案 key/类名/埋点 key 过词表门), 判"状态型"
+            //   76 key 全静态(i18n 文案 key/类名/埋点 key 过词表门), 判"状态型"
             //   与第一行 RC 云验证自相矛盾。实存 key(app 自己写过/读过的)才是 app 真在
             //   用的状态位。静态候选只作 F9 的"可试探"展示, 不再撑判定。
             NSUInteger liveKeys = 0;
@@ -1774,7 +1774,7 @@ NSDictionary *mfReconFingerprint(void) {
             // v2.58.9 F8v2: strip 主二进制兜底 — 符号表无判定函数时走 chained fixups 链
             // (imports→SK 词表→bind→GOT slot→stubs→bl 调用点→prologue 归属), 点位合成 @0x 名
             // v2.58.21: 不再被 F9 else 掐死 — 双路并报(状态型与代码型可并存)
-            // v2.58.36: 云验证型降权 — mf_debug_38 实锤: gooby(RC 云验证型)12 个 F8v2
+            // v2.58.36: 云验证型降权 — 实测: RC 云验证型 app 12 个 F8v2
             //   swifttext 点位⚡后购买页崩(ips: String.init(localized:) @Observable 渲染,
             //   被patch函数返回对象非Bool, mov w0,#1 → 调用方当指针解 → SIGSEGV)。
             //   云SDK在场 = 判定本体在云端回包, F8 点位对这类 app 无意义还高危 —
@@ -1793,7 +1793,7 @@ NSDictionary *mfReconFingerprint(void) {
             // v2.58.55: SK2 流型(非云)抑制 F8v2 swifttext 点位 — mf_debug_58 用户拍板:
             //   "侦查详情页都给出那么详细的判决了, 为什么还要把不相干的点位传到实验
             //   模拟页?" — 判型已定 SK2 流型时, F8 getter 点位是噪声不入库; 云型 F10
-            //   deepslot 仍保留(gooby 双因子实锤)。
+            //   deepslot 仍保留(双因子实测)。
             if (sk2LocalType) {
                 // 抑制 F8 点位: 不 merge 不显示 — lines 只报 SK2 路线
                 [lines addObject:@"F8v2 swifttext 候选: 该 app 已有 isPro 指令级点位, 函数符号候选未入库"];
@@ -1827,7 +1827,7 @@ NSDictionary *mfReconFingerprint(void) {
             } else [lines addObject:@"entitlement 判定点位: 未发现(框架无符号判定函数, 主二进制 fixups 链无 SK 消费候选)"];
             }
 
-    // ---- 判定(动态拼接, 可叠加: Reflix = 云+mach 双面) ----
+    // ---- 判定(动态拼接, 可叠加: 云+mach 双面) ----
     BOOL cloud = cloudBrands.count > 0;
     // v2.58.65: sk2stream 概念废除(sk2ver 判别点=死代码已删) — 留变量仅为 return 兼容
     //   (恒 NO)。判型优先级: 云 > mach > 服务器 > 状态型/代码判定点。
@@ -1837,7 +1837,7 @@ NSDictionary *mfReconFingerprint(void) {
     //   类型)。verdict 云分支前置, 状态型只作 lines 里的辅助线索(实存 key 才标注)。
     BOOL stateType = NO;
     {
-        // 状态型 = 无云无 mach + 实存语义 key 数量 ≥2(静态死串不算, Reflix 76 假案定谳)
+        // 状态型 = 无云无 mach + 实存语义 key 数量 ≥2(静态死串不算, 76 假案定谳)
         // v2.58.50: SK2 流型在场时状态 key 是镜像 — 降级为线索, 不判状态型
         if (!cloud && !mach && !sk2stream) {
             NSUInteger live = 0;
@@ -1868,7 +1868,7 @@ NSDictionary *mfReconFingerprint(void) {
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
-    else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, Reflix/ScriptingPass 同族) — EXCPROBE 应答器可复刻";
+    else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, 同族架构)";
     // v2.58.65: "SK2 事务流验证型"判型已废(用户定案: 实机三轮零作用=死代码)
     else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
     // v2.58.65: 指令级代码判定点优先播报 — mf_debug_68 用户定案: 真正解锁的是
@@ -2023,7 +2023,7 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
         [page addSubview:lab];
         btnY += 44;
     } else if ([recon[@"mach"] boolValue]) {
-        // v2.54.0: mach 型(本地许可服务器, Reflix/ScriptingPass 同族) → 引导去开 EXCPROBE 应答器
+        // v2.54.0: mach 型(本地许可服务器, 同族) → 引导去开 EXCPROBE 应答器
         UIButton *exc = [UIButton buttonWithType:UIButtonTypeSystem];
         exc.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
         exc.backgroundColor = [UIColor systemPurpleColor];

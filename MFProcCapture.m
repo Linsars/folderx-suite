@@ -1,6 +1,6 @@
 // MFProcCapture.m — 第二拳·点位采集器 (被动, 零 hook)
 // 层1 内存差分: ctor 快照主二进制 __TEXT/__DATA_CONST/__DATA, 2s diff — 抓直接写内存的 patch
-// 层2 ObjC imp 巡检: 枚举全部类方法表, imp 落在 ReflixPatch dylib 镜像内 = 它 swizzle 的点
+// 层2 ObjC imp 巡检: 枚举全部类方法表, imp 落在目标 dylib 镜像内 = 它 swizzle 的点
 //     (实测教训: dylib 不写主二进制段 — 它是 NSInvocation+method_getImplementation 型 swizzle,
 //      目标 selector 运行时解密, 但 objc 运行时表是明文, 类名/selector 直出)
 // 产出: mfcap_*.json + hostlog 每事件一行
@@ -812,9 +812,19 @@ static void mfCapTapVendorDylib(void) {
     mfLog(@"[capture] vendor-dylib tap v2: %d (vm_protect=%p msgSend=%p)", r, g_vOrigVMProtect, g_vOrigMsgSendPtr);
 }
 
-static NSString *const kCapBID = @"com.magicgroot.gooby";
+// v2.58.69: kCapBID 死代码已删(定义后从未引用, 且是单 app 硬编码)
 static NSString *const kCapVersion = @"3.0.5";
-static NSString *const kCapDylib = @"/var/jb/usr/lib/MinisFix/ReflixPatch-3.0.5.dylib";
+// v2.58.69: 去硬编码 — 旧版写死单个 vendor dylib 路径(该 dylib 已在 2.46.0 永久摘除,
+//   是死引用)。改为 pref 驱动 + 中性默认路径: 观察目录下的待捕获 dylib。
+static NSString *mfCapDylibPath(void) {
+    // mfReadPrefObj 是 MFAppPatch.m 的 static — 这里直接读同一 plist(同一偏好域)
+    NSDictionary *pd = [NSDictionary dictionaryWithContentsOfFile:
+        @"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"];
+    id v = pd[@"mfCaptureDylibPath"];
+    if ([v isKindOfClass:[NSString class]] && [v length]) return v;
+    return @"/var/jb/usr/lib/MinisFix/sample.dylib";
+}
+#define kCapDylib mfCapDylibPath()
 static const NSTimeInterval kCapPollSec = 0.5;   // v2.27.1: 2s→0.5s 逮瞬时 swizzle
 static const uint32_t kCapMaxEvents = 256;
 
@@ -939,7 +949,7 @@ static void mf_setObjHook(id self, SEL _cmd, id value, NSString *key) {
     if (key && g_capCount6 < 40) {
         NSString *k = key.lowercaseString;
         if ([k containsString:@"revenuecat"] || [k containsString:@"entitlement"]
-            || [k containsString:@"customer"] || [k containsString:@"reflix"]
+            || [k containsString:@"customer"]
             || [k containsString:@"purchases"] || [k containsString:@"subscri"]) {
             @try {
                 NSString *vs = [value description];
@@ -968,7 +978,7 @@ static void mfCapScanMainBinary(void) {
         if (!d) return;
         const uint8_t *p = d.bytes;
         NSUInteger n = d.length;
-        const char *pats[] = {"ReflixPatch", "MinisFix", "/var/jb", "proAccessOverride"};
+        const char *pats[] = {"minisfix", "MinisFix", "/var/jb", "sample.dylib"};
         for (int i = 0; i < 4; i++) {
             size_t pl = strlen(pats[i]);
             const uint8_t *hit = NULL;
@@ -1116,7 +1126,7 @@ static void mfCapBuildImpBaseline(void) {
 static void mfCapLocateDylib(void) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
         const char *nm = _dyld_get_image_name(i);
-        if (nm && strstr(nm, "ReflixPatch")) {
+        if (nm && (strstr(nm, "minisfix/") || strstr(nm, "MinisFix/") || strstr(nm, "minisfix"))) {
             const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(i);
             if (h && h->magic == MH_MAGIC_64) {
                 // load commands 求 __LINKEDIT 段末 = 镜像 vm 范围
@@ -1150,7 +1160,7 @@ static void mf_vendorAddImageCB(const struct mach_header *h, intptr_t slide) {
         for (uint32_t i = 0; i < _dyld_image_count(); i++) {
             if ((const void *)_dyld_get_image_header(i) == (const void *)h) { nm = _dyld_get_image_name(i); break; }
         }
-        if (!nm || !strstr(nm, "ReflixPatch")) return;
+        if (!nm || !(strstr(nm, "minisfix/") || strstr(nm, "MinisFix/") || strstr(nm, "minisfix"))) return;
         const struct mach_header_64 *mh = (const struct mach_header_64 *)h;
         if (mh->magic != MH_MAGIC_64) return;
         g_capDylibBase = (uint8_t *)h;
@@ -1209,7 +1219,7 @@ void mfProcCaptureStart(void) {
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     NSString *ver = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
     // v2.54.4: 止损——mach tap(mach_msg rebind)对任意 app 是高侵入(全 iOS 系统通信走 mach_msg,
-    //   rebind 后 Scripting 崩, Reflix 战役 2.29.0 也踩过同样坑: NSInvocation tap 碰系统 selector 启动崩)。
+    //   rebind 后曾致目标崩, 历史战役也踩过同样坑: NSInvocation tap 碰系统 selector 启动崩)。
     //   mach tap 只对 mfCompatAppList(用户勾选的明确观察目标)装, 不对 mfIsEnabledForCurrentApp 的所有 app 装。
     //   记录当前 app 是否在兼容列表(mach tap + EXCPROBE 观察共用)。
     NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"] ?: @{};
@@ -1227,19 +1237,9 @@ void mfProcCaptureStart(void) {
     mfLog(@"[capture] EXCPROBE armed (mfCompatAppList, bid=%@ ver=%@)", bid, ver);
     mfExcArm();   // v2.54.1: 提取的武装函数——ctor 时也武装(内部自己看 mfExcEnabled)
 
-    // v2.28.1: debug 通道已证伪(2.28.0 实测写入正确域仍不亮) — 默认关, 别污染采集对照
-    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"mfDebugOverride"]) {
-        NSString *dbg = @"com.reflix.debug.proAccessOverride";
-        id cur = [[NSUserDefaults standardUserDefaults] objectForKey:dbg];
-        if (![cur isKindOfClass:[NSString class]] || ![cur isEqualToString:@"active"]) {
-            [[NSUserDefaults standardUserDefaults] setObject:@"active" forKey:dbg];
-            [[NSUserDefaults standardUserDefaults] synchronize];
-            mfLog(@"[mfdbg] proAccessOverride -> active (was %@)", cur ?: @"nil");
-        } else {
-            mfLog(@"[mfdbg] proAccessOverride already active");
-
-        }
-    }
+    // v2.58.69: 已删 — 旧的 proAccessOverride debug 通道(2.28.1 自述"已证伪",
+    //   且写死单 app debug key)。保留只会污染采集对照 + 泄漏目标。
+    //   需要临时调试请用观察模式日志, 不要复活这条死路。
 
     const struct mach_header_64 *mh = NULL;
     intptr_t mainSlide = 0;
@@ -1510,7 +1510,7 @@ void mfProcCaptureStart(void) {
     // v2.29.0: 审讯层 — 主二进制引用扫描(invocation/UD 窃听已提前到 dlopen 之前, v2.34.0)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ mfCapScanMainBinary(); });
     // v2.30.0: 层5 — 主二进制 mach_msg/mach_msg2 重绑(license 客户端握手双向捕获)
-    // v2.54.4: 止损——mach_msg rebind 是高侵入(全 iOS 通信走 mach_msg, 曾崩 Scripting/Reflix)。
+    // v2.54.4: 止损——mach_msg rebind 是高侵入(全 iOS 通信走 mach_msg, 曾致目标崩)。
     //   加独立开关 mfMachTapEnabled(默认关): 开了才 rebind, 否则跳过。防误全局刷新崩。
     if (mh && [[NSUserDefaults standardUserDefaults] boolForKey:@"mfMachTapEnabled"]) {
         mfCapInstallMachTap(mh, mainSlide);

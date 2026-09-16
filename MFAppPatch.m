@@ -1,5 +1,5 @@
 // MFAppPatch.m — 进程层 patch 引擎 (v2.21.0, 2026-09-04)
-// 灵感来源: ReflixPatch-3.0.5 逆向 (vm_protect 写 __text 模式) — 见 reven-recon/REFLIXPATCH-REPORT.md
+// 灵感来源: 第三方补丁工具的逆向观察 (vm_protect 写 __text 模式) — 详见本地 recon 报告
 // 【归属】IAPtools.dylib (IAP 域); 实验模拟页入口; 不碰系统进程
 // 【铁律】ctor 有系统进程守卫(IAPtools 既有); 本文件不新增 ctor, 由 MFPanel ctor 按开关拉起
 //
@@ -7,11 +7,11 @@
 //   1. 规则引擎: prefs 读 JSON 规则表, bundleID+version 匹配当前进程
 //   2. 执行器:   kind=method → objc swizzle;  kind=text → vm_protect(RW)+写字节+icache+恢复RX
 //   3. 采集器:   纯被动周期快照 diff (v2.21: 不 hook vm_protect — fishhook 会污染
-//                ReflixPatch 的 backtrace 反 hook 检测导致其 abort, 见 2026-09-04 实测)
+//                该工具的 backtrace 反 hook 检测会导致其 abort (实测)
 //
 // 规则表格式 (prefs key = mfAppPatchRules, 值 = JSON 字符串):
 // [{
-//   "bid": "com.magicgroot.gooby", "ver": "3.0.5", "note": "Reflix Pro gate",
+//   "bid": "<目标 bundle id>", "ver": "<版本>", "note": "<说明>",
 //   "patches": [
 //     {"kind":"method","cls":"ProGateChecker","sel":"isPro","ret":true},
 //     {"kind":"text","off":"0x12345678","old":"1f2003d5","new":"20008052c0035fd6"}
@@ -127,7 +127,7 @@ static NSString *apCurVersion(void) {
     return [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"";
 }
 
-// ====== Mach-O 主程序定位 (MH_EXECUTE, ReflixPatch 同款思路) ======
+// ====== Mach-O 主程序定位 (MH_EXECUTE, 同款思路) ======
 static uintptr_t apMainImageBase(void) {
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
@@ -137,7 +137,7 @@ static uintptr_t apMainImageBase(void) {
     return _dyld_image_count() ? (uintptr_t)_dyld_get_image_header(0) : 0;
 }
 
-// ====== text patch: vm_protect 三步 (ReflixPatch 同款) ======
+// ====== text patch: vm_protect 三步 ======
 // v2.57: 抽出 apTextPatchAt(绝对地址) — 主程序(text 规则)与框架(swifttext 规则)共用执行核
 static BOOL apTextPatchAt(uintptr_t target, NSData *expectOld, NSData *newBytes, NSString **err) {
     if (expectOld.length) {
@@ -288,8 +288,8 @@ static BOOL apMethodPatch(NSString *clsName, NSString *selName, BOOL ret, NSStri
     return YES;
 }
 
-// ====== v2.56: Keychain 授权豁免(学习自 ScriptingPass 判定链数据源) ======
-// 样本(ScriptingPass)授权判定: fetchUserRecordID(CloudKit 身份) + SecItemCopyMatching(Keychain 缓存)
+// ====== v2.56: Keychain 授权豁免(学习自样本判定链数据源) ======
+// 样本授权判定: fetchUserRecordID(CloudKit 身份) + SecItemCopyMatching(Keychain 缓存)
 // hook SecItemCopyMatching → 恒"找到授权项"(errSecSuccess + 伪 data) → 样本/主进程判定"已授权"
 static OSStatus (*g_origSecCopyMatching)(CFDictionaryRef, CFTypeRef *) = NULL;
 // v2.56.7: dlsym hook 前向声明(kc Install 先于定义使用)
@@ -473,7 +473,7 @@ void mfAppPatchBoot(void) {
     // v2.58.63: 修正域 — 注入进程内 standardUserDefaults 才是 app 自己的域;
     //   旧版 initWithSuiteName 读的是 suite 域(app 未用) → 恒 nil 误报"写侧没跑"
     {
-        // v2.58.68: 去硬编码(旧版写死 "HostLog.entitlement.isPro.v1" + HostLog 前缀计数)
+        // v2.58.68: 去硬编码(旧版写死单个目标 app 的 key + 前缀计数)
         //   — 诊断改为通用: 扫标准域里含权益语义族的 key, 报数量与 Bool 位快照。
         NSUserDefaults *au = [NSUserDefaults standardUserDefaults];
         NSDictionary *rep = [au dictionaryRepresentation];
@@ -493,7 +493,7 @@ void mfAppPatchBoot(void) {
         apLog(@"[AppPatch] [statediag] 权益语义 key=%lu 个 · 首个 Bool 位: %@", (unsigned long)hitKeys.count, snap);
     }
     apEntDumpsApply();
-    // v2.58.68: 旧 udseed(写死 com.julyfire.hostlog 的 isPro/missingSince)已泛化 —
+    // v2.58.68: 旧 udseed(写死单目标 app 的解锁位 key)已泛化 —
     //   语义保留(每次启动重锤解锁位, 防 app 启动重置), 数据源改为该 app 自己的
     //   侦查缓存语义 key, 不再内置单 app 特征。
     //   只对"已开💾持久化"的 app 生效(= 用户确认过该 app 走状态型路线), 不主动乱写。
@@ -636,7 +636,7 @@ void apEntDumpsApply(void) {
             unsigned rt = 9;
             NSRange dot = [d[@"sym"] rangeOfString:@"." options:NSBackwardsSearch];
             if (dot.location != NSNotFound) rt = (unsigned)[[d[@"sym"] substringFromIndex:dot.location + 1] intValue];
-            if (rt > 30) rt = 9;    // 容错: 解析失败回落 x9(gooby 实证寄存器)
+            if (rt > 30) rt = 9;    // 容错: 解析失败回落 x9(实测寄存器)
             uint32_t movx = 0xd2800000u | (1u << 5) | rt;
             newBytes = [NSData dataWithBytes:&movx length:4];
         } else if ([d[@"sym"] hasPrefix:@"sk2pro@"]) {
@@ -663,7 +663,7 @@ long mfAppPatchEntDumpCount(void) { apEntDumpsLoad(); return g_entDumps.count; }
 
 // v2.21 教训: 内存首拍在 ctor 才拍, 而 TrollFools 注入的补丁 dylib
 // 初始化更早 — patch 在基线之前就打完了, 内存 diff 永远是 0 (假阴性)
-// 破法: ReflixiOS 二进制文件 = 原始字节 (主程序 vmaddr偏移==文件偏移),
+// 破法: 主二进制文件 = 原始字节 (主程序 vmaddr偏移==文件偏移),
 // 文件区段 vs 内存同偏移对照, 何时打的 patch 都能现形
 // ==================================================================
 BOOL mfAppPatchCollIsOn(void) { return mfPrefBool(apPrefKey(@"mfAppPatchCollector"), NO); }
@@ -833,17 +833,9 @@ void apInstallCollectors(void) {
 NSString *mfAppPatchRulesJSON(void) {
     id v = mfReadPrefObj(@"mfAppPatchRules");
     if ([v isKindOfClass:[NSString class]]) return v;
-    // v2.22.1: 预置 Reflix 首条规则 (0x7c06f4 tbz→tbnz, 强制走 proAccessOverride 注入路径)
-    return @"[\n"
-           @"  {\n"
-           @"    \"bid\": \"com.magicgroot.gooby\",\n"
-           @"    \"ver\": \"3.0.5\",\n"
-           @"    \"note\": \"ProGate debug override 强制注入 (tbz→tbnz)\",\n"
-           @"    \"patches\": [\n"
-           @"      {\"kind\":\"text\",\"off\":\"0x7c06f4\",\"old\":\"94020036\",\"new\":\"94020037\"}\n"
-           @"    ]\n"
-           @"  }\n"
-           @"]";
+    // v2.58.69: 预置规则模板已清空 — 旧版预置单 app 的 bid/版本/指令偏移(泄漏残留),
+    //   且判定点主流程早已不依赖规则表(apEntDumps 驱动)。模板只留空数组 + 格式示例。
+    return @"[]";
 }
 void mfAppPatchSetRulesJSON(NSString *json) {
     NSData *d = [json dataUsingEncoding:NSUTF8StringEncoding];
@@ -1177,7 +1169,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     y += 24;
     // ====== v2.58 重构(用户六点清单): 引擎开关退役 — 有持久化点位(mfEntDumps)冷启动自动重打;
     //   采集器迁观察模块(MFCompatPatcher 同路); 规则表保留为 text/method 手工高级用法。 ======
-    // v2.58.67: F9 卡条件显示 — mf_debug_70(com.bobo.bplayer)实锤: 非状态型 app
+    // v2.58.67: F9 卡条件显示 — 实测(非状态型 app): 无语义 key 时
     //   (0 语义 key)也一直显示 F9 卡 = 噪声; 用户问"这个 F9 卡片怎么回事"。
     //   判据同主卡: 有语义 key(侦查确认为状态型)才显示。
     {

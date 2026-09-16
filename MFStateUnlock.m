@@ -28,7 +28,7 @@ static NSString *stateWritesKey(void);
 static BOOL stateKeyIsDate(NSString *k);
 
 // v2.58.49: 读侧守卫 — SK2(JWS) 型 app 启动时用事务流重算覆写 UserDefaults,
-//   写侧直写被打回原形(mf_debug_51: 12 点位⚡+F9 直写全中, HostLog 仍不亮)。
+//   写侧直写被打回原形(实测: 12 点位⚡+F9 直写全中, 仍不亮)。
 //   终局解法: 读侧拦截 — 对持久化守卫 key 恒返解锁值, app 写什么无所谓。
 static IMP g_orig_ud_objectForKey = NULL;
 static IMP g_orig_ud_boolForKey = NULL;
@@ -144,7 +144,7 @@ static BOOL stateKeyMatch(NSString *k) {
     if (![k containsString:@"."]) return NO;    // plist key 命名风格: a.b 点分 camelCase
     if ([k hasPrefix:@"com."]) return NO;       // 排除第三方 SDK 域名风格 key(RC 映射等 — 缓存 dict, 直写会破坏)
     if (!stateKeyShapeOK(k)) return NO;         // v2.58.21: 形态门 — 文案/URL/路径不是 key
-    // v2.58.35: 静态污染排除(Reflix 76 假案定谳) — __cstring 里的 i18n 文案段
+    // v2.58.35: 静态污染排除(76 条假案定谳) — __cstring 里的 i18n 文案段
     //   (discover./drawer./paywall./testflight./player./settings./badge_/detail.)
     //   与 Firebase 埋点段 (measurement./error_/.token/.mocking_) 词表全误命中
     //   ("pro_header"/"lifetime"/"expiresIn" 子串), 但全是文案 key 非状态位。
@@ -303,7 +303,7 @@ long mfStateUnlockApplyKey(NSString *key, BOOL on) {
 // v2.58.64: 编码数据型 key 判定 — app 侧走 dataForKey:/setObject(Data) 的 key,
 //   写 Bool 类型不符 → app 解析失败 → 依赖该记录集的功能不亮(mf_debug_67"部分解锁"根因)。
 //   判据: ①当前值已是 NSData → 铁证 ②名字含 Records/Snapshot/Transactions 等记录集词
-//   (HostLog.entitlement.verifiedRecords.v1 实证; 记录集不能凭空伪造 → 跳过而非瞎写)
+//   (实测目标记录集 key 实证; 记录集不能凭空伪造 → 跳过而非瞎写)
 BOOL mfStateKeyIsDataBacked(NSString *key) {
     if (!key.length) return NO;
     id cur = [[NSUserDefaults standardUserDefaults] objectForKey:key];

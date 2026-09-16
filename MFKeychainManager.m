@@ -395,7 +395,7 @@ static NSString *g_ckWarmContainerID = nil; // SecTask 读到的真容器 ID
 static volatile BOOL g_ckHookInstalled = NO;
 static volatile BOOL g_ckEntQueried = NO;   // my wrapper 是否被 CK 调用过
 
-// v2.6.93: ck 日志落盘——trap 崩溃进程时 hostlog 内存缓冲全丢，落盘才能拿到死前现场
+// v2.6.93: ck 日志落盘——trap 崩溃进程时宿主日志内存缓冲全丢，落盘才能拿到死前现场
 static void ckLog(NSString *fmt, ...) NS_FORMAT_FUNCTION(1,2);
 static void ckLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);

@@ -1221,7 +1221,7 @@ void mfShowScanPage(void) {
             });
             mfLog(@"[iap] 产品ID先行: hooked=%lu local=%lu 候选秒级上真列表", (unsigned long)hookedPIDs.count, (unsigned long)localCandidates.count);
         }
-        // v2.47.0: 内购模式一次性侦查(零 hook 纯读, 判据沉淀自 Reflix 战役终案) — 结果进置顶卡
+        // v2.47.0: 内购模式一次性侦查(零 hook 纯读, 判据沉淀自实战终案) — 结果进置顶卡
         //   v2.58.35: recon 完成即换卡(独立流水线), 不再与产品ID/SK verify 绑在一个回调里
         NSDictionary *recon = mfReconFingerprint();
         for (NSString *rl in recon[@"lines"]) mfLog(@"[recon] %@", rl);
@@ -1607,7 +1607,7 @@ void mfShowLabPage(void) {
     //    且授权判定链 = keychain+cloudkit); mfMachRespHits 还误用了 g_excHitCount(虚报)。
 
     // v2.56: patch 引擎(规则驱动: method swizzle / text vm_protect / keychain 授权豁免)
-    //   ——学习自 ScriptingPass 判定链的落地容器。规则格式: mfAppPatchRules JSON
+    //   ——学习自样本判定链的落地容器。规则格式: mfAppPatchRules JSON
     //   [{"bid":"com.scripting.ios","ver":"","patches":[{"kind":"keychain"}]}]
     CGFloat apY = 264;   // v2.57.1: L1 行(256 结束)+8 — 原mach应答器删除留下的 72px 死区收回
     extern void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio);
@@ -2610,9 +2610,8 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
             [[objc_getClass("SKPaymentQueue") defaultQueue] addTransactionObserver:g_observer];
         });
 
-        // v2.6.48: ObjC 规则冷启动自动应用(每个注入的 app 进程生效——跨进程规则的根基)
-        extern void mfReflixOracleStart(void);
-        mfReflixOracleStart();
+        // v2.58.69: 旧 oracle 模块已删(锁死单 app bid+版本, 无 UI 入口, 产物无人读取 —
+        //   自述"dylib 已退役"的死模块, 且硬编码目标实名)。判定点主流程走 apEntDumps。
         extern void mfProcCaptureStart(void);   // v2.26.0: 第二拳·被动点位采集(白名单 app)
         mfProcCaptureStart();
         extern void mfAppPatchBoot(void);       // v2.58: 判定点引擎(mfEntDumps 自判, 无开关)

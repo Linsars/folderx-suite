@@ -12,7 +12,7 @@
 static NSString *MF_OBJC_HOOK_PATH = @"/var/jb/var/mobile/Library/MinisFix/objchooks.plist";
 static NSString *g_objcPrefill = nil;
 static void mfObjCHookLoad(void);  // 前向声明
-// v2.6.44: 全程诊断日志(NSLog 双写进 hostlog 管道)
+// v2.6.44: 全程诊断日志(NSLog 双写进宿主日志管道)
 #define OH_LOG(fmt, ...) NSLog(@"[ObCHook] " fmt, ##__VA_ARGS__)
 // v2.6.41: 实现 mfTraceSetPrefill(MFPanel.h 声明 + MFClassDump.m 调用, 之前漏实现 = undefined symbol)
 void mfTraceSetPrefill(NSString *cls) {
