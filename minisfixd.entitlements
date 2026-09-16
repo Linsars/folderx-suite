@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 核心三件: 电源源写权(IORegistryEntrySetCFProperties 的钥匙) -->
+	<key>com.apple.private.powersource-read</key>
+	<true/>
+	<key>com.apple.private.powersource-write</key>
+	<true/>
+	<key>com.apple.private.powersource-write-all</key>
+	<true/>
+	<key>com.apple.private.applesmartbattery-smcdatastream</key>
+	<true/>
+	<!-- daemon 基础运行环境 -->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.security.no-sandbox</key>
+	<true/>
+</dict>
+</plist>
