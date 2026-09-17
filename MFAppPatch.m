@@ -772,6 +772,20 @@ void apEntDumpsApply(void) {
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"1f2003d5");   // nop 兜底
+        } else if ([d[@"sym"] hasPrefix:@"ivargate@"]) {
+            // v2.58.80: 权益 ivar 读侧门 — ldrb wT,[xN,#off] → mov wT,#1(UI 每次读到已购)
+            //   sym 格式 ivargate@0x<off>.<T>; new 存库内字节(mov wT,#1)
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else {
+                unsigned rt9 = 0;
+                NSRange dot9 = [d[@"sym"] rangeOfString:@"." options:NSBackwardsSearch];
+                if (dot9.location != NSNotFound) rt9 = (unsigned)[[d[@"sym"] substringFromIndex:dot9.location + 1] intValue];
+                if (rt9 <= 30) {
+                    uint32_t mz = 0x52800020u | rt9;
+                    newBytes = [NSData dataWithBytes:&mz length:4];
+                } else newBytes = apHexToBytes(@"20008052");   // mov w0,#1 兜底
+            }
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         // v2.58.52: 点位带 old 字段时校验原字节(指令漂移自检, sk2pro/sk2ver 专用)
         NSData *oldBytes = ([d[@"old"] isKindOfClass:[NSString class]] && [d[@"old"] length]) ? apHexToBytes(d[@"old"]) : nil;
@@ -1284,6 +1298,19 @@ static MFAPEntList *g_apEntList = nil;
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"1f2003d5");   // nop 兜底
+        } else if ([sym hasPrefix:@"ivargate@"]) {
+            // v2.58.80: 权益 ivar 读侧门 — ldrb wT,[xN,#off] → mov wT,#1
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else {
+                unsigned rtg = 0;
+                NSRange dotg = [sym rangeOfString:@"." options:NSBackwardsSearch];
+                if (dotg.location != NSNotFound) rtg = (unsigned)[[sym substringFromIndex:dotg.location + 1] intValue];
+                if (rtg <= 30) {
+                    uint32_t mzg = 0x52800020u | rtg;
+                    newBytes = [NSData dataWithBytes:&mzg length:4];
+                } else newBytes = apHexToBytes(@"20008052");
+            }
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }
@@ -1381,6 +1408,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
             NSString *sh = dd[@"shape"] ?: @"";
             BOOL sem = [sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2get"]
                     || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"sk2br"]
+                    || [sh isEqualToString:@"ivargate"]
                     || [sh isEqualToString:@"deepslot"]
                     || [sh isEqualToString:@"ivarRead"] || [sh isEqualToString:@"ivarGetter"]
                     || [sh isEqualToString:@"sk2ver"]

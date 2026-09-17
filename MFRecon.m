@@ -30,6 +30,7 @@ static const char *mfStrCaseStr(const char *hay, const char *needle) {
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <string.h>
+#import <objc/runtime.h>   // v2.58.80: ivargate — class_copyIvarList/ivar_getOffset
 #import "MFPanel.h"
 
 extern CGFloat g_mfCardW;
@@ -903,6 +904,98 @@ static NSDictionary *mfReconF8v2Scan(void) {
             mfLog(@"[f8v2] sk2br: SKU串=%d 引用函数=%d 门分支点=%d 个", nSku2, nRefFn, nBr);
         } else {
             mfLog(@"[f8v2] sk2br: __cstring 区(%#llx+%#llx) 无 SKU 形态串", cstrVM, cstrSize);
+        }
+    }
+
+    // =====================================================================
+    // ivargate (v2.58.80): 运行时驱动的权益读侧门控点。
+    //   动机(mf_debug_82 + VansonMod 桥实证): bplayer 的 6 个形态点全在交易处理链
+    //   (无购买时根本不执行, patch 全空转); 真闸门是 HMVipProManager._isVipPro
+    //   (ivar 偏移运行时才有值, 静态文件里是 0) 的读侧门控:
+    //     ldrb wT,[xN,#<ivarOff>] ; cmp wT,#1 ; b.cond
+    //   → patch ldrb 为 mov wT,#1 = UI 每次读到"已购"。
+    //   算法(纯运行时 API, 零 app 硬编码):
+    //     ① objc_copyClassList 遍历 → 类名/ivar 名过权益词表 → 收 ivar 偏移
+    //     ② 单遍扫 __TEXT: ldrb wT,[xN,#off] + cmp wT,#1 + b.cond 三连 → 门控点
+    //   隔离: 新 shape ivargate(独立 sym 前缀 + 独立执行分支), 老 shape 不动。
+    // =====================================================================
+    {
+        uint32_t gateOffs[16]; int nGateOff = 0;
+        unsigned int nCls = 0;
+        Class *clsList = objc_copyClassList(&nCls);
+        if (clsList) {
+            for (unsigned int ci = 0; ci < nCls && nGateOff < 16; ci++) {
+                Class c = clsList[ci];
+                if (!c) continue;
+                const char *cn = class_getName(c);
+                if (!cn) continue;
+                static const char *kClsWords[] = {"Vip","VIP","ProManager","Entitle","Premium",
+                                                  "Membership","Subscri","Purchase"};
+                BOOL clsHit = NO;
+                for (int w = 0; w < 8; w++) if (strstr(cn, kClsWords[w])) { clsHit = YES; break; }
+                if (!clsHit) continue;
+                unsigned int nIv = 0;
+                Ivar *ivs = class_copyIvarList(c, &nIv);
+                if (!ivs) continue;
+                for (unsigned int ii = 0; ii < nIv && nGateOff < 16; ii++) {
+                    const char *in = ivar_getName(ivs[ii]);
+                    if (!in) continue;
+                    static const char *kIvWords[] = {"isVip","isPro","hasPro","hasVip","entitled",
+                                                     "hasAccess","isPremium","isMember","vipStatus",
+                                                     "proStatus","isSubscribed","hasEntitle",
+                                                     "vipActive","isUnlocked","hasPurchas"};
+                    BOOL ivHit = NO;
+                    for (int w = 0; w < 15; w++) if (strstr(in, kIvWords[w])) { ivHit = YES; break; }
+                    if (!ivHit) continue;
+                    ptrdiff_t off = ivar_getOffset(ivs[ii]);
+                    if (off <= 0 || off > 0x2000) continue;
+                    BOOL dup = NO;
+                    for (int k = 0; k < nGateOff; k++) if (gateOffs[k] == (uint32_t)off) { dup = YES; break; }
+                    if (!dup) gateOffs[nGateOff++] = (uint32_t)off;
+                }
+                free(ivs);
+            }
+            free(clsList);
+        }
+        if (nGateOff) {
+            int nGate = 0;
+            for (uint64_t o = 0; o + 12 <= textSize; o += 4) {
+                uint32_t w1 = *(const uint32_t *)(bd + textFileOff + o);
+                if ((w1 & 0xFFC00000) != 0x39400000) continue;      // ldrb wT,[xN,#imm]
+                uint32_t T = w1 & 0x1F;
+                if (T == 31) continue;
+                if (((w1 >> 5) & 0x1F) == 31) continue;
+                uint32_t imm = (w1 >> 10) & 0xFFF;
+                BOOL offHit = NO;
+                for (int k = 0; k < nGateOff; k++) if (gateOffs[k] == imm) { offHit = YES; break; }
+                if (!offHit) continue;
+                uint32_t w2 = *(const uint32_t *)(bd + textFileOff + o + 4);
+                if ((w2 & 0xFFFFFC1F) != 0x7100041F) continue;      // cmp wT,#1
+                if (((w2 >> 5) & 0x1F) != T) continue;
+                uint32_t w3 = *(const uint32_t *)(bd + textFileOff + o + 8);
+                BOOL isBr = ((w3 & 0xFF000010) == 0x54000000) ||
+                            ((w3 & 0x7F000000) == 0x34000000);
+                if (!isBr) continue;                                 // 门控分支
+                nGate++;
+                uint32_t movNew = 0x52800020u | T;                   // mov wT,#1
+                [sk2pts addObject:@{
+                    @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                    @"sym": [NSString stringWithFormat:@"ivargate@%#llx.%u", (unsigned long long)o, T],
+                    @"vmaddr": @(textVM + o),
+                    @"slide": @((long)slide),
+                    @"score": @(94),
+                    @"calls": @(0),
+                    @"shape": @"ivargate",
+                    @"kind": @"ivargate",
+                    @"old": mfLeHex(w1),
+                    @"new": mfLeHex(movNew),
+                }];
+                mfLog(@"[f8v2] ★ivargate @%#llx (权益 ivar 读侧门: ldrb w%u,[xN,#%#x]→mov w%u,#1)",
+                      (unsigned long long)(textVM + o), T, imm, T);
+            }
+            mfLog(@"[f8v2] ivargate: 权益类 ivar 偏移=%d 个, 读侧门控点=%d 个", nGateOff, nGate);
+        } else {
+            mfLog(@"[f8v2] ivargate: 无权益类 ivar(运行时类表未命中词表)");
         }
     }
 
@@ -1870,7 +1963,8 @@ NSDictionary *mfReconFingerprint(void) {
     BOOL sk2LocalType = NO;
     {
         NSUInteger nS = 0;
-        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]) nS++;
+        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]
+                || [f[@"shape"] isEqualToString:@"ivargate"]) nS++;
         if (!cloudBrands.count && !mach && nS >= 1 &&
             (mfRecFind(p, n, "verification failed") || mfRecFind(p, n, "could not be verified") || mfRecFind(p, n, "snapshot verification")))
             sk2LocalType = YES;
@@ -2049,7 +2143,7 @@ NSDictionary *mfReconFingerprint(void) {
                 for (NSDictionary *f in sk2ptsRef) {
                     NSString *sh = f[@"shape"] ?: @"";
                     // v2.58.78: sk2br(SKU 锚 + 分支粒度)= 强证据; 只有它才压 sk2dat
-                    if ([sh isEqualToString:@"sk2br"]) { haveBetter = YES; break; }
+                    if ([sh isEqualToString:@"sk2br"] || [sh isEqualToString:@"ivargate"]) { haveBetter = YES; break; }
                     if (![sh isEqualToString:@"sk2dat"] && sh.length) { haveBetter = YES; break; }
                 }
                 if (!haveBetter && [candsRef isKindOfClass:[NSArray class]]) {
@@ -2153,7 +2247,8 @@ NSDictionary *mfReconFingerprint(void) {
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
-            || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]) nCodePts++;
+            || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]
+            || [f[@"shape"] isEqualToString:@"ivargate"]) nCodePts++;
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
