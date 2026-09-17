@@ -687,10 +687,16 @@ void apEntDumpsApply(void) {
             if (rt > 30) rt = 9;    // 容错: 解析失败回落 x9(实测寄存器)
             uint32_t movx = 0xd2800000u | (1u << 5) | rt;
             newBytes = [NSData dataWithBytes:&movx length:4];
-        } else if ([d[@"sym"] hasPrefix:@"sk2pro@"]) {
+        } else if ([d[@"sym"] hasPrefix:@"sk2pro@"] || [d[@"sym"] hasPrefix:@"sk2dat@"]) {
             // v2.58.52→58: SK2 数据源装载点 — ldr → movz xT,#1(记录恒存在, 恒解锁)
+            // v2.58.71: sk2dat(B 路)同语义 — sym 格式 sk2dat@0x<off>.<Rt>, 优先用库内 new
+            unsigned rt7 = 0;
+            NSRange dot7 = [d[@"sym"] rangeOfString:@"." options:NSBackwardsSearch];
+            if (dot7.location != NSNotFound) rt7 = (unsigned)[[d[@"sym"] substringFromIndex:dot7.location + 1] intValue];
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
+            else if (rt7 <= 30)
+                newBytes = mfLeHex(0xD2800000u | (1u << 5) | rt7);   // movz x<rt>,#1(内存序)
             else newBytes = apHexToBytes(@"370080d2");   // movz x23,#1 兜底(内存序)
         } else if ([d[@"sym"] hasPrefix:@"sk2get@"]) {
             // v2.58.62: SK2 UI 读侧 getter — ldrb w0,[xN,#0x10] → mov w0,#1
@@ -1159,10 +1165,16 @@ static MFAPEntList *g_apEntList = nil;
             if (rt > 30) rt = 9;
             uint32_t movx = 0xd2800000u | (1u << 5) | rt;
             newBytes = [NSData dataWithBytes:&movx length:4];
-        } else if ([sym hasPrefix:@"sk2pro@"]) {
+        } else if ([sym hasPrefix:@"sk2pro@"] || [sym hasPrefix:@"sk2dat@"]) {
             // v2.58.52→58: SK2 数据源装载点 — ldr → movz xT,#1(记录恒存在, 恒解锁)
+            // v2.58.71: sk2dat(B 路)同语义 — sym 格式 sk2dat@0x<off>.<Rt>, 优先用库内 new
+            unsigned rt8 = 0;
+            NSRange dot8 = [sym rangeOfString:@"." options:NSBackwardsSearch];
+            if (dot8.location != NSNotFound) rt8 = (unsigned)[[sym substringFromIndex:dot8.location + 1] intValue];
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
+            else if (rt8 <= 30)
+                newBytes = mfLeHex(0xD2800000u | (1u << 5) | rt8);   // movz x<rt>,#1(内存序)
             else newBytes = apHexToBytes(@"370080d2");   // movz x23,#1 兜底(内存序)
         } else if ([sym hasPrefix:@"sk2get@"]) {
             // v2.58.62: SK2 UI 读侧 getter — ldrb w0,[xN,#0x10] → mov w0,#1
@@ -1266,7 +1278,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         NSUInteger nWrite = 0, nRead = 0, nOther = 0, nDeep = 0;
         for (NSDictionary *dd in all) {
             NSString *sh = dd[@"shape"] ?: @"";
-            if ([sh isEqualToString:@"sk2pro"]) nWrite++;
+            if ([sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2dat"]) nWrite++;
             else if ([sh isEqualToString:@"sk2get"]) nRead++;
             else if ([sh isEqualToString:@"deepslot"]) nDeep++;
             else nOther++;

@@ -720,6 +720,51 @@ static NSDictionary *mfReconF8v2Scan(void) {
             }
         }
 
+    // =====================================================================
+    // sk2dat (v2.58.71): B 路 — 无锚数据源判定点扫描。
+    //   动机: sk2pro 门 = 状态播报串(bplayer 类 app 不打 oslog → 门死),
+    //   引擎四路全空但 app 明明是 SK2 流消费者(SK stub=33 实测)。
+    //   B 路零字符串依赖: 全 __TEXT 扫数据源装载形态 ldr xT,[xK,#imm]
+    //   + cmp xT,#0 + cset wS,ne(存在→真方向)。本地实证(hostlog):
+    //   形态A 全 TEXT 仅 4 处, ne 门后剩 1 = 已知真点 0x1000a2f68, 0 误报
+    //   (3 处误报全为 cset eq 反向语义)。patch = movz xT,#1(与 sk2pro 同语义)。
+    // =====================================================================
+    {
+        int nDat = 0;
+        for (uint64_t off = 0; off + 12 <= textSize; off += 4) {
+            uint32_t w1 = *(const uint32_t *)(bd + textFileOff + off);
+            if ((w1 & 0xFFC00000) != 0xF9400000) continue;      // ldr xT,[xK,#imm12]
+            uint32_t T1 = w1 & 0x1F;
+            if (T1 == 31) continue;
+            uint32_t w2 = *(const uint32_t *)(bd + textFileOff + off + 4);
+            if ((w2 & 0xFFFFFC1F) != 0xF100001F) continue;      // cmp xT,#0
+            if (((w2 >> 5) & 0x1F) != T1) continue;
+            uint32_t w3 = *(const uint32_t *)(bd + textFileOff + off + 8);
+            if ((w3 & 0xFFFF0FFF) != 0x1A9F07E1) continue;      // cset wS,ne(cond 精确)
+            uint64_t a6 = textVM + off;
+            BOOL dup6 = NO;
+            for (NSDictionary *sp in sk2pts)
+                if ([sp[@"vmaddr"] unsignedLongLongValue] == a6) { dup6 = YES; break; }
+            if (dup6) continue;
+            uint32_t movNew = 0xD2800000u | (1u << 5) | T1;     // movz xT,#1
+            nDat++;
+            [sk2pts addObject:@{
+                @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                @"sym": [NSString stringWithFormat:@"sk2dat@%#llx.%u", (unsigned long long)off, T1],
+                @"vmaddr": @(a6),
+                @"slide": @((long)slide),
+                @"score": @(95),
+                @"calls": @(0),
+                @"shape": @"sk2dat",
+                @"kind": @"sk2dat",
+                @"old": mfLeHex(w1),
+                @"new": mfLeHex(movNew),
+            }];
+            mfLog(@"[f8v2] ★sk2dat @%#llx (ldr x%u→movz x%u,#1, cset ne — B 路无锚)", (unsigned long long)a6, T1, T1);
+        }
+        mfLog(@"[f8v2] sk2dat: B 路无锚数据源点=%d 个(cset ne 门, 零字符串依赖)", nDat);
+    }
+
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";
     NSMutableArray *out = [NSMutableArray array];
     // v2.58.16: top6→top12 + CE 消费者无条件保位 — mf_debug_16 实锤真判定函数
@@ -1661,7 +1706,7 @@ NSDictionary *mfReconFingerprint(void) {
     BOOL sk2LocalType = NO;
     {
         NSUInteger nS = 0;
-        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]) nS++;
+        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"]) nS++;
         if (!cloudBrands.count && !mach && nS >= 1 &&
             (mfRecFind(p, n, "verification failed") || mfRecFind(p, n, "could not be verified") || mfRecFind(p, n, "snapshot verification")))
             sk2LocalType = YES;
@@ -1864,7 +1909,8 @@ NSDictionary *mfReconFingerprint(void) {
     }
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
-        if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]) nCodePts++;
+        if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
+            || [f[@"shape"] isEqualToString:@"sk2dat"]) nCodePts++;
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
