@@ -772,6 +772,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
 
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";
     NSMutableArray *out = [NSMutableArray array];
+    NSUInteger f8v2Seg = 0;   // v2.58.76: F8v2 段边界(语义锚定候选, 截断时必须保位)
     // v2.58.16: top6→top12 + CE 消费者无条件保位 — mf_debug_16 实锤真判定函数
     // (CE 唯一消费者 0x100070cb0, score=5) 被垃圾候选(假 stub 的 calls大户)挤出 top6
     for (NSUInteger i = 0; i < cands.count && i < 12; i++) {
@@ -786,6 +787,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
             @"calls": cands[i][@"calls"] ?: @0,
         }];
     }
+    f8v2Seg = out.count;   // v2.58.76: F8v2 段(≤12)到此为止
 
     // =====================================================================
     // F8v3 (2026-09-12): 判定层深挖 — mf_debug_17 全候选⚡不亮定谳:
@@ -1454,12 +1456,23 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     // v2.58.23: score 排序 + top12 截断 — mf_debug_23 定谳 205 个全量
                     // 入 entDumps 是噪声倾倒(真 oracle 1~3 个)。排序: score↓ → fan↓
                     // (f8v2 的 out 在此 return 前已 top12, 这里只截 f8v3 追加段)
+                    // v2.58.76 修(f8v2_78 定谳): 旧实现把 f8v2 段(score 0~8)与 f8v3 段
+                    //   (score 91~93)混在一个数组里全局排序 + 统一截 12 → 两把不同刻度的尺子
+                    //   相比, f8v2 语义锚定候选(调用过 currentEntitlements/productID 的真候选)
+                    //   **整段被压到底部截掉**, 用户看到的 12 点全是 f8v3 共享 bool getter 噪声。
+                    //   (旧注释自述"只截 f8v3 追加段", 实现却截整体 — 注释与代码不符)
+                    //   修法: f8v2 段中 score≥3(语义锚定: CE/productID/updates/Transactions)
+                    //   保位; f8v3 只填剩余槽位。
                     if ([out isKindOfClass:[NSMutableArray class]]) {
                         NSMutableArray *mo = (NSMutableArray *)out;
-                        NSRange appRange = NSMakeRange(0, mo.count);   // f8v2 段+ f8v3 段
-                        // 只排序截断「整体」— f8v2 段(≤12)已按 score 排, 合并后再全局排不丢
-                        (void)appRange;
-                        [mo sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                        NSMutableArray *keep = [NSMutableArray array];
+                        NSMutableArray *pool = [NSMutableArray array];
+                        for (NSUInteger i = 0; i < mo.count; i++) {
+                            NSDictionary *it = mo[i];
+                            if (i < f8v2Seg && [it[@"score"] intValue] >= 3) [keep addObject:it];
+                            else [pool addObject:it];
+                        }
+                        [pool sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
                             // v2.58.27: 方向修正 — 旧写法 d<0?Descending:Ascending 把高分排到尾部,
                             // top12 removeLast 恰好删掉 ivarBoolGetter(94)真判定层, mf_debug_26 实锤
                             int d = [b[@"score"] intValue] - [a[@"score"] intValue];
@@ -1470,7 +1483,13 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             int c = [a[@"calls"] intValue] - [b[@"calls"] intValue];
                             return c < 0 ? NSOrderedAscending : NSOrderedDescending;
                         }];
-                        while (mo.count > 12) [mo removeLastObject];
+                        NSUInteger room = keep.count >= 12 ? 0 : (12 - keep.count);
+                        NSUInteger fill = MIN(pool.count, room);
+                        [mo removeAllObjects];
+                        [mo addObjectsFromArray:keep];
+                        [mo addObjectsFromArray:[pool subarrayWithRange:NSMakeRange(0, fill)]];
+                        mfLog(@"[f8v3] 截断: 语义锚定保位=%lu 槽, getter 填充=%lu (池 %lu)",
+                              (unsigned long)keep.count, (unsigned long)fill, (unsigned long)pool.count);
                     }
                 }
             }
@@ -1722,6 +1741,12 @@ NSDictionary *mfReconFingerprint(void) {
     //   判据: ①自研 /iap/* 端点 ≥1 条 ②有 VIP/权益类 Codable 字段(纯反射) ③无云 SDK 品牌
     //   → 判决「服务端权威」并抑制 sk2dat 噪声点(通用判空, 撒出去=让用户白试)。
     //   注: 提前到此计算 — merge 抑制(下方)与 verdict(末尾)都要用, 单一事实来源。
+    //   v2.58.76 修正(用户定案): 旧判据用 vip_info/vip_type/vipStatus 当"权益 Codable 字段"
+    //   是错的 — 那些是**百度/115 网盘** API 字段(邻居 baidu_name/netdisk_name/rt_space_info),
+    //   与 Pro 无关。bplayer 实测: 4 个 Pro SKU 全在二进制, 设备 plist 零 Pro 状态键
+    //   → Pro 是运行时由 StoreKit 算的**本地链**, 不是服务端下发。
+    //   新判据加**本地 SK 链否决**: 只要本地 SK2 消费链在场(SK 形态 + 无锚/有锚点位),
+    //   权益判定就落在本地, 绝不判"服务端权威"。
     BOOL srvSelfIap = NO;
     {
         static NSArray *kIapPaths;
@@ -1732,14 +1757,21 @@ NSDictionary *mfReconFingerprint(void) {
         });
         int epHits = 0;
         for (NSString *pp in kIapPaths) if (mfRecFind(p, n, pp.UTF8String)) epHits++;
-        // 自研权益 Codable 字段(纯反射键: 无 adrp+add 代码引用, 只由 JSONDecoder 消费)
-        int codHits = 0;
-        for (NSString *cf in @[@"vipStatus", @"vipLeftSeconds", @"vip_info", @"vip_type"])
-            if (mfRecFind(p, n, cf.UTF8String)) codHits++;
-        if (!cloudBrands.count && !mach && epHits >= 1 && codHits >= 1) {
+        NSUInteger nLocalPts = 0;
+        for (NSDictionary *f in sk2pts) {
+            NSString *sh = f[@"shape"] ?: @"";
+            if ([sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2get"]
+                || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"deepslot"]) nLocalPts++;
+        }
+        BOOL skHere = ([skType containsString:@"SK"] && nLocalPts > 0);
+        if (!cloudBrands.count && !mach && epHits >= 1 && !skHere) {
             srvSelfIap = YES;
             [lines addObject:[NSString stringWithFormat:
-                @"自研 IAP 端点 %d 条 + 权益 Codable 字段 %d 个 → 权益状态由自家后端下发", epHits, codHits]];
+                @"自研 IAP 端点 %d 条 + 无本地 SK 权益链 → 权益状态由自家后端下发", epHits]];
+        } else if (epHits >= 1 && skHere) {
+            [lines addObject:[NSString stringWithFormat:
+                @"自研 IAP 端点 %d 条 + 本地 SK 权益链在场(%lu 点) → 混合型, 以本地 StoreKit 判定为准",
+                epHits, (unsigned long)nLocalPts]];
         }
     }
     NSMutableArray *entFuncs = [NSMutableArray array];
@@ -1868,14 +1900,30 @@ NSDictionary *mfReconFingerprint(void) {
             // v2.58.75: 服务端权威型抑制代码点入库 — 形态门(sk2dat)在自研服务端权益 app 上
             //   全是通用判空, 入库=让用户白试(bplayer 35 点全试不亮, mf_debug_77 实证)。
             //   sk2pro/sk2get(有字符串锚的写点/读侧)不受影响, 仅滤 sk2dat。
+            // v2.58.76: sk2dat(纯指令形态门)降级为兜底 — 只要存在更强证据(语义锚定点或
+            //   其他 shape), 就不再把通用判空形态点塞给用户。mf_debug_77 实证: bplayer
+            //   35 个 sk2dat 全 ⚡ 不亮(它们是 ldr+cmp#0+cset ne 的通用判空, 与内购无关)。
             NSArray *mergePts = sk2ptsRef;
-            if (srvSelfIap) {
-                mergePts = [sk2ptsRef filteredArrayUsingPredicate:
-                            [NSPredicate predicateWithFormat:@"shape != 'sk2dat'"]];
-                if (mergePts.count != sk2ptsRef.count)
-                    [lines addObject:[NSString stringWithFormat:
-                        @"服务端权益型: 已抑制 %lu 个无锚形态点(通用判空, 非判定链)",
-                        (unsigned long)(sk2ptsRef.count - mergePts.count)]];
+            {
+                BOOL haveBetter = NO;
+                for (NSDictionary *f in sk2ptsRef) {
+                    NSString *sh = f[@"shape"] ?: @"";
+                    if (![sh isEqualToString:@"sk2dat"] && sh.length) { haveBetter = YES; break; }
+                }
+                if (!haveBetter && [candsRef isKindOfClass:[NSArray class]]) {
+                    for (NSDictionary *f in candsRef) {
+                        if ([f[@"score"] intValue] >= 3) { haveBetter = YES; break; }
+                        if ([f[@"shape"] length]) { haveBetter = YES; break; }
+                    }
+                }
+                if (haveBetter) {
+                    mergePts = [sk2ptsRef filteredArrayUsingPredicate:
+                                [NSPredicate predicateWithFormat:@"shape != 'sk2dat'"]];
+                    if (mergePts.count != sk2ptsRef.count)
+                        [lines addObject:[NSString stringWithFormat:
+                            @"形态门兜底: 已抑制 %lu 个无锚 sk2dat(通用判空形态, 有更强锚定证据时不上场)",
+                            (unsigned long)(sk2ptsRef.count - mergePts.count)]];
+                }
             }
             if ([mergePts isKindOfClass:[NSArray class]] && mergePts.count) {
                 mfAppPatchEntDumpsMerge(mergePts);
@@ -1912,9 +1960,15 @@ NSDictionary *mfReconFingerprint(void) {
                 extern void mfAppPatchEntDumpsMerge(NSArray *);
                 mfAppPatchEntDumpsMerge(candsRef);
                 [entFuncs addObjectsFromArray:candsRef];
-                [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(F8v2 fixups 链, 主二进制无符号可查) — 见实验模拟页", (unsigned long)candsRef.count]];
-                for (NSDictionary *f in [candsRef subarrayWithRange:NSMakeRange(0, MIN(4, candsRef.count))]) {
-                    [lines addObject:[NSString stringWithFormat:@"  %@:%@ score=%@ · swifttext 直打", f[@"img"], f[@"vmaddr"], f[@"score"] ?: @"?"]];
+                // v2.58.76: 标签按 score 来源分开报 — 旧实现一律写"F8v2 fixups 链", 实际
+                //   库里多半是 f8v3(score 91~93)共享 bool getter, 把排查方向带偏(mf_debug_78)。
+                NSUInteger nSem = 0, nGetter = 0;
+                for (NSDictionary *f in candsRef)
+                    if ([f[@"score"] intValue] >= 91 || [f[@"shape"] length]) nGetter++; else nSem++;
+                [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(语义锚定 %lu · getter %lu)", (unsigned long)candsRef.count, (unsigned long)nSem, (unsigned long)nGetter]];
+                for (NSDictionary *f in [candsRef subarrayWithRange:NSMakeRange(0, MIN(6, candsRef.count))]) {
+                    NSString *src = ([f[@"score"] intValue] >= 91 || [f[@"shape"] length]) ? @"getter" : @"语义锚定";
+                    [lines addObject:[NSString stringWithFormat:@"  [%@] %@:%@ score=%@", src, f[@"img"], f[@"vmaddr"], f[@"score"] ?: @"?"]];
                 }
             } else [lines addObject:@"entitlement 判定点位: 未发现(框架无符号判定函数, 主二进制 fixups 链无 SK 消费候选)"];
             }
@@ -1966,7 +2020,7 @@ NSDictionary *mfReconFingerprint(void) {
     else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
     // v2.58.75: 服务端权威判定型 — 优先于代码点播报(bplayer 案: 35 个形态点是通用
     //   判空噪声, 全 ⚡ 不亮已实证; 判定链在自家后端, 本地 patch 无意义)
-    else if (srvSelfIap)    verdict = @"自研服务端权益型(权益状态由自家 /iap/* 端点下发) — 本地点位为通用判空噪声, 本地解锁无意义, 跳过";
+    else if (srvSelfIap)    verdict = @"自研服务端权益型(无本地 SK 权益链, /iap/* 端点下发) — 本地解锁无意义, 跳过";
     // v2.58.65: 指令级代码判定点优先播报 — mf_debug_68 用户定案: 真正解锁的是
     //   sk2pro(写点)+sk2get(读侧) 这类**指令级 patch**, UserDefaults 直写只是辅助/部分。
     else if (nCodePts > 0)  verdict = [NSString stringWithFormat:@"代码判定型(指令级 patch %lu 点: isPro 写点/读侧 getter) — 实验模拟页⚡即解锁", (unsigned long)nCodePts];
