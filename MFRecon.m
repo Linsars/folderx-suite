@@ -1839,10 +1839,22 @@ NSDictionary *mfReconFingerprint(void) {
             NSArray *candsRef = cands;
             NSArray *sk2ptsRef = sk2pts;
             extern void mfAppPatchEntDumpsMerge(NSArray *);
-            if ([sk2ptsRef isKindOfClass:[NSArray class]] && sk2ptsRef.count) {
-                mfAppPatchEntDumpsMerge(sk2ptsRef);
-                [entFuncs addObjectsFromArray:sk2ptsRef];
-                [lines addObject:[NSString stringWithFormat:@"代码判定点: %lu 个已入库(isPro 写点/读侧 getter, 指令级 mov #1) — 见实验模拟页", (unsigned long)sk2ptsRef.count]];
+            // v2.58.75: 服务端权威型抑制代码点入库 — 形态门(sk2dat)在自研服务端权益 app 上
+            //   全是通用判空, 入库=让用户白试(bplayer 35 点全试不亮, mf_debug_77 实证)。
+            //   sk2pro/sk2get(有字符串锚的写点/读侧)不受影响, 仅滤 sk2dat。
+            NSArray *mergePts = sk2ptsRef;
+            if (srvSelfIap) {
+                mergePts = [sk2ptsRef filteredArrayUsingPredicate:
+                            [NSPredicate predicateWithFormat:@"shape != 'sk2dat'"]];
+                if (mergePts.count != sk2ptsRef.count)
+                    [lines addObject:[NSString stringWithFormat:
+                        @"服务端权益型: 已抑制 %lu 个无锚形态点(通用判空, 非判定链)",
+                        (unsigned long)(sk2ptsRef.count - mergePts.count)]];
+            }
+            if ([mergePts isKindOfClass:[NSArray class]] && mergePts.count) {
+                mfAppPatchEntDumpsMerge(mergePts);
+                [entFuncs addObjectsFromArray:mergePts];
+                [lines addObject:[NSString stringWithFormat:@"代码判定点: %lu 个已入库(isPro 写点/读侧 getter, 指令级 mov #1) — 见实验模拟页", (unsigned long)mergePts.count]];
             }
             // v2.58.55: SK2 流型(非云)抑制 F8v2 swifttext 点位 — mf_debug_58 用户拍板:
             //   "侦查详情页都给出那么详细的判决了, 为什么还要把不相干的点位传到实验
@@ -1916,6 +1928,31 @@ NSDictionary *mfReconFingerprint(void) {
         // SK 本地形态 + 无云验证 + JS 桥权益字段 → 服务器权益型
         if (srvHits >= 2 && !cloud && !mach && skLocal) serverSide = YES;
     }
+    // F11 自研服务端权益型(v2.58.75, bplayer 案定谳): app 自带 IAP 端点(/iap/pro-status
+    //   /iap/transactions 等) → 权益状态由**自家后端**下发, 本地只有 Codable 解码后的镜像字段
+    //   (无代码引用=纯反射串) + 容器 Preferences 为空 → 指令级 patch 到不了判定链。
+    //   判据: ①自研 /iap/* 端点 ≥1 条 ②有 VIP/权益类 Codable 字段(纯反射) ③无云 SDK 品牌
+    //   → 判决「服务端权威」并抑制代码点播报(它们是通用判空形态, 撒出去=让用户白试)。
+    BOOL srvSelfIap = NO;
+    {
+        static NSArray *kIapPaths;
+        static dispatch_once_t onceIap;
+        dispatch_once(&onceIap, ^{
+            kIapPaths = @[@"/iap/pro-status", @"/iap/transactions", @"/iap/verify",
+                          @"/iap/status", @"/iap/entitlement", @"/iap/subscription"];
+        });
+        int epHits = 0;
+        for (NSString *pp in kIapPaths) if (mfRecFind(p, n, pp.UTF8String)) epHits++;
+        // 自研权益 Codable 字段(纯反射键: 无 adrp+add 代码引用, 只由 JSONDecoder 消费)
+        int codHits = 0;
+        for (NSString *cf in @[@"vipStatus", @"vipLeftSeconds", @"vip_info", @"vip_type"])
+            if (mfRecFind(p, n, cf.UTF8String)) codHits++;
+        if (!cloudBrands.count && !mach && epHits >= 1 && codHits >= 1) {
+            srvSelfIap = YES;
+            [lines addObject:[NSString stringWithFormat:
+                @"自研 IAP 端点 %d 条 + 权益 Codable 字段 %d 个 → 权益状态由自家后端下发", epHits, codHits]];
+        }
+    }
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
@@ -1926,6 +1963,9 @@ NSDictionary *mfReconFingerprint(void) {
     else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, 同族架构)";
     // v2.58.65: "SK2 事务流验证型"判型已废(用户定案: 实机三轮零作用=死代码)
     else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
+    // v2.58.75: 服务端权威判定型 — 优先于代码点播报(bplayer 案: 35 个形态点是通用
+    //   判空噪声, 全 ⚡ 不亮已实证; 判定链在自家后端, 本地 patch 无意义)
+    else if (srvSelfIap)    verdict = @"自研服务端权益型(权益状态由自家 /iap/* 端点下发) — 本地点位为通用判空噪声, 本地解锁无意义, 跳过";
     // v2.58.65: 指令级代码判定点优先播报 — mf_debug_68 用户定案: 真正解锁的是
     //   sk2pro(写点)+sk2get(读侧) 这类**指令级 patch**, UserDefaults 直写只是辅助/部分。
     else if (nCodePts > 0)  verdict = [NSString stringWithFormat:@"代码判定型(指令级 patch %lu 点: isPro 写点/读侧 getter) — 实验模拟页⚡即解锁", (unsigned long)nCodePts];
