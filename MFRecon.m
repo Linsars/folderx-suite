@@ -128,6 +128,9 @@ static NSDictionary *mfReconF8v2Scan(void) {
     uint64_t textVM = 0, textSize = 0, stubVM = 0, stubSize = 0, textFileOff = 0;
     uint64_t baseVM = 0;   // v2.58.52: __TEXT vmaddr(sk2pro 串定位)
     uint64_t constSecVM[8] = {0}; uint64_t constSecSize[8] = {0}; int nConstSec = 0;
+    // v2.58.79: __cstring section — SKU 串扫描用(mf_debug_81 定谳: 旧实现扫 __text
+    //   导致零命中, sk2br 块静默跳过)
+    uint64_t cstrVM = 0, cstrSize = 0, cstrFileOff = 0;
     for (uint32_t c = 0; c < mh->ncmds; c++, lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize)) {
         if (lc->cmd != LC_SEGMENT_64) continue;
         const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
@@ -136,6 +139,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
         for (uint32_t s = 0; s < sg->nsects; s++, sc++) {
             if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__text")) { textVM = sc->addr; textSize = sc->size; textFileOff = sc->offset; }
             if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__stubs")) { stubVM = sc->addr; stubSize = sc->size; }
+            if (!strcmp(sc->segname, "__TEXT") && !strcmp(sc->sectname, "__cstring")) { cstrVM = sc->addr; cstrSize = sc->size; cstrFileOff = sc->offset; }
             // v2.58.52: const 段收集(oslog fmt 槽在 __const/__constg_swiftt — sk2pro 用)
             if (!strcmp(sc->segname, "__TEXT") && !strncmp(sc->sectname, "__const", 7) && nConstSec < 8) {
                 constSecVM[nConstSec] = sc->addr; constSecSize[nConstSec] = sc->size; nConstSec++;
@@ -785,10 +789,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
     //                   0x100c053ac escape=0x100c05a64→M=0x100c05a68(4 分支汇聚)
     // =====================================================================
     {
+        // v2.58.79: SKU 串在 __cstring(不是 __text!) — mf_debug_81 定谳:
+        //   旧实现扫 __text → SKU串=0 → 块静默跳过。改用 LC 拿到的 __cstring 范围。
         uint64_t skuVM[64]; int nSku2 = 0;
-        for (uint64_t off = 0; off + 8 < textSize && nSku2 < 64; off++) {
-            if (bd[textFileOff + off] != 0) continue;
-            const char *sp = (const char *)(bd + textFileOff + off + 1);
+        for (uint64_t o2 = 0; o2 + 8 < cstrSize && nSku2 < 64; o2++) {
+            if (bd[cstrFileOff + o2] != 0) continue;
+            const char *sp = (const char *)(bd + cstrFileOff + o2 + 1);
             size_t L = strnlen(sp, 65);
             if (L < 5 || L > 64) continue;
             if (!memchr(sp, '.', L)) continue;
@@ -801,7 +807,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
             if (bad || hasUpper) continue;
             if (!memmem(sp, L, "pro", 3) && !memmem(sp, L, "vip", 3) &&
                 !memmem(sp, L, "premium", 7) && !memmem(sp, L, "subscri", 7)) continue;
-            skuVM[nSku2++] = textVM + off + 1;
+            skuVM[nSku2++] = cstrVM + o2 + 1;
         }
         if (nSku2) {
             uint64_t refFn[16]; int nRefFn = 0;
@@ -895,6 +901,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
                       (unsigned long long)esc, (unsigned long long)M, best);
             }
             mfLog(@"[f8v2] sk2br: SKU串=%d 引用函数=%d 门分支点=%d 个", nSku2, nRefFn, nBr);
+        } else {
+            mfLog(@"[f8v2] sk2br: __cstring 区(%#llx+%#llx) 无 SKU 形态串", cstrVM, cstrSize);
         }
     }
 
