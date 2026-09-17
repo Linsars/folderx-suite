@@ -934,6 +934,38 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 BOOL clsHit = NO;
                 for (int w = 0; w < 8; w++) if (strstr(cn, kClsWords[w])) { clsHit = YES; break; }
                 if (!clsHit) continue;
+                // v2.58.86: 运行时类内省 — 拿到权益类的完整 ivar/method 映射。
+                //   动机: 静态偏移在混淆二进制里无法区分类(0x6d0 在几百个类里都有字段),
+                //   四轮点位全错即此因。类元数据是类专属的, 不会被撞名欺骗。
+                //   getter IMP = "读侧收敛点": 一处 patch 全部读取者生效, 且不毁栈
+                //   (Swift 存储属性 getter 通常 8 字节: ldrb w0,[x0,#imm]; ret
+                //    → 可原位替换为 mov w0,#1; ret, 同长度零副作用)。
+                //   纯内省(class_copyIvarList/class_copyMethodList), 零 hook 零 patch。
+                {
+                    static int nEntClsDump = 0;
+                    if (nEntClsDump < 6) {
+                        nEntClsDump++;
+                        NSMutableString *ds = [NSMutableString string];
+                        unsigned int dIv = 0;
+                        Ivar *divs = class_copyIvarList(c, &dIv);
+                        for (unsigned int di = 0; divs && di < dIv; di++)
+                            [ds appendFormat:@"\n      ivar %-24s off=%-5ld %s",
+                             ivar_getName(divs[di]) ?: "?", (long)ivar_getOffset(divs[di]),
+                             ivar_getTypeEncoding(divs[di]) ?: "?"];
+                        if (divs) free(divs);
+                        unsigned int dM = 0;
+                        Method *dms = class_copyMethodList(c, &dM);
+                        for (unsigned int dm = 0; dms && dm < dM; dm++) {
+                            const char *sn = sel_getName(method_getName(dms[dm]));
+                            uint64_t imp = (uint64_t)method_getImplementation(dms[dm]);
+                            uint64_t vm = imp - (uint64_t)slide;
+                            if (vm >= 0x100000000ULL && vm < 0x1014b0000ULL)   // 只在主二进制内(可 patch)
+                                [ds appendFormat:@"\n      sel %-28s vmaddr=%#llx", sn ?: "?", vm];
+                        }
+                        if (dms) free(dms);
+                        mfLog(@"[entcls] %s ivars=%u methods=%u%@", cn, dIv, dM, ds);
+                    }
+                }
                 unsigned int nIv = 0;
                 Ivar *ivs = class_copyIvarList(c, &nIv);
                 if (!ivs) continue;
