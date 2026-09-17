@@ -68,6 +68,10 @@ static void mfWritePrefObj(NSString *key, id val) {
     if (val) d[key] = val; else [d removeObjectForKey:key];
     [d writeToFile:MFPrefsPath() atomically:YES];
 }
+// v2.58.70: 墓碑(fwd) — 定义在下方, apEntDumpsLoad/Merge 先用
+static NSString *apCurBundleID(void);
+static NSArray *apTombstones(void);
+static void apTombstoneAdd(NSString *sym);
 
 // ====== 状态 ======
 static long g_apHits = 0;          // 成功 patch 数
