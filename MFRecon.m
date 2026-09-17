@@ -940,15 +940,30 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 for (unsigned int ii = 0; ii < nIv && nGateOff < 16; ii++) {
                     const char *in = ivar_getName(ivs[ii]);
                     if (!in) continue;
+                    // v2.58.81 修: 旧实现裸子串匹配 → "isPro" 命中 isProfiling/isProgressive/
+                    //   isProcessingInstruction/isProxy(Nuke/Sentry/Amplitude 字段, 偏移 0x8/0x20
+                    //   = 对象头) → 249 个噪声点(mf_debug_83)。
+                    //   修法: ①前缀词 ②词边界(后跟字符不能是小写字母) ③黑名单二次排除
                     static const char *kIvWords[] = {"isVip","isPro","hasPro","hasVip","entitled",
                                                      "hasAccess","isPremium","isMember","vipStatus",
                                                      "proStatus","isSubscribed","hasEntitle",
                                                      "vipActive","isUnlocked","hasPurchas"};
+                    static const char *kIvBlack[] = {"Profiling","Processing","Progressive","Proxy",
+                                                     "Probe","Promo","Property","Provider","Protocol",
+                                                     "Program","Progress"};
                     BOOL ivHit = NO;
-                    for (int w = 0; w < 15; w++) if (strstr(in, kIvWords[w])) { ivHit = YES; break; }
+                    for (int w = 0; w < 15 && !ivHit; w++) {
+                        const char *pp = strstr(in, kIvWords[w]);
+                        if (!pp) continue;
+                        char nxt = pp[strlen(kIvWords[w])];
+                        if (nxt >= 'a' && nxt <= 'z') continue;   // 词边界: 后跟小写 = 别的词
+                        ivHit = YES;
+                    }
+                    if (ivHit) for (int w = 0; w < 11; w++) if (strstr(in, kIvBlack[w])) { ivHit = NO; break; }
                     if (!ivHit) continue;
                     ptrdiff_t off = ivar_getOffset(ivs[ii]);
-                    if (off <= 0 || off > 0x2000) continue;
+                    // v2.58.81: 偏移门 — 0x8/0x20 是对象头(isa/引用计数), 真业务字段在后面
+                    if (off < 0x40 || off > 0x2000) continue;
                     BOOL dup = NO;
                     for (int k = 0; k < nGateOff; k++) if (gateOffs[k] == (uint32_t)off) { dup = YES; break; }
                     if (!dup) gateOffs[nGateOff++] = (uint32_t)off;
@@ -969,13 +984,19 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 BOOL offHit = NO;
                 for (int k = 0; k < nGateOff; k++) if (gateOffs[k] == imm) { offHit = YES; break; }
                 if (!offHit) continue;
-                uint32_t w2 = *(const uint32_t *)(bd + textFileOff + o + 4);
-                if ((w2 & 0xFFFFFC1F) != 0x7100041F) continue;      // cmp wT,#1
-                if (((w2 >> 5) & 0x1F) != T) continue;
-                uint32_t w3 = *(const uint32_t *)(bd + textFileOff + o + 8);
-                BOOL isBr = ((w3 & 0xFF000010) == 0x54000000) ||
-                            ((w3 & 0x7F000000) == 0x34000000);
-                if (!isBr) continue;                                 // 门控分支
+                // v2.58.81: cmp 窗口放宽到 4 条 — 桥实测 0x100660ed8 的形态是
+                //   ldrb → add → bl → cmp → b.ne(中间插了 2 条), 旧窗口 1~2 条会漏
+                BOOL gateOK = NO;
+                for (int k = 1; k <= 4 && !gateOK; k++) {
+                    if (o + (uint64_t)(k + 1) * 4 + 4 > textSize) break;
+                    uint32_t w2 = *(const uint32_t *)(bd + textFileOff + o + (uint64_t)k * 4);
+                    if ((w2 & 0xFFFFFC1F) != 0x7100041F) continue;   // cmp wT,#1
+                    if (((w2 >> 5) & 0x1F) != T) continue;
+                    uint32_t w3 = *(const uint32_t *)(bd + textFileOff + o + (uint64_t)(k + 1) * 4);
+                    if (((w3 & 0xFF000010) == 0x54000000) ||
+                        ((w3 & 0x7F000000) == 0x34000000)) gateOK = YES;
+                }
+                if (!gateOK) continue;                               // 门控分支
                 nGate++;
                 uint32_t movNew = 0x52800020u | T;                   // mov wT,#1
                 [sk2pts addObject:@{
