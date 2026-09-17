@@ -740,11 +740,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
             if ((w2 & 0xFFFFFC1F) != 0xF100001F) continue;      // cmp xT,#0
             if (((w2 >> 5) & 0x1F) != T1) continue;
             uint32_t w3 = *(const uint32_t *)(bd + textFileOff + off + 8);
-            // cset wS,ne 精确判定: 0x1A9F07E0 | cond<<12; cond=ne(1) → 0x1A9F17E0
-            // v2.58.72 修: 旧掩码 0xFFFF0FFF/0x1A9F07E1 恒假(cset cond 在位15-12, 被掩掉
-            //   后低半字节又与 0xE1 比 → 设备上 sk2dat 恒 0 命中, mf_debug_74 实证)
-            if ((w3 & 0xFFF00FE0) != 0x1A9F07E0) continue;      // 含 cond 检查
-            if (((w3 >> 12) & 0xF) != 0x1) continue;            // 只收 ne(存在→真)
+            // cset wS,ne 精确判定: 0x1A9F07E0。
+            // v2.58.72 修: 旧掩码 0xFFFF0FFF/0x1A9F07E1 恒假(cset cond 在位15-12,
+            //   被掩掉后低半字节又与 0xE1 比) → 设备上 sk2dat 恒 0 命中(mf_debug_74)。
+            //   注: CSET 的 cond 字段 = invert(实际cond), 故 ne→字段0(0x1A9F07E0),
+            //   eq→字段1(0x1A9F17E0)。掩码 0xFFFFFFE0 已钉死字段=0, 无需二次判断。
+            if ((w3 & 0xFFFFFFE0) != 0x1A9F07E0) continue;      // cset w*,#ne 精确
             uint64_t a6 = textVM + off;
             BOOL dup6 = NO;
             for (NSDictionary *sp in sk2pts)
