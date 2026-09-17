@@ -162,30 +162,36 @@ static BOOL apTextPatchAt(uintptr_t target, NSData *expectOld, NSData *newBytes,
     }
     uint32_t pre = 0; BOOL hadPre = NO;
     if (newBytes.length >= 4) { pre = *(const uint32_t *)target; hadPre = YES; }   // v2.58.82: 改前值
-    kern_return_t kr = vm_protect(mach_task_self(), target & ~0xFFFUL, 0x1000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    // v2.58.82: 跨页保护 — 4 字节 patch 落在页尾 1~3 字节时需要保护两页
+    uintptr_t pgA = target & ~0xFFFUL;
+    uintptr_t pgB = (target + newBytes.length - 1) & ~0xFFFUL;
+    vm_size_t span = (vm_size_t)(pgB - pgA) + 0x1000;
+    kern_return_t kr = vm_protect(mach_task_self(), pgA, span, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
         *err = [NSString stringWithFormat:@"vm_protect RW failed kr=%d", kr];
         return NO;
     }
     memcpy((void*)target, newBytes.bytes, newBytes.length);
     sys_icache_invalidate((void*)target, newBytes.length);
-    // v2.58.82: ★回读校验 — 三轮"patch OK 却不亮"的核心疑点: 所有成功都是自报,
-    //   从未独立回读内存。memcpy 后立刻重读, 拿不到期望值就是硬失败(不是判据问题)。
-    if (hadPre && newBytes.length >= 4) {
-        uint32_t want = 0; memcpy(&want, newBytes.bytes, 4);
-        uint32_t post = *(const uint32_t *)target;   // 真·内存回读
-        BOOL land = (post == want);
-        apLog(@"[verify] %p pre=%08x want=%08x post=%08x %@",
-              (void*)target, pre, want, post, land ? @"✓字节已落地" : @"✗未落地(写失败)");
-        if (!land) {
-            *err = [NSString stringWithFormat:@"readback mismatch @%p: post=%08x want=%08x", (void*)target, post, want];
-            return NO;
-        }
+    // ★回读校验 — 三轮"patch OK 却不亮"的核心疑点: 所有成功都是自报, 从未独立回读内存。
+    //   注意: 先恢复 RX 再判返回值 — 否则失败路径会把该页留在"可写不可执行"状态,
+    //   该页代码一执行就崩(v2.58.82 自查修正: 初版在恢复前 return NO, 会毁掉其它点)。
+    BOOL land = YES; uint32_t want = 0, post = 0;
+    if (hadPre) {
+        memcpy(&want, newBytes.bytes, 4);
+        post = *(const uint32_t *)target;   // 真·内存回读
+        land = (post == want);
     }
-    kr = vm_protect(mach_task_self(), target & ~0xFFFUL, 0x1000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    apLog(@"[verify] %p pre=%08x want=%08x post=%08x %@",
+          (void*)target, pre, want, post, land ? @"✓字节已落地" : @"✗未落地(写失败)");
+    kr = vm_protect(mach_task_self(), pgA, span, 0, VM_PROT_READ | VM_PROT_EXECUTE);
     if (kr != KERN_SUCCESS) {
         *err = [NSString stringWithFormat:@"vm_protect RX restore failed kr=%d", kr];
         return NO; // 字节已写, 权限没恢复 — 仍算半成功
+    }
+    if (!land) {
+        *err = [NSString stringWithFormat:@"readback mismatch @%p: post=%08x want=%08x", (void*)target, post, want];
+        return NO;
     }
     return YES;
 }
