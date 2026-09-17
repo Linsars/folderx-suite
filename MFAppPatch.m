@@ -1360,6 +1360,22 @@ static MFAPEntList *g_apEntList = nil;
         }
         // v2.58.52: 点位带 old 字段时校验原字节(指令漂移自检)
         NSData *oldBytes = ([d[@"old"] isKindOfClass:[NSString class]] && [d[@"old"] length]) ? apHexToBytes(d[@"old"]) : nil;
+        // v2.58.85 (mf_debug_87 定谳): 序言形态拦截必须在 ⚡ 立即路径也有 —
+        //   v2.58.84 只加在持久化重打路径(apEntDumpsApply), 导致 ⚡ 仍能打穿
+        //   4 个序言点(日志实测 pre=d10343ff want=52800020 仍出现)。
+        //   序言被 4 字节 mov w0,#1 整体替换后无 ret → 函数继续执行 stp x28,x27,[sp,#8],
+        //   栈帧未建立 ⇒ 写进调用者栈帧(毁栈), 且返回值被函数尾部真实逻辑覆盖 ⇒ 双重有害。
+        if (oldBytes.length >= 4) {
+            uint32_t o0 = 0; [oldBytes getBytes:&o0 length:4];
+            BOOL isPrologue = ((o0 & 0xFFC003FF) == 0xD10003FF && ((o0 >> 10) & 0xFFF)) ||
+                              ((o0 & 0x7FC00000) == 0x29800000 && ((o0 >> 5) & 0x1F) == 31) ||
+                              (o0 == 0xD503237F);
+            if (isPrologue) {
+                apLog(@"[entdump] ⛔ %@ 序言形态(%08x) 拒绝 patch — 4 字节无法安全表达(毁栈+返回值被覆盖)", sym, o0);
+                mfToast(@"⛔ 该点是函数序言 — 无法安全 patch（会毁栈）");
+                return;
+            }
+        }
         if (apSwiftTextPatchDump(d, oldBytes, newBytes, &err)) {
             g_apHits++;
             // v2.58.31: ⚡即持久化 — 与 F9 卡片交互对齐(用户定谳: "patch 了还要再点
