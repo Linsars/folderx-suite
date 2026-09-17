@@ -79,6 +79,7 @@ void mfAppPatchTombstoneRemove(NSString *sym);
 
 // ====== 状态 ======
 static long g_apHits = 0;          // 成功 patch 数
+static long g_apProPhit = 0;       // v2.58.84: 序言形态拒绝计数(诊断用)
 static long g_apCollHits = 0;      // 采集到的外部 patch 数
 static BOOL g_apCollInstalled = NO;
 static NSMutableArray *g_apLog = nil;   // 最近 50 条日志
@@ -808,6 +809,28 @@ void apEntDumpsApply(void) {
                 } else newBytes = apHexToBytes(@"20008052");   // mov w0,#1 兜底
             }
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
+        // v2.58.84 (mf_debug_86 定谳): 序言形态拦截。
+        //   F8v2 语义锚定候选点位上入库的是"函数序言"(sub sp,sp,#N / stp X,X,[sp,#-N]! / pacibsp),
+        //   而执行器把序言整体替换成 4 字节 mov w0,#1 — 函数随后照常执行 stp x28,x27,[sp,#8],
+        //   此时栈帧并未建立 → 写进调用者栈帧; 且返回值在函数尾部被真实逻辑覆盖。
+        //   结果: 既不解锁(返回值被覆盖), 又毁栈(mf_debug_85 四序言点即此形态, 全部空转)。
+        //   序言点位的语义不可知(可能是 void / 多返回值), 4 字节无法安全表达 → 拒绝执行。
+        {
+            NSData *oldChk = ([d[@"old"] isKindOfClass:[NSString class]] && [d[@"old"] length])
+                             ? apHexToBytes(d[@"old"]) : nil;
+            if (oldChk.length >= 4) {
+                uint32_t o0 = 0; [oldChk getBytes:&o0 length:4];
+                BOOL isPrologue = ((o0 & 0xFFC003FF) == 0xD10003FF && ((o0 >> 10) & 0xFFF)) ||
+                                  ((o0 & 0x7FC00000) == 0x29800000 && ((o0 >> 5) & 0x1F) == 31) ||
+                                  (o0 == 0xD503237F);
+                if (isPrologue) {
+                    apLog(@"[entdump] ⛔ %@ 序言形态(%08x) 拒绝 patch — 4 字节无法安全表达(会毁栈且返回值被覆盖)",
+                          [d[@"sym"] lastPathComponent], o0);
+                    g_apProPhit++;
+                    continue;
+                }
+            }
+        }
         // v2.58.52: 点位带 old 字段时校验原字节(指令漂移自检, sk2pro/sk2ver 专用)
         NSData *oldBytes = ([d[@"old"] isKindOfClass:[NSString class]] && [d[@"old"] length]) ? apHexToBytes(d[@"old"]) : nil;
         if (apSwiftTextPatchDump(d, oldBytes, newBytes, &err)) {

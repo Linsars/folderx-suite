@@ -997,6 +997,39 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         ((w3 & 0x7F000000) == 0x34000000)) gateOK = YES;
                 }
                 if (!gateOK) continue;                               // 门控分支
+                // ------------------------------------------------------------------
+                // v2.58.84 (mf_debug_86 定谳): 类归属指纹门 — ivargate 的三轮不亮根源。
+                //   静态偏移在 Swift 混淆的 30MB 二进制里无法区分类: 0x660ed8/0x684e34 两个
+                //   "门控点" 实测分别位于 fn 0x100660d58(读 x22 上 #0x2970) 与
+                //   fn 0x100684de0(Swift Array 逐元素 0xd8 memcpy) — 两者都不是 HMVipProManager
+                //   的方法, 只是某个无关结构在该偏移恰好有字段 → 纯偏移撞名。
+                //   判据: HMVipProManager 自身代码必然同时碰多个权益 ivar 偏移
+                //   (指纹实测 fn 0x1001cdb2c 命中 6 种: 0x6d0/0x6e0/0x6f0/0x700/0x8c0/0x8d0)。
+                //   故要求: 点位所在函数内出现 >=2 个不同 gateOffs 才认类归属。
+                //   偏好精确而非召回 — 三轮假阳性已证明"召回过宽"是主要损失来源。
+                uint64_t fnStart = o;
+                for (uint64_t back = 0; back < 0x10000 && o >= back; back += 4) {
+                    uint32_t q = *(const uint32_t *)(bd + textFileOff + o - back);
+                    if (q == 0xD503237F) { fnStart = o - back; break; }
+                    if ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) { fnStart = o - back; break; }
+                    if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) { fnStart = o - back; break; }
+                }
+                int nOtherOff = 0;
+                for (uint64_t p = fnStart; p + 64 <= textSize && p < fnStart + 0x8000; p += 4) {
+                    uint32_t wp = *(const uint32_t *)(bd + textFileOff + p);
+                    uint32_t bp = wp & 0xFFC00000;
+                    if (bp != 0x39400000 && bp != 0x39000000) continue;   // ldrb / strb
+                    if ((wp & 0x1F) == 31 || ((wp >> 5) & 0x1F) == 31) continue;
+                    uint32_t ip = (wp >> 10) & 0xFFF;
+                    if (ip == imm) continue;
+                    for (int k2 = 0; k2 < nGateOff; k2++)
+                        if (gateOffs[k2] == ip) { nOtherOff++; break; }
+                }
+                if (nOtherOff < 1) {                                  // 函数内无第二个权益偏移 → 撞名
+                    mfLog(@"[f8v2] ivargate 丢弃 @%#llx (偏移%#x 撞名: 函数 %#llx 内无其它权益 ivar)",
+                          (unsigned long long)(textVM + o), imm, (unsigned long long)(textVM + fnStart));
+                    continue;
+                }
                 nGate++;
                 uint32_t movNew = 0x52800020u | T;                   // mov wT,#1
                 [sk2pts addObject:@{
@@ -1011,8 +1044,9 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     @"old": mfLeHex(w1),
                     @"new": mfLeHex(movNew),
                 }];
-                mfLog(@"[f8v2] ★ivargate @%#llx (权益 ivar 读侧门: ldrb w%u,[xN,#%#x]→mov w%u,#1)",
-                      (unsigned long long)(textVM + o), T, imm, T);
+                mfLog(@"[f8v2] ★ivargate @%#llx (权益 ivar 读侧门: ldrb w%u,[xN,#%#x]→mov w%u,#1, fn=%#llx 指纹=%d)",
+                      (unsigned long long)(textVM + o), T, imm, T,
+                      (unsigned long long)(textVM + fnStart), nOtherOff + 1);
             }
             mfLog(@"[f8v2] ivargate: 权益类 ivar 偏移=%d 个, 读侧门控点=%d 个", nGateOff, nGate);
         } else {
