@@ -1717,6 +1717,10 @@ NSDictionary *mfReconFingerprint(void) {
             sk2LocalType = YES;
     }
     NSMutableArray *entFuncs = [NSMutableArray array];
+    // v2.58.74: 轮次开始 — 标记库中点位"本轮未见", merge 时置 seen, 结束剔除陈旧
+    extern void mfAppPatchEntDumpsBeginRound(void);
+    extern void mfAppPatchEntDumpsEndRound(void);
+    mfAppPatchEntDumpsBeginRound();
     if (!sk2LocalType) {   // v2.58.55: SK2 流型时框架符号点位是噪声, 整块跳过
         uint32_t ic = _dyld_image_count();
         for (uint32_t i = 0; i < ic && entFuncs.count < 24; i++) {
@@ -1937,6 +1941,8 @@ NSDictionary *mfReconFingerprint(void) {
 
     // v2.58.55: 本次会话侦查点位缓存 — 已废除(2.58.61 用户定案)
     //   侦查→mfAppPatchEntDumpsMerge 入库, 实验/列表 UI 只读持久层, 无"本次有效"概念
+    // v2.58.74: 轮次结束 — 剔除本轮未扫出且用户未持久化的陈旧点后, 卡片"共 N 点"= 本轮真值
+    mfAppPatchEntDumpsEndRound();
     return @{@"verdict": verdict, @"lines": lines,
              @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide), @"sk": @(skLocal),
              @"sk2": @(sk2stream),

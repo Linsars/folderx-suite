@@ -593,6 +593,39 @@ NSArray *mfAppPatchEntDumps(void) { apEntDumpsLoad(); return g_entDumps; }
 // v2.58.61: 会话缓存架构已废(用户定案"你为什么要搞得这么复杂") —
 //   侦查→mfAppPatchEntDumpsMerge 入库, 实验/列表 UI 只读持久层。"本次有效"概念删除。
 // F8 扫描点位合并进持久存储(去重: img+sym 相同视为同点)
+// v2.58.74: 轮次机制 — 卡片"共 N 点"读的是持久库全量, 跨轮 merge 只增不减
+//   → mf_debug_75 用户看到 35 点(侦查详情只报 12, 库里是历史累积)。
+//   侦查开始清 seen, merge 时置 seen, 结束剔除"本轮未扫出且用户未持久化"的陈旧点;
+//   用户 ⚡/💾 过的(on=YES)永不清 — 与墓碑同哲学: 用户意图优先于引擎本轮产出。
+static int g_entRoundSeen = 0;
+void mfAppPatchEntDumpsBeginRound(void) {
+    apEntDumpsLoad();
+    g_entRoundSeen = 0;
+    for (NSMutableDictionary *m in g_entDumps) m[@"seen"] = @NO;
+}
+void mfAppPatchEntDumpsEndRound(void) {
+    if (g_entRoundSeen == 0) return;   // 本轮零产出(侦查 bail) → 不清, 免误删
+    apEntDumpsLoad();
+    NSUInteger before = g_entDumps.count;
+    NSMutableArray *keep = [NSMutableArray array];
+    for (NSDictionary *m in g_entDumps) {
+        BOOL seen = [m[@"seen"] boolValue];
+        BOOL on = [m[@"on"] boolValue];
+        if (!seen && !on) {
+            apLog(@"[entdump] ⚰ 陈旧点剔除 %@ (本轮未扫出且未持久化)", m[@"sym"]);
+            continue;
+        }
+        [keep addObject:m];
+    }
+    if (keep.count != before) {
+        g_entDumps = keep;
+        apEntDumpsSave();
+        apLog(@"[entdump] 库同步: %lu → %lu 条(剔除陈旧 %lu, 保留用户持久化 %lu)",
+              (unsigned long)before, (unsigned long)keep.count,
+              (unsigned long)(before - keep.count),
+              (unsigned long)[[keep filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"on == YES"]] count]);
+    }
+}
 void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
     if (![newOnes isKindOfClass:[NSArray class]]) return;
     apEntDumpsLoad();
@@ -610,7 +643,9 @@ void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
         if (!dup) {
             NSMutableDictionary *m = [n mutableCopy];
             m[@"on"] = @NO;                       // 新点位默认未开启(用户左划持久化才开)
+            m[@"seen"] = @YES;                    // v2.58.74: 本轮扫出
             [g_entDumps addObject:m];
+            g_entRoundSeen++;
         } else {
             // v2.58.18: 旧点位补 shape 字段(重扫后分类升级, 不动用户持久化开关)
             // v2.58.30: 同时补 vmaddr/slide — mf_debug_30 定谳: ivarRead@/ivarGetter@
@@ -621,6 +656,8 @@ void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
             // mfLeHex 内存序; 旧点位重扫时在此处换代修正。
             for (NSMutableDictionary *m in g_entDumps)
                 if ([m[@"img"] isEqualToString:n[@"img"]] && [m[@"sym"] isEqualToString:n[@"sym"]]) {
+                    m[@"seen"] = @YES;            // v2.58.74: 本轮重温 → 不算陈旧
+                    g_entRoundSeen++;
                     if (n[@"shape"] && !m[@"shape"]) m[@"shape"] = n[@"shape"];
                     if (n[@"vmaddr"] && !m[@"vmaddr"]) m[@"vmaddr"] = n[@"vmaddr"];
                     if (n[@"slide"] && !m[@"slide"]) m[@"slide"] = n[@"slide"];
