@@ -534,6 +534,29 @@ static void apEntDumpsLoad(void) {
             if ([a isKindOfClass:[NSArray class]]) g_entDumps = [a mutableCopy];
         }
         if (!g_entDumps) g_entDumps = [NSMutableArray new];
+        // v2.58.70: 墓碑自愈 — 库里已存在的墓碑点位(用户 ✂ 过但被重扫 merge 复活的)
+        //   启动即剔除, 不进重打清单。mf_debug_72: deepslot@11d1398.9 僵尸在库 on=YES
+        //   → 双点恒1 → 破坏 CustomerInfo 解析 → mock 腿假死。
+        {
+            NSArray *tombs2 = apTombstones();
+            if (tombs2.count) {
+                NSMutableArray *clean2 = [NSMutableArray array];
+                for (NSDictionary *d2 in g_entDumps) {
+                    NSString *sy2 = d2[@"sym"] ?: @"";
+                    if (sy2.length && [tombs2 containsObject:sy2]) {
+                        apLog(@"[entdump] ⚰ 墓碑自愈: 剔除 %@ (on=%@, 不再重打)", sy2, d2[@"on"] ?: @0);
+                        continue;
+                    }
+                    [clean2 addObject:d2];
+                }
+                if (clean2.count != g_entDumps.count) {
+                    g_entDumps = clean2;
+                    NSData *dd2 = [NSJSONSerialization dataWithJSONObject:g_entDumps options:0 error:nil];
+                    if (dd2) mfWritePrefObj([NSString stringWithFormat:@"mfEntDumps_%@", apCurBundleID()],
+                                            [[NSString alloc] initWithData:dd2 encoding:NSUTF8StringEncoding]);
+                }
+            }
+        }
         // v2.58.65: 旧库自愈 — sk2ver 判别点是死代码(实机三轮零作用), 从库中剔除
         //   (用户在 2.58.64 前扫入的遗留条目, 不清会继续出现在列表/重打清单里)
         NSMutableArray *clean = [NSMutableArray array];
@@ -564,8 +587,14 @@ NSArray *mfAppPatchEntDumps(void) { apEntDumpsLoad(); return g_entDumps; }
 void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
     if (![newOnes isKindOfClass:[NSArray class]]) return;
     apEntDumpsLoad();
+    NSArray *tombs = apTombstones();   // v2.58.70: 墓碑点位永不复活
     for (NSDictionary *n in newOnes) {
         if (![n isKindOfClass:[NSDictionary class]]) continue;
+        NSString *nsym = n[@"sym"] ?: @"";
+        if (nsym.length && [tombs containsObject:nsym]) {
+            apLog(@"[entdump] ⚰ 墓碑跳过 %@ (用户已删, 侦查不再入库)", nsym);
+            continue;
+        }
         BOOL dup = NO;
         for (NSDictionary *o in g_entDumps)
             if ([o[@"img"] isEqualToString:n[@"img"]] && [o[@"sym"] isEqualToString:n[@"sym"]]) { dup = YES; break; }
@@ -601,14 +630,29 @@ void mfAppPatchEntDumpSetOn(NSString *sym, BOOL on) {
     apEntDumpsSave();
 }
 // v2.58.12: 删除点位 — 左划删除用; 同 sym 去重口径单条删除(扫描 merge 端 img+sym 去重)
+// v2.58.70: ✂ 墓碑 — 用户删过的点位, 侦查 merge 不再复活。
+//   mf_debug_72 定谳: F10 每次侦查都扫出同族点(11d1398=CustomerInfo 序列化族,
+//   非 licensed 真点), 用户在 46 轮 ✂ 删过, 但 72 轮重扫又被 merge 回库 → 双点
+//   恒1 破坏 CustomerInfo 解析 → mock 数据到不了 UI → 双因子瘸腿。
+//   墓碑按 bid 隔离(prefs key mfTombstones_<bid>), 跨会话持久。
+static NSArray *apTombstones(void) {
+    id v = mfReadPrefObj([NSString stringWithFormat:@"mfTombstones_%@", apCurBundleID()]);
+    return [v isKindOfClass:[NSArray class]] ? v : @[];
+}
+static void apTombstoneAdd(NSString *sym) {
+    NSMutableArray *ts = [apTombstones() mutableCopy] ?: [NSMutableArray array];
+    if (![ts containsObject:sym]) [ts addObject:sym];
+    mfWritePrefObj([NSString stringWithFormat:@"mfTombstones_%@", apCurBundleID()], ts);
+}
 void mfAppPatchEntDumpDelete(NSString *sym) {
     apEntDumpsLoad();
     for (NSInteger i = (NSInteger)g_entDumps.count - 1; i >= 0; i--)
         if ([g_entDumps[i][@"sym"] isEqualToString:sym]) {
             [g_entDumps removeObjectAtIndex:(NSUInteger)i];
-            apLog(@"[entdump] ✂ 删除点位 %@", sym);
+            apLog(@"[entdump] ✂ 删除点位 %@ (已立墓碑, 侦查不再复活)", sym);
             break;
         }
+    apTombstoneAdd(sym);   // v2.58.70: 无论库中是否有, 都记墓碑(防 merge 复活)
     apEntDumpsSave();
 }
 // 冷启动/热触发: 重打所有 on=YES 点位(持久化执行核心)
