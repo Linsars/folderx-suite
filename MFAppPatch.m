@@ -1161,10 +1161,10 @@ static MFAPEntList *g_apEntList = nil;
     [ac addAction:[UIAlertAction actionWithTitle:@"♻️ 全部清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
         mfAppPatchTombstonesClear();
         mfToast(@"墓碑已清 — 重进侦查页即可重新发现");
-        [self mfAPShowLabPage];
     }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [self presentViewController:ac animated:YES completion:nil];
+    extern UIViewController *g_mfPanelRootVC;   // 面板宿主(既有弹窗同款入口)
+    [g_mfPanelRootVC presentViewController:ac animated:YES completion:nil];
 }
 - (void)mfAPShowEntDumps {
     UIView *page = mfMakePage(@"🎯 判定点", YES);
