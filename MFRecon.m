@@ -770,6 +770,134 @@ static NSDictionary *mfReconF8v2Scan(void) {
         mfLog(@"[f8v2] sk2dat: B 路无锚数据源点=%d 个(cset ne 门, 零字符串依赖)", nDat);
     }
 
+    // =====================================================================
+    // sk2br (v2.58.78): 分支粒度判定点 — 打"Pro 门"的分支决策, 不砍函数头。
+    //   动机(mf_debug_79): 真点 0x1004a080c/0x100c053ac 函数头 mov w0,#1;ret 全空转 —
+    //   多返回路径的大函数里, 函数头短路 ≠ "Pro 有效"。
+    //   算法(零 SKU 硬编码, 只用形态门):
+    //     ① __TEXT 线性扫 SKU 形态串(全小写+含点, 词含 pro/vip/premium/subscri)
+    //     ② adrp+add 引用 → 归属引用函数(≤16)
+    //     ③ 函数内扫条件分支(b.cond/tbz/tbnz/cbz/cbnz)统计靶频次
+    //     ④ M = fan-in ≥2 的最大靶(> 函数头) = "命中/继续" 汇聚点
+    //     ⑤ escape = 条件分支中 fall-through(pc+4)==M 的那条(即"未命中→逃逸")
+    //        patch = NOP(4B) → 恒走 M(matched 路径)
+    //   实测(bplayer): 0x1004a080c escape=0x1004a09fc→M=0x1004a0a00;
+    //                   0x100c053ac escape=0x100c05a64→M=0x100c05a68(4 分支汇聚)
+    // =====================================================================
+    {
+        uint64_t skuVM[64]; int nSku2 = 0;
+        for (uint64_t off = 0; off + 8 < textSize && nSku2 < 64; off++) {
+            if (bd[textFileOff + off] != 0) continue;
+            const char *sp = (const char *)(bd + textFileOff + off + 1);
+            size_t L = strnlen(sp, 65);
+            if (L < 5 || L > 64) continue;
+            if (!memchr(sp, '.', L)) continue;
+            int bad = 0, hasUpper = 0;
+            for (size_t k = 0; k < L; k++) {
+                char c = sp[k];
+                if (c >= 'A' && c <= 'Z') { hasUpper = 1; break; }
+                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) { bad = 1; break; }
+            }
+            if (bad || hasUpper) continue;
+            if (!memmem(sp, L, "pro", 3) && !memmem(sp, L, "vip", 3) &&
+                !memmem(sp, L, "premium", 7) && !memmem(sp, L, "subscri", 7)) continue;
+            skuVM[nSku2++] = textVM + off + 1;
+        }
+        if (nSku2) {
+            uint64_t refFn[16]; int nRefFn = 0;
+            for (uint64_t off = 0; off + 8 < textSize && nRefFn < 16; off += 4) {
+                uint32_t w1 = *(const uint32_t *)(bd + textFileOff + off);
+                if ((w1 & 0x9F000000) != 0x90000000) continue;
+                uint32_t w2 = *(const uint32_t *)(bd + textFileOff + off + 4);
+                if ((w2 & 0xFFC00000) != 0x91000000) continue;
+                int64_t immlo = (w1 >> 29) & 3, immhi = (w1 >> 5) & 0x7FFFF;
+                int64_t imm = (immhi << 2) | immlo;
+                if (imm & (1 << 20)) imm -= (1 << 21);
+                uint64_t page = ((textVM + off) & ~0xFFFULL) + ((uint64_t)imm << 12);
+                uint64_t tgt = page + ((w2 >> 10) & 0xFFF);
+                BOOL isSku = NO;
+                for (int k = 0; k < nSku2; k++) if (skuVM[k] == tgt) { isSku = YES; break; }
+                if (!isSku) continue;
+                uint64_t h2 = 0;
+                for (uint64_t back = 0; back < 0x10000 && off >= back + 4; back += 4) {
+                    uint32_t q = *(const uint32_t *)(bd + textFileOff + off - back);
+                    if (q == 0xD503237F || ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) ||
+                        ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF))) { h2 = textVM + off - back; break; }
+                }
+                if (!h2) continue;
+                BOOL dup2 = NO;
+                for (int k = 0; k < nRefFn; k++) if (refFn[k] == h2) { dup2 = YES; break; }
+                if (!dup2 && nRefFn < 16) refFn[nRefFn++] = h2;
+            }
+            int nBr = 0;
+            for (int f = 0; f < nRefFn; f++) {
+                uint64_t h = refFn[f];
+                uint64_t tgtBuf[128]; int cntBuf[128]; int nT = 0;
+                for (uint64_t o = 0; o < 0x3000; o += 4) {
+                    uint64_t a = h + o;
+                    if (a + 4 > textVM + textSize) break;
+                    uint32_t w = *(const uint32_t *)(bd + textFileOff + (a - textVM));
+                    if (w == 0xD65F03C0 && o > 0x20) break;
+                    uint64_t t = 0;
+                    if ((w & 0xFF000010) == 0x54000000) {
+                        int64_t im = (w >> 5) & 0x7FFFF; if (im & 0x40000) im -= 0x80000;
+                        t = a + im * 4;
+                    } else if (((w >> 25) & 0x3F) == 0b011011) {
+                        int64_t im = (w >> 5) & 0x3FFF; if (im & 0x2000) im -= 0x4000;
+                        t = a + im * 4;
+                    } else if ((w & 0x7F000000) == 0x34000000) {
+                        int64_t im = (w >> 5) & 0x7FFFF; if (im & 0x40000) im -= 0x80000;
+                        t = a + im * 4;
+                    } else continue;
+                    if (t <= h) continue;
+                    int idx = -1;
+                    for (int k = 0; k < nT; k++) if (tgtBuf[k] == t) { idx = k; break; }
+                    if (idx < 0) { if (nT >= 128) continue; idx = nT++; tgtBuf[idx] = t; cntBuf[idx] = 0; }
+                    cntBuf[idx]++;
+                }
+                uint64_t M = 0; int best = 0;
+                for (int k = 0; k < nT; k++) if (cntBuf[k] > best) { best = cntBuf[k]; M = tgtBuf[k]; }
+                if (best < 2) continue;
+                uint64_t esc = 0; uint32_t escW = 0;
+                for (uint64_t o = 0; o < 0x3000; o += 4) {
+                    uint64_t a = h + o;
+                    if (a + 4 > textVM + textSize) break;
+                    uint32_t w = *(const uint32_t *)(bd + textFileOff + (a - textVM));
+                    uint64_t t = 0; BOOL isBr = NO;
+                    if ((w & 0xFF000010) == 0x54000000) {
+                        int64_t im = (w >> 5) & 0x7FFFF; if (im & 0x40000) im -= 0x80000;
+                        t = a + im * 4; isBr = YES;
+                    } else if (((w >> 25) & 0x3F) == 0b011011) {
+                        int64_t im = (w >> 5) & 0x3FFF; if (im & 0x2000) im -= 0x4000;
+                        t = a + im * 4; isBr = YES;
+                    } else if ((w & 0x7F000000) == 0x34000000) {
+                        int64_t im = (w >> 5) & 0x7FFFF; if (im & 0x40000) im -= 0x80000;
+                        t = a + im * 4; isBr = YES;
+                    }
+                    if (!isBr || t == M) continue;
+                    if (a + 4 == M) { esc = a; escW = w; break; }
+                }
+                if (!esc) continue;
+                nBr++;
+                [sk2pts addObject:@{
+                    @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                    @"sym": [NSString stringWithFormat:@"sk2br@%#llx", (unsigned long long)(esc - textVM)],
+                    @"vmaddr": @(esc),
+                    @"slide": @((long)slide),
+                    @"score": @(94),
+                    @"calls": @(0),
+                    @"shape": @"sk2br",
+                    @"kind": @"sk2br",
+                    @"old": mfLeHex(escW),
+                    @"new": mfLeHex(0xD503201Fu),   // nop → fall through 到汇聚点
+                }];
+                mfLog(@"[f8v2] ★sk2br @%#llx (Pro门分支: 逃逸→NOP, 恒走汇聚点 %#llx, fan=%d)",
+                      (unsigned long long)esc, (unsigned long long)M, best);
+            }
+            mfLog(@"[f8v2] sk2br: SKU串=%d 引用函数=%d 门分支点=%d 个", nSku2, nRefFn, nBr);
+        }
+    }
+
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";
     NSMutableArray *out = [NSMutableArray array];
     NSUInteger f8v2Seg = 0;   // v2.58.76: F8v2 段边界(语义锚定候选, 截断时必须保位)
@@ -1734,7 +1862,7 @@ NSDictionary *mfReconFingerprint(void) {
     BOOL sk2LocalType = NO;
     {
         NSUInteger nS = 0;
-        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"]) nS++;
+        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]) nS++;
         if (!cloudBrands.count && !mach && nS >= 1 &&
             (mfRecFind(p, n, "verification failed") || mfRecFind(p, n, "could not be verified") || mfRecFind(p, n, "snapshot verification")))
             sk2LocalType = YES;
@@ -1912,6 +2040,8 @@ NSDictionary *mfReconFingerprint(void) {
                 BOOL haveBetter = NO;
                 for (NSDictionary *f in sk2ptsRef) {
                     NSString *sh = f[@"shape"] ?: @"";
+                    // v2.58.78: sk2br(SKU 锚 + 分支粒度)= 强证据; 只有它才压 sk2dat
+                    if ([sh isEqualToString:@"sk2br"]) { haveBetter = YES; break; }
                     if (![sh isEqualToString:@"sk2dat"] && sh.length) { haveBetter = YES; break; }
                 }
                 if (!haveBetter && [candsRef isKindOfClass:[NSArray class]]) {
@@ -2015,7 +2145,7 @@ NSDictionary *mfReconFingerprint(void) {
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
-            || [f[@"shape"] isEqualToString:@"sk2dat"]) nCodePts++;
+            || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]) nCodePts++;
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];

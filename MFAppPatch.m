@@ -765,6 +765,13 @@ void apEntDumpsApply(void) {
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"20008052");   // mov w0,#1 兜底
+        } else if ([d[@"sym"] hasPrefix:@"sk2br@"]) {
+            // v2.58.78: 分支粒度判定点 — Pro 门的"逃逸分支"→ NOP(fall through 到汇聚点)。
+            //   与函数头短路(sk2pro/sk2get)不同: 不改函数入口, 只改门的分支决策,
+            //   保留函数完整逻辑(多返回路径大函数安全)。new 存库内字节。
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"1f2003d5");   // nop 兜底
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         // v2.58.52: 点位带 old 字段时校验原字节(指令漂移自检, sk2pro/sk2ver 专用)
         NSData *oldBytes = ([d[@"old"] isKindOfClass:[NSString class]] && [d[@"old"] length]) ? apHexToBytes(d[@"old"]) : nil;
@@ -981,7 +988,7 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 // v2.58: 判定点操作方法在独立 category(列表类需文件作用域)
 @interface MFPanelCtrl (AppPatchEnt)
 - (void)mfAPShowEntDumps;
-- (void)mfAPRestoreTombstones;   // v2.58.77: 清墓碑(误删真点的退路)
+- (void)mfAPRestoreTombstones:(UIButton *)btn;   // v2.58.77: 清墓碑(误删真点的退路)
 - (void)mfAPShowSk2List;   // v2.58.52: SK2 判别点过滤列表(与 F8v2 点位分家)
 - (void)mfAPEntPatchNow:(NSString *)sym;
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
@@ -1152,19 +1159,32 @@ static UITextView *g_apEditor = nil;
 static MFAPEntList *g_apEntList = nil;
 // v2.58.77: 墓碑恢复 — 单向门是缺陷(用户: "误删真点=永久解不开这个 app?")。
 //   删除是用户意图要尊重, 但误删必须能撤回: 清空墓碑后, 下次侦查可重新发现这些点。
-- (void)mfAPRestoreTombstones {
+// v2.58.78: 交互改页内两次点击确认 — 用户指"系统弹窗和插件风格太割裂"(插件是
+//   bottom-sheet 页内交互, 系统 alert 是另一种模态, 视觉/手感都不连贯)。
+- (void)mfAPRestoreTombstones:(UIButton *)btn {
     NSUInteger n = mfAppPatchTombstoneCount();
     if (!n) { mfToast(@"无已删点位"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"恢复被删点位"
-        message:[NSString stringWithFormat:@"当前有 %lu 个墓碑(被 ✂ 删除的点位)。\n\n清除后, 下次侦查会重新发现它们。\n已被 patch 持久化的点不受影响。", (unsigned long)n]
-        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"♻️ 全部清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        mfAppPatchTombstonesClear();
-        mfToast(@"墓碑已清 — 重进侦查页即可重新发现");
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    extern UIViewController *g_mfPanelRootVC;   // 面板宿主(既有弹窗同款入口)
-    [g_mfPanelRootVC presentViewController:ac animated:YES completion:nil];
+    if (![objc_getAssociatedObject(btn, "mfArmRestore") boolValue]) {
+        objc_setAssociatedObject(btn, "mfArmRestore", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [btn setTitle:[NSString stringWithFormat:@"⚠️ 再点一次确认清除 %lu 个墓碑", (unsigned long)n]
+             forState:UIControlStateNormal];
+        btn.backgroundColor = [UIColor systemRedColor];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if ([objc_getAssociatedObject(btn, "mfArmRestore") boolValue]) {
+                objc_setAssociatedObject(btn, "mfArmRestore", @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                NSUInteger m = mfAppPatchTombstoneCount();
+                [btn setTitle:(m ? [NSString stringWithFormat:@"♻️ 恢复被删点位（清墓碑 %lu 个）", (unsigned long)m]
+                                  : @"♻️ 无已删点位") forState:UIControlStateNormal];
+                btn.backgroundColor = m ? [UIColor systemOrangeColor] : [UIColor tertiarySystemFillColor];
+            }
+        });
+        return;
+    }
+    objc_setAssociatedObject(btn, "mfArmRestore", @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    mfAppPatchTombstonesClear();
+    [btn setTitle:@"♻️ 已清 — 重进侦查页可重新发现" forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGreenColor];
+    mfToast(@"墓碑已清 — 重进侦查页即可重新发现");
 }
 - (void)mfAPShowEntDumps {
     UIView *page = mfMakePage(@"🎯 判定点", YES);
@@ -1259,6 +1279,11 @@ static MFAPEntList *g_apEntList = nil;
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"20008052");   // mov w0,#1 兜底
+        } else if ([sym hasPrefix:@"sk2br@"]) {
+            // v2.58.78: 分支粒度 — Pro 门逃逸分支 NOP(不改函数头, 保留完整逻辑)
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"1f2003d5");   // nop 兜底
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }
@@ -1355,7 +1380,8 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         for (NSDictionary *dd in all) {
             NSString *sh = dd[@"shape"] ?: @"";
             BOOL sem = [sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2get"]
-                    || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"deepslot"]
+                    || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"sk2br"]
+                    || [sh isEqualToString:@"deepslot"]
                     || [sh isEqualToString:@"ivarRead"] || [sh isEqualToString:@"ivarGetter"]
                     || [sh isEqualToString:@"sk2ver"]
                     || ([sh length] == 0 && [dd[@"score"] intValue] >= 3)
@@ -1393,7 +1419,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
                               : @"♻️ 无已删点位")
                 forState:UIControlStateNormal];
         btnR.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-        [btnR addTarget:g_mfCtrl action:@selector(mfAPRestoreTombstones) forControlEvents:UIControlEventTouchUpInside];
+        [btnR addTarget:g_mfCtrl action:@selector(mfAPRestoreTombstones:) forControlEvents:UIControlEventTouchUpInside];
         [page addSubview:btnR];
         y += 42;
     }
