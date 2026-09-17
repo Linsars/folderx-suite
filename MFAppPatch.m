@@ -96,6 +96,11 @@ static void apLog(NSString *fmt, ...) {
 long mfAppPatchHits(void) { return g_apHits; }
 
 // ====== 工具: hex string <-> bytes (纯 C 解析, 避开 SDK selector 可见性怪问题) ======
+// v2.58.71: mfLeHex(内存序 hex) — MFRecon.m 同名 static 的本文件副本(跨文件 static 不可见)
+static NSString *mfLeHex(uint32_t w) {
+    return [NSString stringWithFormat:@"%02x%02x%02x%02x",
+            w & 0xFF, (w >> 8) & 0xFF, (w >> 16) & 0xFF, (w >> 24) & 0xFF];
+}
 static NSMutableData *apHexToBytes(NSString *hex) {
     NSMutableData *d = [NSMutableData data];
     if (![hex isKindOfClass:[NSString class]]) return d;
