@@ -1716,6 +1716,32 @@ NSDictionary *mfReconFingerprint(void) {
             (mfRecFind(p, n, "verification failed") || mfRecFind(p, n, "could not be verified") || mfRecFind(p, n, "snapshot verification")))
             sk2LocalType = YES;
     }
+    // F11 自研服务端权益型(v2.58.75, bplayer 案定谳): app 自带 IAP 端点(/iap/pro-status
+    //   /iap/transactions 等) → 权益状态由**自家后端**下发, 本地只有 Codable 解码后的镜像字段
+    //   (无代码引用=纯反射串) + 容器 Preferences 为空 → 指令级 patch 到不了判定链。
+    //   判据: ①自研 /iap/* 端点 ≥1 条 ②有 VIP/权益类 Codable 字段(纯反射) ③无云 SDK 品牌
+    //   → 判决「服务端权威」并抑制 sk2dat 噪声点(通用判空, 撒出去=让用户白试)。
+    //   注: 提前到此计算 — merge 抑制(下方)与 verdict(末尾)都要用, 单一事实来源。
+    BOOL srvSelfIap = NO;
+    {
+        static NSArray *kIapPaths;
+        static dispatch_once_t onceIap;
+        dispatch_once(&onceIap, ^{
+            kIapPaths = @[@"/iap/pro-status", @"/iap/transactions", @"/iap/verify",
+                          @"/iap/status", @"/iap/entitlement", @"/iap/subscription"];
+        });
+        int epHits = 0;
+        for (NSString *pp in kIapPaths) if (mfRecFind(p, n, pp.UTF8String)) epHits++;
+        // 自研权益 Codable 字段(纯反射键: 无 adrp+add 代码引用, 只由 JSONDecoder 消费)
+        int codHits = 0;
+        for (NSString *cf in @[@"vipStatus", @"vipLeftSeconds", @"vip_info", @"vip_type"])
+            if (mfRecFind(p, n, cf.UTF8String)) codHits++;
+        if (!cloudBrands.count && !mach && epHits >= 1 && codHits >= 1) {
+            srvSelfIap = YES;
+            [lines addObject:[NSString stringWithFormat:
+                @"自研 IAP 端点 %d 条 + 权益 Codable 字段 %d 个 → 权益状态由自家后端下发", epHits, codHits]];
+        }
+    }
     NSMutableArray *entFuncs = [NSMutableArray array];
     // v2.58.74: 轮次开始 — 标记库中点位"本轮未见", merge 时置 seen, 结束剔除陈旧
     extern void mfAppPatchEntDumpsBeginRound(void);
@@ -1927,31 +1953,6 @@ NSDictionary *mfReconFingerprint(void) {
             if (mfRecFind(p, n, pat.UTF8String)) srvHits++;
         // SK 本地形态 + 无云验证 + JS 桥权益字段 → 服务器权益型
         if (srvHits >= 2 && !cloud && !mach && skLocal) serverSide = YES;
-    }
-    // F11 自研服务端权益型(v2.58.75, bplayer 案定谳): app 自带 IAP 端点(/iap/pro-status
-    //   /iap/transactions 等) → 权益状态由**自家后端**下发, 本地只有 Codable 解码后的镜像字段
-    //   (无代码引用=纯反射串) + 容器 Preferences 为空 → 指令级 patch 到不了判定链。
-    //   判据: ①自研 /iap/* 端点 ≥1 条 ②有 VIP/权益类 Codable 字段(纯反射) ③无云 SDK 品牌
-    //   → 判决「服务端权威」并抑制代码点播报(它们是通用判空形态, 撒出去=让用户白试)。
-    BOOL srvSelfIap = NO;
-    {
-        static NSArray *kIapPaths;
-        static dispatch_once_t onceIap;
-        dispatch_once(&onceIap, ^{
-            kIapPaths = @[@"/iap/pro-status", @"/iap/transactions", @"/iap/verify",
-                          @"/iap/status", @"/iap/entitlement", @"/iap/subscription"];
-        });
-        int epHits = 0;
-        for (NSString *pp in kIapPaths) if (mfRecFind(p, n, pp.UTF8String)) epHits++;
-        // 自研权益 Codable 字段(纯反射键: 无 adrp+add 代码引用, 只由 JSONDecoder 消费)
-        int codHits = 0;
-        for (NSString *cf in @[@"vipStatus", @"vipLeftSeconds", @"vip_info", @"vip_type"])
-            if (mfRecFind(p, n, cf.UTF8String)) codHits++;
-        if (!cloudBrands.count && !mach && epHits >= 1 && codHits >= 1) {
-            srvSelfIap = YES;
-            [lines addObject:[NSString stringWithFormat:
-                @"自研 IAP 端点 %d 条 + 权益 Codable 字段 %d 个 → 权益状态由自家后端下发", epHits, codHits]];
-        }
     }
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
