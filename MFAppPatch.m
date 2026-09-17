@@ -72,6 +72,10 @@ static void mfWritePrefObj(NSString *key, id val) {
 static NSString *apCurBundleID(void);
 static NSArray *apTombstones(void);
 static void apTombstoneAdd(NSString *sym);
+// v2.58.77: 墓碑可恢复(单向门是缺陷) — 定义在下方, 卡片/恢复入口先用
+NSUInteger mfAppPatchTombstoneCount(void);
+void mfAppPatchTombstonesClear(void);
+void mfAppPatchTombstoneRemove(NSString *sym);
 
 // ====== 状态 ======
 static long g_apHits = 0;          // 成功 patch 数
@@ -690,6 +694,21 @@ static void apTombstoneAdd(NSString *sym) {
     if (![ts containsObject:sym]) [ts addObject:sym];
     mfWritePrefObj([NSString stringWithFormat:@"mfTombstones_%@", apCurBundleID()], ts);
 }
+// v2.58.77: 墓碑可恢复 — 单向门是设计缺陷(用户: "误删真判定点=永久解不开这个app?")。
+//   提供: 计数/全清/单点恢复。删除是用户意图, 但"误删"必须能撤回。
+NSUInteger mfAppPatchTombstoneCount(void) { return apTombstones().count; }
+void mfAppPatchTombstonesClear(void) {
+    mfWritePrefObj([NSString stringWithFormat:@"mfTombstones_%@", apCurBundleID()], nil);
+    apLog(@"[entdump] ♻️ 墓碑已清空 — 被删点位可被侦查重新发现");
+}
+void mfAppPatchTombstoneRemove(NSString *sym) {
+    NSMutableArray *ts = [apTombstones() mutableCopy] ?: [NSMutableArray array];
+    if ([ts containsObject:sym]) {
+        [ts removeObject:sym];
+        mfWritePrefObj([NSString stringWithFormat:@"mfTombstones_%@", apCurBundleID()], ts);
+        apLog(@"[entdump] ♻️ 墓碑移除 %@ — 下次侦查可重新入库", sym);
+    }
+}
 void mfAppPatchEntDumpDelete(NSString *sym) {
     apEntDumpsLoad();
     for (NSInteger i = (NSInteger)g_entDumps.count - 1; i >= 0; i--)
@@ -962,6 +981,7 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 // v2.58: 判定点操作方法在独立 category(列表类需文件作用域)
 @interface MFPanelCtrl (AppPatchEnt)
 - (void)mfAPShowEntDumps;
+- (void)mfAPRestoreTombstones;   // v2.58.77: 清墓碑(误删真点的退路)
 - (void)mfAPShowSk2List;   // v2.58.52: SK2 判别点过滤列表(与 F8v2 点位分家)
 - (void)mfAPEntPatchNow:(NSString *)sym;
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
@@ -1130,6 +1150,22 @@ static UITextView *g_apEditor = nil;
 // category 续: 判定点操作方法(列表类之后重新开)
 @implementation MFPanelCtrl (AppPatchEnt)
 static MFAPEntList *g_apEntList = nil;
+// v2.58.77: 墓碑恢复 — 单向门是缺陷(用户: "误删真点=永久解不开这个 app?")。
+//   删除是用户意图要尊重, 但误删必须能撤回: 清空墓碑后, 下次侦查可重新发现这些点。
+- (void)mfAPRestoreTombstones {
+    NSUInteger n = mfAppPatchTombstoneCount();
+    if (!n) { mfToast(@"无已删点位"); return; }
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"恢复被删点位"
+        message:[NSString stringWithFormat:@"当前有 %lu 个墓碑(被 ✂ 删除的点位)。\n\n清除后, 下次侦查会重新发现它们。\n已被 patch 持久化的点不受影响。", (unsigned long)n]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"♻️ 全部清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        mfAppPatchTombstonesClear();
+        mfToast(@"墓碑已清 — 重进侦查页即可重新发现");
+        [self mfAPShowLabPage];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
 - (void)mfAPShowEntDumps {
     UIView *page = mfMakePage(@"🎯 判定点", YES);
     g_apEntList = [[MFAPEntList alloc] init];
@@ -1250,11 +1286,6 @@ static MFAPEntList *g_apEntList = nil;
     mfAppPatchEntDumpDelete(sym);
     mfToast(@"✂ 已删除点位");
 }
-// v2.58 占位: 自签票据写 app keychain(链B) — 实现为占位, 参数已逆向齐待落地
-- (void)mfAPKeychainStub {
-    mfToast(@"🔐 链B票据写入开发中 — 参数已逆向(LZFSE+HMAC/psc.dv.s1)");
-    apLog(@"[entdump] keychain 票据入口被点击(占位) — 自签 Envelope: LZFSE 压缩 + HMAC-SHA256(DeviceSecret, psc.dv.s1) → kcp.ent.snapshot.v1");
-}
 @end
 
 // ====== 实验模拟页嵌入块 (由 MFPanel.m 的 mfShowLabPage 调用) ======
@@ -1314,54 +1345,62 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         [bar addSubview:l];
         UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 27, g_mfCardW - 46, 22)];
-        st.numberOfLines = 2;
+        st.numberOfLines = 3;
         st.minimumScaleFactor = 0.7;
         NSArray *all = mfAppPatchEntDumps();
-        NSUInteger nWrite = 0, nRead = 0, nOther = 0, nDeep = 0;
+        // v2.58.77: 按"证据强度"分类报数 — 旧实现一律"共 N 点(N 含截断填充的噪声)",
+        //   用户看不出哪些是真解锁候选(mf_debug_79: "12 个"里 8 个是共享 bool 噪声)。
+        //   语义锚定 = 调用过 SK API 或有指令级形态锚; 参考 = fan 共现的共享 bool。
+        NSUInteger nSem = 0, nRef = 0;
         for (NSDictionary *dd in all) {
             NSString *sh = dd[@"shape"] ?: @"";
-            if ([sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2dat"]) nWrite++;
-            else if ([sh isEqualToString:@"sk2get"]) nRead++;
-            else if ([sh isEqualToString:@"deepslot"]) nDeep++;
-            else nOther++;
+            BOOL sem = [sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2get"]
+                    || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"deepslot"]
+                    || [sh isEqualToString:@"ivarRead"] || [sh isEqualToString:@"ivarGetter"]
+                    || [sh isEqualToString:@"sk2ver"]
+                    || ([sh length] == 0 && [dd[@"score"] intValue] >= 3)
+                    || ([sh isEqualToString:@"bool"] && [dd[@"score"] intValue] >= 3);
+            if (sem) nSem++; else nRef++;
         }
-        NSMutableArray *parts = [NSMutableArray array];
-        if (nWrite) [parts addObject:[NSString stringWithFormat:@"isPro写点 %lu", (unsigned long)nWrite]];
-        if (nRead)  [parts addObject:[NSString stringWithFormat:@"读侧getter %lu", (unsigned long)nRead]];
-        if (nDeep)  [parts addObject:[NSString stringWithFormat:@"深槽 %lu", (unsigned long)nDeep]];
-        if (nOther) [parts addObject:[NSString stringWithFormat:@"其他 %lu", (unsigned long)nOther]];
-        st.text = all.count ? [NSString stringWithFormat:@"共 %lu 点(%@) → 左划[⚡patch][💾持久化][✂删除]",
-                               (unsigned long)all.count, [parts componentsJoinedByString:@" · "]]
-                            : @"暂无点位 — 先跑侦查卡";
+        NSUInteger nTomb = mfAppPatchTombstoneCount();
+        if (all.count) {
+            NSMutableString *mt = [NSMutableString stringWithFormat:@"解锁候选 %lu 点(语义锚定)", (unsigned long)nSem];
+            if (nRef) [mt appendFormat:@" · 参考 %lu 点(共享getter, 多为噪声)", (unsigned long)nRef];
+            if (nTomb) [mt appendFormat:@" · 已删 %lu", (unsigned long)nTomb];
+            [mt appendString:@"\n左划[⚡patch][💾持久化][✂删除] · 点卡片看明细"];
+            st.text = mt;
+        } else if (nTomb) {
+            st.text = [NSString stringWithFormat:@"暂无点位(已删 %lu 点, 可恢复) → 点卡片管理", (unsigned long)nTomb];
+        } else {
+            st.text = @"暂无点位 — 先跑侦查卡";
+        }
         st.font = [UIFont systemFontOfSize:10.5];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:g_mfCtrl action:@selector(mfAPShowEntDumps)];
         [bar addGestureRecognizer:tap];
         [page addSubview:bar];
-        y += 56;
+        y += 62;
+    }
+    // v2.58.77: 恢复入口 — 墓碑可清(误删真点的退路)
+    {
+        NSUInteger nTomb = mfAppPatchTombstoneCount();
+        UIButton *btnR = [UIButton buttonWithType:UIButtonTypeSystem];
+        btnR.frame = CGRectMake(16, y, g_mfCardW - 32, 36);
+        btnR.backgroundColor = nTomb ? [UIColor systemOrangeColor] : [UIColor tertiarySystemFillColor];
+        btnR.layer.cornerRadius = 9;
+        [btnR setTitle:(nTomb ? [NSString stringWithFormat:@"♻️ 恢复被删点位（清墓碑 %lu 个）", (unsigned long)nTomb]
+                              : @"♻️ 无已删点位")
+                forState:UIControlStateNormal];
+        btnR.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        [btnR addTarget:g_mfCtrl action:@selector(mfAPRestoreTombstones) forControlEvents:UIControlEventTouchUpInside];
+        [page addSubview:btnR];
+        y += 42;
     }
     // v2.58.66: SK2/代码判定点第二张卡已删 — 与 🎯 判定点同义(用户: "又是什么鬼")。
     //   两类点(sk2pro/sk2get)本就入同一持久层, 由上面单卡统一展示与操作。
 
-    // v2.58 占位: 自签票据写入 app keychain(样本链B手法 — 无插件也亮)
-    //   参数已逆向齐: kcp.ent.snapshot.v1 / DeviceSecret kcp.v3.nx7.p0.7f1a / LZFSE+HMAC-SHA256(psc.dv.s1)
-    UIButton *btnKC = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnKC.frame = CGRectMake(16, y, g_mfCardW - 32, 38);
-    btnKC.backgroundColor = [UIColor systemTealColor];
-    btnKC.layer.cornerRadius = 9;
-    [btnKC setTitle:@"🔐 keychain 票据持久化(链B · 开发中)" forState:UIControlStateNormal];
-    [btnKC setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btnKC.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-    [btnKC addTarget:g_mfCtrl action:@selector(mfAPKeychainStub) forControlEvents:UIControlEventTouchUpInside];
-    [page addSubview:btnKC];
-    y += 44;
-    UILabel *note = [[UILabel alloc] initWithFrame:CGRectMake(16, y, g_mfCardW - 32, 64)];
-    note.text = @"冷启动: 已持久化点位自动重打(mov w0,#1; ret), 无开关依赖。\n规则表入口已撤(主流程不依赖); 日志已并入 mf_debug.log。";
-    note.numberOfLines = 0;
-    note.font = [UIFont systemFontOfSize:11];
-    note.textColor = [UIColor secondaryLabelColor];
-    [page addSubview:note];
-    y += 68;
-    *yio = y;
+    // v2.58.77 删: "keychain 票据(链B·开发中)" 占位按钮 + 说明块
+    //   用户定案: "别老是搞一些死文案丢在那里" — 未落地的入口不上屏。
+    *yio = y + 8;
 }

@@ -1483,7 +1483,11 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             int c = [a[@"calls"] intValue] - [b[@"calls"] intValue];
                             return c < 0 ? NSOrderedAscending : NSOrderedDescending;
                         }];
-                        NSUInteger room = keep.count >= 12 ? 0 : (12 - keep.count);
+                        // v2.58.77: 有语义锚定就不再用噪声填满 12 — 旧行为(keep=4+fill=8)
+                        //   让卡片报"12 个", 用户看着像真有 12 个候选(mf_debug_79)。
+                        //   语义 ≥4 → 不填; 语义 1~3 → 补到 4; 语义 0 → 兜底填满(纯 getter app)
+                        NSUInteger target = keep.count == 0 ? 12 : (keep.count >= 4 ? keep.count : 4);
+                        NSUInteger room = target > keep.count ? target - keep.count : 0;
                         NSUInteger fill = MIN(pool.count, room);
                         [mo removeAllObjects];
                         [mo addObjectsFromArray:keep];
