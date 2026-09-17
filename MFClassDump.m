@@ -420,6 +420,18 @@ static NSString *mfSwiftDumpImage(const struct mach_header *mh, intptr_t slide, 
                     (kind == 18 ? @"case" : @"var"), fname, ty];
             }
         }
+        // v2.58.87: 纯 Swift 类无 ObjC 方法表(baseMethods=null), 方法在 Swift vtable 里 —
+        //   运行时补上这一半(静态需解 chained fixup, 运行时 dyld 已重定位故直接可读)
+        if (kind == 16) {   // class
+            @try {
+                Class sc = objc_getClass(tname);
+                if (sc) {
+                    extern NSString *mfSwiftMethodTable(Class c);
+                    NSString *mt = mfSwiftMethodTable(sc);
+                    if (mt) [out appendString:mt];
+                }
+            } @catch (NSException *ex) { (void)ex; }
+        }
         [out appendString:@"}\n\n"];
         count++;
     }
