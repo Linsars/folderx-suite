@@ -942,8 +942,19 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 //    → 可原位替换为 mov w0,#1; ret, 同长度零副作用)。
                 //   纯内省(class_copyIvarList/class_copyMethodList), 零 hook 零 patch。
                 {
+                    // v2.58.96: 只 dump **主二进制(app 自己)** 的权益类。
+                    //   mf_debug_93 实测: 8 个预算全被框架类耗尽 ——
+                    //   StoreKit.StoreProductManager / LocalPurchasesManager /
+                    //   CloudSubscriptionFeatures.* 都含 "Subscri"/"Purchase",
+                    //   而 HMVipProManager 排在其后 → 永远轮不到。
+                    //   判据: class_getImageName(c) 与主二进制路径一致(运行时信息, 不硬编码 app)。
+                    //   兜底: 该 API 返回 NULL 时不做归属过滤(保持旧行为, 不至于零输出)。
+                    extern const char *class_getImageName(Class cls);
+                    const char *img = class_getImageName(c);
+                    BOOL isMainCls = YES;
+                    if (img && mainPath) isMainCls = (strcmp(img, mainPath) == 0);
                     static int nEntClsDump = 0;
-                    if (nEntClsDump < 8) {
+                    if (isMainCls && nEntClsDump < 10) {
                         nEntClsDump++;
                         NSMutableString *ds = [NSMutableString string];
                         unsigned int dIv = 0;
