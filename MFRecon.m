@@ -1056,17 +1056,23 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 if (!offHit) continue;
                 // v2.58.81: cmp 窗口放宽到 4 条 — 桥实测 0x100660ed8 的形态是
                 //   ldrb → add → bl → cmp → b.ne(中间插了 2 条), 旧窗口 1~2 条会漏
-                BOOL gateOK = NO;
-                for (int k = 1; k <= 4 && !gateOK; k++) {
+                // v2.58.108 定谳(mf_debug_100 不亮 + 本地穷尽扫描):
+                //   真 UI 读侧**不带 cmp #1 形态** —— 实测 6 个真类方法
+                //   (0x1007e28b8 / 0x100be9a6c / 0x100beac9c / 0x100beb138 /
+                //    0x100beb254 / 0x100bec194) 全是"直接读字段就返回/使用", 无分支。
+                //   旧实现要求 ldrb + cmp #1 + b.cond → 真点全被过滤, 只剩
+                //   0x100684e34(唯一带 cmp 的) —— 上轮 patch 它没亮, 正因它不是 UI 门。
+                //   改法: cmp 形态降级为**线索**(仅用于日志标注), 主判据 = 同基址类归属。
+                BOOL hasGate = NO;
+                for (int k = 1; k <= 4 && !hasGate; k++) {
                     if (o + (uint64_t)(k + 1) * 4 + 4 > textSize) break;
                     uint32_t w2 = *(const uint32_t *)(bd + textFileOff + o + (uint64_t)k * 4);
                     if ((w2 & 0xFFFFFC1F) != 0x7100041F) continue;   // cmp wT,#1
                     if (((w2 >> 5) & 0x1F) != T) continue;
                     uint32_t w3 = *(const uint32_t *)(bd + textFileOff + o + (uint64_t)(k + 1) * 4);
                     if (((w3 & 0xFF000010) == 0x54000000) ||
-                        ((w3 & 0x7F000000) == 0x34000000)) gateOK = YES;
+                        ((w3 & 0x7F000000) == 0x34000000)) hasGate = YES;
                 }
-                if (!gateOK) continue;                               // 门控分支
                 // ------------------------------------------------------------------
                 // v2.58.84 (mf_debug_86 定谳): 类归属指纹门 — ivargate 的三轮不亮根源。
                 //   静态偏移在 Swift 混淆的 30MB 二进制里无法区分类: 0x660ed8/0x684e34 两个
@@ -1085,11 +1091,29 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) { fnStart = o - back; break; }
                 }
                 int nOtherOff = 0;
-                for (uint64_t p = fnStart; p + 64 <= textSize && p < fnStart + 0x8000; p += 4) {
+                // v2.58.108 定谳(mf_debug_100 两个假阳性): 判据必须是**同一基址寄存器**。
+                //   旧实现统计"函数内任意寄存器访问类字段" → 大拷贝/解码函数必然命中
+                //   十几个偏移 → 假阳性(0x100660d58 指纹=37 就是指令条数, 不是字段数)。
+                //   实测区分度(本地穷尽扫描):
+                //     假阳性 0x100660ed8 base=x8  → 同基址类字段 0 个
+                //     真点   0x100684e34 base=x22 → 同基址类字段 3 个
+                //     真点   0x1007e28b8 base=x19 → 6 个 / 0x100beac9c base=x20 → 8 个
+                //   判据: 同一条基址寄存器上出现该类**其它**字段(跨度大, 非数组元素)。
+                uint32_t baseRn = (w1 >> 5) & 0x1F;
+                // v2.58.108: 窗口必须限定在**本函数范围内**。
+                //   旧实现用 fnStart + 0x8000 硬窗口 → 越界扫进相邻函数,
+                //   把邻居的类字段访问算进本函数 → 假阳性 0x100660ed8(本函数仅 0x3dc 字节,
+                //   多出的字段全来自邻居)。本地验证: 收紧到函数末尾后, 该点字段数 3→0 被正确丢弃。
+                uint64_t fnEnd = textSize;
+                for (uint64_t fwd = 4; fwd < 0x10000; fwd += 4) {
+                    if (o + fwd + 4 > textSize) break;
+                    uint32_t q = *(const uint32_t *)(bd + textFileOff + o + fwd);
+                    if (q == 0xD503237F) { fnEnd = o + fwd; break; }
+                    if ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) { fnEnd = o + fwd; break; }
+                    if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) { fnEnd = o + fwd; break; }
+                }
+                for (uint64_t p = fnStart; p + 64 <= fnEnd; p += 4) {
                     uint32_t wp = *(const uint32_t *)(bd + textFileOff + p);
-                    // v2.58.107 修 bug2: 旧实现只认 ldrb/strb(0x39400000/0x39000000),
-                    //   而 0x100684de0 里的类字段访问是 **64 位 ldr/str** → 全漏。
-                    //   改为覆盖全部宽度: 字节/半字/字/双字 的 ldr/str。
                     uint32_t bp = wp & 0x3FC00000;
                     BOOL isLDST = (bp == 0x39400000 || bp == 0x39000000 ||   // byte
                                    bp == 0x79400000 || bp == 0x79000000 ||   // half
@@ -1097,8 +1121,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                    bp == 0xF9400000 || bp == 0xF9000000);    // double
                     if (!isLDST) continue;
                     if ((wp & 0x1F) == 31 || ((wp >> 5) & 0x1F) == 31) continue;
+                    if (((wp >> 5) & 0x1F) != baseRn) continue;              // ★ 同一基址寄存器
                     uint32_t ip = (wp >> 10) & 0xFFF;
-                    // 按宽度换算真实偏移(立即数需 ×元素大小)
                     uint32_t sz = (wp >> 30) & 3;
                     uint32_t mult = (sz == 0) ? 1 : (sz == 1 ? 2 : (sz == 2 ? 4 : 8));
                     ip *= mult;
@@ -1125,9 +1149,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     @"old": mfLeHex(w1),
                     @"new": mfLeHex(movNew),
                 }];
-                mfLog(@"[f8v2] ★ivargate @%#llx (权益 ivar 读侧门: ldrb w%u,[xN,#%#x]→mov w%u,#1, fn=%#llx 指纹=%d)",
+                mfLog(@"[f8v2] ★ivargate @%#llx (权益 ivar 读侧: ldrb w%u,[xN,#%#x]→mov w%u,#1, fn=%#llx 同基址类字段=%d%@)",
                       (unsigned long long)(textVM + o), T, imm, T,
-                      (unsigned long long)(textVM + fnStart), nOtherOff + 1);
+                      (unsigned long long)(textVM + fnStart), nOtherOff,
+                      hasGate ? @" [带cmp门]" : @"");
             }
             mfLog(@"[f8v2] ivargate: 权益类 ivar 偏移=%d 个, 读侧门控点=%d 个", nGateOff, nGate);
         } else {
