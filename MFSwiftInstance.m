@@ -1,18 +1,19 @@
-// MFSwiftInstance.m — 运行时实例写 (v2.58.100)
+// MFSwiftInstance.m — 运行时实例写 (v2.58.103)
 //
-// ★ 用户指摘修正: 之前这里自己 objc_copyClassList 找类 + 全堆 vm_region 扫描找实例
-//   —— 两条都是重复造轮子。现在:
-//     ① 类/字段偏移: **由侦查(ivargate)喂入** — 它本来就用 objc_copyClassList +
-//        class_copyIvarList 找到了 (mf_debug_94: HMVipProManager._isVipPro off=1744)。
-//     ② 实例: **从 app 已有对象图遍历得到** — 不走堆扫描。
-//        classdump 实测有 10 个 UI 类型持有 _vipProManager (HMRootView / IPTVPlayerRootView /
-//        SettingVipBanner / VIPDetailPage ...), 从 keyWindow 的视图控制器递归遍历
-//        ivar 就能拿到那个对象, 不需要知道它分配到哪块内存。
+// ★ 三次路线修正的血泪史(别再走弯路):
+//   v2.58.97-99: vm_region 全堆扫描找实例 —— 对的, 但类/ivar 自己查了一遍(与 ivargate 重复)
+//   v2.58.101-102: 删掉重复的类查找(改由侦查喂入)——对; 但顺手把找实例也换成了
+//                  对象图遍历 —— **错**: 持有 _vipProManager 的 10 个类型在 classdump
+//                  产物里全是 struct(HMRootView/SettingVipBanner/VipLogoView...),
+//                  不在 ObjC 对象图里, 从 UIViewController 根本走不到。
+//                  mf_debug_96 实测: 遍历起点 4 个根控制器 → 实例=0。
+//   v2.58.103: 类/偏移仍由侦查喂入(不重复造轮子); 找实例改回内存扫描。
 //
-// 本模块只做侦查和 F9 都没做的事: 拿到实例后写它的 bool 字段(先读回验证)。
+// 为什么内存扫描是必需的(不是偷懒): Swift struct 持有的 @StateObject/@ObservedObject
+//   实例在堆上, 其 isa == 类指针。ObjC runtime 不提供"某类的全部实例"API,
+//   只能扫可读写区找「首字 == 类指针 且 16 字节对齐」(arm64 malloc 16 对齐)。
 
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <string.h>
 #import <mach/mach.h>
@@ -22,7 +23,7 @@ static Class g_entCls = NULL;
 static char g_entIvar[128] = {0};
 static ptrdiff_t g_entOff = -1;
 
-// 侦查喂入目标 (MFRecon 的 ivargate 块调用)
+// 侦查喂入目标 (MFRecon 的 ivargate 块调用) — 类/偏移一律复用, 不自己查
 void mfEntClsTargetSet(Class c, const char *ivarName, ptrdiff_t off) {
     if (!c || !ivarName || !*ivarName) return;
     if (g_entCls && g_entOff >= 0) return;          // 首个命中优先, 幂等
@@ -46,63 +47,54 @@ static BOOL mfiWr(uintptr_t a, const void *src, size_t len) {
 }
 
 // =====================================================================
-// 从对象图里找目标类的实例 —— 复用 app 自己的引用链, 不做盲扫。
-//   起点: keyWindow.rootViewController (以及其 presentedViewController 链)
-//   方式: 递归遍历对象的全部 ivar (对象引用型), 深度/数量都有上限。
-//   安全: 只读 ivar 指针值; 指针是否有效由后续 mfiRd 判定, 不 deref。
+// 找实例: 扫可读写区, 定位 isa==类指针 且 16 字节对齐的堆对象
 // =====================================================================
-static int mfiWalk(id root, Class want, void **out, int cap, int depth, int *budget) {
-    if (!root || !want || depth > 6 || *budget <= 0) return 0;
+static int mfiCollectInstances(Class want, uintptr_t *out, int cap) {
+    if (!want) return 0;
+    uintptr_t wantCls = (uintptr_t)want;
     int n = 0;
-    *budget -= 1;
+    vm_address_t addr = 0;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t infoCnt;
+    mach_port_t objName = MACH_PORT_NULL;
+    uint8_t buf[65536];
+    int guard = 0;
+    size_t scanned = 0;
+    size_t budget = 512 * 1024 * 1024;              // 512MB 上限, 钉死工作量
 
-    if (object_getClass(root) == want) { if (n < cap) out[n++] = (__bridge void *)root; return n; }
-
-    unsigned int nIv = 0;
-    Ivar *ivs = class_copyIvarList(object_getClass(root), &nIv);
-    for (unsigned int i = 0; ivs && i < nIv && n < cap; i++) {
-        const char *ty = ivar_getTypeEncoding(ivs[i]);
-        if (!ty || ty[0] != '@') continue;           // 只看对象引用字段
-        uintptr_t slot = (uintptr_t)(__bridge void *)root + (uintptr_t)ivar_getOffset(ivs[i]);
-        // ★ 走 vm_read 读槽位, 不直接 deref — 槽里可能是任意位模式
-        uintptr_t p = 0;
-        if (!mfiRd(slot, &p, sizeof(p)) || !p) continue;
-        // 再验一步: 候选对象的 isa 必须可读(说明它确实是个有效对象)
-        uintptr_t isa = 0;
-        if (!mfiRd(p, &isa, sizeof(isa)) || !isa) continue;
-        id child = (__bridge id)(void *)p;
-        int m = mfiWalk(child, want, out + n, cap - n, depth + 1, budget);
-        n += m;
-    }
-    if (ivs) free(ivs);
-    return n;
-}
-
-// 收集实例: 从关键窗口的控制器树出发
-static int mfiCollectInstances(Class want, void **out, int cap) {
-    int n = 0;
-    int budget = 4000;                                // 遍历步数上限, 防跑飞
-    NSMutableArray *roots = [NSMutableArray array];
-    for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
-        if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-            if (w.rootViewController) [roots addObject:w.rootViewController];
+    while (n < cap && guard++ < 100000) {
+        infoCnt = VM_REGION_BASIC_INFO_COUNT_64;
+        kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size, VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &infoCnt, &objName);
+        if (kr != KERN_SUCCESS) break;
+        if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE)) {
+            uintptr_t p = (uintptr_t)addr;
+            uintptr_t endp = (uintptr_t)addr + size;
+            while (p + 16 <= endp && n < cap && scanned < budget) {
+                size_t want2 = sizeof(buf);
+                if (p + want2 > endp) want2 = (size_t)(endp - p);
+                if (want2 < 16) break;
+                vm_size_t got = 0;
+                if (vm_read_overwrite(mach_task_self(), (vm_address_t)p, (vm_size_t)want2,
+                                      (vm_address_t)buf, &got) != KERN_SUCCESS || got < 16) {
+                    p += want2; scanned += want2; continue;
+                }
+                for (size_t i = 0; i + 8 <= got; i += 8) {
+                    uintptr_t v = 0;
+                    memcpy(&v, buf + i, 8);
+                    if (v != wantCls) continue;
+                    uintptr_t cand = p + i;
+                    if (cand & 0xF) continue;        // 实例必 16 字节对齐
+                    if (n < cap) out[n++] = cand;
+                }
+                scanned += got;
+                p += got;
+            }
         }
+        addr += size;
     }
-    UIWindow *kw = [UIApplication sharedApplication].keyWindow;
-    if (kw.rootViewController) [roots addObject:kw.rootViewController];
-    mfLog(@"[inst] 遍历起点: %lu 个根控制器", (unsigned long)roots.count);
-
-    for (id r in roots) {
-        if (n >= cap) break;
-        // 同时沿 presentedViewController 链找
-        id cur = r;
-        int guard = 0;
-        while (cur && guard++ < 8 && n < cap) {
-            n += mfiWalk(cur, want, out + n, cap - n, 0, &budget);
-            cur = [(UIViewController *)cur presentedViewController];
-        }
-    }
+    mfLog(@"[inst] 内存扫描完成: 实例=%d (扫过 %zuMB)", n, scanned / 1024 / 1024);
     return n;
 }
 
@@ -118,15 +110,14 @@ NSDictionary *mfInstProbe(void) {
     const char *cn = class_getName(c);
     mfLog(@"[inst] 目标(来自侦查): %s.%s off=%ld", cn, g_entIvar, (long)g_entOff);
 
-    void *found[64];
+    uintptr_t found[64];
     int n = mfiCollectInstances(c, found, 64);
-    mfLog(@"[inst] 对象图遍历完成: 实例=%d", n);
 
     NSMutableArray *vals = [NSMutableArray array];
     for (int i = 0; i < n && i < 12; i++) {
         uint8_t b = 0;
-        if (mfiRd((uintptr_t)found[i] + (uintptr_t)g_entOff, &b, 1)) [vals addObject:@(b)];
-        mfLog(@"[inst]   #%d @%p  %s=%u", i, found[i], g_entIvar, (unsigned)b);
+        if (mfiRd(found[i] + (uintptr_t)g_entOff, &b, 1)) [vals addObject:@(b)];
+        mfLog(@"[inst]   #%d @%#lx  %s=%u", i, (unsigned long)found[i], g_entIvar, (unsigned)b);
     }
     return @{@"cls": @(cn), @"count": @(n), @"off": @(g_entOff), @"vals": vals};
 }
@@ -139,13 +130,13 @@ int mfInstForceBool(void) {
         mfLog(@"[inst] 写: 尚未定位权益类/ivar — 请先跑一次侦查");
         return -1;
     }
-    void *found[64];
+    uintptr_t found[64];
     int n = mfiCollectInstances(g_entCls, found, 64);
-    if (!n) { mfLog(@"[inst] 写: 对象图中未找到实例(可能尚未创建)"); return 0; }
+    if (!n) { mfLog(@"[inst] 写: 未找到实例(可能尚未创建)"); return 0; }
 
     int ok = 0;
     for (int i = 0; i < n; i++) {
-        uintptr_t a = (uintptr_t)found[i] + (uintptr_t)g_entOff;
+        uintptr_t a = found[i] + (uintptr_t)g_entOff;
         uint8_t old = 0;
         if (!mfiRd(a, &old, 1)) continue;
         if (old == 1) { ok++; continue; }               // 已是解锁态
