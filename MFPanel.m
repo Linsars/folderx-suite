@@ -1572,6 +1572,9 @@ void mfShowLabPage(void) {
     //   像产品 ID 列表那样滚动, 卡片动态堆叠永不互相覆盖
     UIScrollView *sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 42, g_mfCardW, g_mfCardH - 42)];
     sv.showsVerticalScrollIndicator = YES;
+    // v2.58.100: 卡片高度是内容驱动的(底部会 mfSetWantH), 必须让滚动区跟随父页高度,
+    //   否则 sv 停留在创建时的旧 g_mfCardH → 卡片变高后内容被裁。
+    sv.autoresizingMask = UIViewAutoresizingFlexibleHeight | UIViewAutoresizingFlexibleWidth;
 
     UIButton *scan = [UIButton buttonWithType:UIButtonTypeSystem];
     scan.frame = CGRectMake(16, 6, g_mfCardW - 32, 40);
@@ -1617,8 +1620,12 @@ void mfShowLabPage(void) {
     sv.contentSize = CGSizeMake(g_mfCardW, apY + 24);
     [page addSubview:sv];
 
-    // 卡片高度不再按内容拉伸 — 滚动容器内固定可视高度
-    mfSetWantH(460);
+    // v2.58.100: 恢复内容驱动高度 — 旧实现硬编码 mfSetWantH(460),
+    //   而卡片是动态堆叠的(apY 随引擎卡片增减变化) → 引擎越加越多时被截断。
+    //   对齐图标页写法(42 + rows*62 + 26): 内容尾 + 导航栏 + 余量。
+    CGFloat want = apY + 24 + 42;
+    CGFloat maxH = g_mfPanelOverlay ? MIN(560, g_mfPanelOverlay.bounds.size.height - 100) : 560;
+    mfSetWantH(MIN(want, maxH));
     mfPushPage(page);
 }
 

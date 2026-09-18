@@ -942,6 +942,30 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 //    → 可原位替换为 mov w0,#1; ret, 同长度零副作用)。
                 //   纯内省(class_copyIvarList/class_copyMethodList), 零 hook 零 patch。
                 {
+                    // v2.58.100: 把找到的权益类/ivar 偏移**对外暴露**, 供其它引擎复用 —
+                    //   避免"每个模块各自 objc_copyClassList 找一遍"的重复(用户指摘)。
+                    extern void mfEntClsTargetSet(Class c, const char *ivarName, ptrdiff_t off);
+                    {
+                        unsigned int eN = 0;
+                        Ivar *eIvs = class_copyIvarList(c, &eN);
+                        for (unsigned int ei = 0; eIvs && ei < eN; ei++) {
+                            const char *eIn = ivar_getName(eIvs[ei]);
+                            if (!eIn) continue;
+                            static const char *kEntIv[] = {"isVip","isPro","hasPro","hasVip","entitled",
+                                                           "hasAccess","isPremium","isMember"};
+                            BOOL hit = NO;
+                            for (int w = 0; w < 8 && !hit; w++) {
+                                const char *pp = strstr(eIn, kEntIv[w]);
+                                if (pp && !(pp[strlen(kEntIv[w])] >= 'a' && pp[strlen(kEntIv[w])] <= 'z')) hit = YES;
+                            }
+                            if (!hit) continue;
+                            ptrdiff_t eo = ivar_getOffset(eIvs[ei]);
+                            if (eo < 0x40 || eo > 0x2000) continue;
+                            mfEntClsTargetSet(c, eIn, eo);
+                            break;
+                        }
+                        if (eIvs) free(eIvs);
+                    }
                     // v2.58.96: 只 dump **主二进制(app 自己)** 的权益类。
                     //   mf_debug_93 实测: 8 个预算全被框架类耗尽 ——
                     //   StoreKit.StoreProductManager / LocalPurchasesManager /

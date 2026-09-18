@@ -1229,13 +1229,13 @@ static MFAPEntList *g_apEntList = nil;
 //   写操作需两次点击确认(与清墓碑同风格) — 避免误触改坏运行中的 app。
 - (void)mfInstProbeTap:(UIButton *)btn {
     btn.enabled = NO;
-    mfToast(@"🧬 扫描中(只读, 约数秒)…");
+    mfToast(@"🧬 从对象图取实例(只读)…");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        extern NSDictionary *mfInstProbe(const char *clsSub, const char *ivarName, size_t budgetMB);
-        NSDictionary *r = mfInstProbe("VipProManager", "_isVipPro", 256);
+        extern NSDictionary *mfInstProbe(void);
+        NSDictionary *r = mfInstProbe();
         dispatch_async(dispatch_get_main_queue(), ^{
             btn.enabled = YES;
-            if (!r) { mfToast(@"未找到权益类"); return; }
+            if (!r) { mfToast(@"尚未定位权益类 — 请先跑一次侦查"); return; }
             mfToast([NSString stringWithFormat:@"实例 %@ 个 · off=%@ · 详见日志",
                      r[@"count"], r[@"off"]]);
         });
@@ -1257,10 +1257,10 @@ static MFAPEntList *g_apEntList = nil;
     btn.enabled = NO;
     [btn setTitle:@"⚡ 直写解锁" forState:UIControlStateNormal];
     btn.backgroundColor = [UIColor systemGreenColor];
-    mfToast(@"⚡ 正在扫描并写入…");
+    mfToast(@"⚡ 正在取实例并写入…");
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        extern int mfInstForceBool(const char *clsSub, const char *ivarName, size_t budgetMB);
-        int ok = mfInstForceBool("VipProManager", "_isVipPro", 256);
+        extern int mfInstForceBool(void);
+        int ok = mfInstForceBool();
         dispatch_async(dispatch_get_main_queue(), ^{
             btn.enabled = YES;
             mfToast(ok > 0 ? [NSString stringWithFormat:@"⚡ 已写 %d 个实例 · 请看界面是否变化", ok]
