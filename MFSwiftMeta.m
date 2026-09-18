@@ -108,10 +108,19 @@ static uintptr_t smMetaForDesc(uintptr_t desc) {
             for (size_t i = 0; i + 8 <= want; i += 8) {
                 uintptr_t v = 0;
                 memcpy(&v, buf + i, 8);
-                if (v != desc) continue;
+                // v2.58.94: chained fixup 槽在运行时**不是裸指针** —— 低位 36 bit = 重定位后地址,
+                //   bit51~62 仍是 next 链字段(实测静态槽 0x00f0000001683c44: next=0xf, target=0x1683c44)。
+                //   直接 `v == desc` 必然不等(高位干扰) → 必须掩码。
+                //   双掩码: 36 bit(target 域) 与 51 bit(去 next 保留全地址) 都试一遍。
+                uintptr_t m36 = v & 0xFFFFFFFFFULL;
+                uintptr_t m51 = v & 0x7FFFFFFFFFFFFULL;
+                if (m36 != desc && m51 != desc && v != desc) continue;
                 uintptr_t cand = a + off + i - 0x40;          // meta = 槽 - 0x40
                 uintptr_t chk = 0;
-                if (smRd64(cand + 0x40, &chk) && chk == desc) return cand;
+                if (smRd64(cand + 0x40, &chk)) {
+                    uintptr_t c36 = chk & 0xFFFFFFFFFULL, c51 = chk & 0x7FFFFFFFFFFFFULL;
+                    if (c36 == desc || c51 == desc || chk == desc) return cand;
+                }
             }
         }
     }
