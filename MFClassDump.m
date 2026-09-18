@@ -421,33 +421,11 @@ static NSString *mfSwiftDumpImage(const struct mach_header *mh, intptr_t slide, 
                     (kind == 18 ? @"case" : @"var"), fname, ty];
             }
         }
-        // v2.58.87: 纯 Swift 类无 ObjC 方法表(baseMethods=null), 方法在 Swift vtable 里 —
-        //   运行时补上这一半(静态需解 chained fixup, 运行时 dyld 已重定位故直接可读)
-        // v2.58.88: 只对权益相关类做方法表解析。
-        //   v2.58.87 无条件对全部 Swift 类型(class, 本二进制 3347 个类型)调用 →
-        //   每类数十~数百次 vm_read ⇒ 百万级系统调用, 进程被 jetsam 杀 / 卡死。
-        //   词表门把工作量限定在个位数类, 且这些正是我们要找的目标。
-        if (kind == 16) {
-            static const char *kMTWords[] = {"Vip","ProManager","Entitle","Premium",
-                                             "Membership","Subscri","Purchase","Product"};
-            BOOL mtHit = NO;
-            for (int wi = 0; wi < 8 && !mtHit; wi++) if (strstr(tname, kMTWords[wi])) mtHit = YES;
-            // v2.58.92 两道保险 (Swift 阶段与 ObjC 阶段一样从未跑过, 同样需要设防):
-            //   ① 只处理**主二进制**的类型 — 方法表反查只在主二进制 __DATA 里找,
-            //      处理 StoreKit 等框架类型纯属白扫(每类 ~1.5MB vm_read)
-            //   ② 硬上限 — 即使词表命中很多, 也只解析前 24 个, 把工作量钉死在可控范围
-            static int nMTDone = 0;
-            BOOL isMainImg = (mh == _dyld_get_image_header(0));
-            if (mtHit && isMainImg && nMTDone < 24) {
-                nMTDone++;
-                @try {
-                    mfLog(@"[swiftmt] try %s desc=%#llx", tname, (unsigned long long)descAddr);
-                    extern NSString *mfSwiftMethodTableForDescriptor(uintptr_t desc, const char *clsName);
-                    NSString *mt = mfSwiftMethodTableForDescriptor(descAddr, tname);
-                    if (mt) { [out appendString:mt]; mfLog(@"[swiftmt] %s ok", tname); }
-                } @catch (NSException *ex) { mfLog(@"[swiftmt] %s ex=%@", tname, ex.name); }
-            }
-        }
+        // v2.58.101: 移除这里的「描述符反查 metadata」方法表解析。
+        //   原因(用户指摘"又造扫描"): 该路径需要全堆 vm_region 扫找指向 desc 的槽 ——
+        //   与 ivargate 已经在做的"Class 对象直接就是 metadata"重复, 且实际从未产出输出
+        //   (两轮 classdump 产物中 vtable 段均为 0)。方法表现在统一由 MFRecon 的 ivargate
+        //   喂给 MFSwiftMeta(meta 直取, 无需反查)。
         [out appendString:@"}\n\n"];
         count++;
     }
