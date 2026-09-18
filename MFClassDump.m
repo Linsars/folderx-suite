@@ -434,13 +434,13 @@ static NSString *mfSwiftDumpImage(const struct mach_header *mh, intptr_t slide, 
             for (int wi = 0; wi < 8 && !mtHit; wi++) if (strstr(tname, kMTWords[wi])) mtHit = YES;
             if (mtHit) {
                 @try {
-                    mfLog(@"[swiftmt] try %s", tname);
-                    Class sc = objc_getClass(tname);
-                    if (sc) {
-                        extern NSString *mfSwiftMethodTable(Class c);
-                        NSString *mt = mfSwiftMethodTable(sc);
-                        if (mt) { [out appendString:mt]; mfLog(@"[swiftmt] %s ok", tname); }
-                    }
+                    // v2.58.91: **不再调 objc_getClass**(会 force-realize Swift 类 →
+                    //   iOS26 _getWitnessTable 崩, mf_debug_92 实测定谳)。
+                    //   直接用手头已有的描述符地址 descAddr 做纯内存解析。
+                    mfLog(@"[swiftmt] try %s desc=%#llx", tname, (unsigned long long)descAddr);
+                    extern NSString *mfSwiftMethodTableForDescriptor(uintptr_t desc, const char *clsName);
+                    NSString *mt = mfSwiftMethodTableForDescriptor(descAddr, tname);
+                    if (mt) { [out appendString:mt]; mfLog(@"[swiftmt] %s ok", tname); }
                 } @catch (NSException *ex) { mfLog(@"[swiftmt] %s ex=%@", tname, ex.name); }
             }
         }
@@ -498,20 +498,30 @@ void mfClassDumpStartAction(UIProgressView *pv, UILabel *lb, UIButton *btn, UIVi
         }
         mfLog(@"CLASSDUMP names=%lu", (unsigned long)allNames.count);
 
+        // v2.58.91 崩溃修复 (mf_debug_92: 日志停在 "CLASSDUMP names=61121", realized 行未出现):
+        //   v2.58.90 只按 `_TtC/_TtV/...` 前缀跳过 Swift 类名, 但词表里的 "Product"/"Purchase"
+        //   命中大量 **Swift 命名的框架类**(StoreKit.StoreProductManager 等) → 仍被 realize → 崩。
+        //   彻底修法(三条):
+        //     ① **Swift 命名的类一律不碰**: `_Tt` 前缀 或 名字含 '.'(模块限定名)。
+        //        Swift 类信息走 __swift5_types 独立路径, 不需要 ObjC 类对象。
+        //     ② 用 **objc_lookUpClass** 而非 objc_getClass — 前者不 force-realize。
+        //     ③ 只对权益词表命中的纯 ObjC 类取类对象; 每类打日志, 仍崩可精确定位。
         static const char *kEntWords[] = {"Vip","ProManager","Entitle","Premium",
                                           "Membership","Subscri","Purchase","Product"};
-        unsigned realized = 0, skippedSwift = 0;
+        unsigned realized = 0, skipped = 0, seen = 0;
         NSMutableArray<Class> *all = [NSMutableArray array];
         for (NSString *n in allNames) {
+            seen++;
+            if ((seen % 5000) == 0) mfLog(@"CLASSDUMP scan %u/%lu", seen, (unsigned long)allNames.count);
+            if ([n hasPrefix:@"_Tt"] || [n containsString:@"."]) { skipped++; continue; }   // ① Swift 命名
             BOOL entHit = NO;
-            for (int w = 0; w < 8 && !entHit; w++) if ([n rangeOfString:@(kEntWords[w])].location != NSNotFound) entHit = YES;
-            // Swift 泛型/私有类名 = witness table 崩源; 除非是我们要找的权益类, 一律跳过
-            BOOL swiftish = [n hasPrefix:@"_TtC"] || [n hasPrefix:@"_TtV"] || [n hasPrefix:@"_TtGC"] || [n hasPrefix:@"_TtO"];
-            if (swiftish && !entHit) { skippedSwift++; continue; }
-            Class c = objc_getClass(n.UTF8String);   // 只 realize 白名单内的
+            for (int w = 0; w < 8 && !entHit; w++) if ([n containsString:@(kEntWords[w])]) entHit = YES;
+            if (!entHit) { skipped++; continue; }
+            mfLog(@"CLASSDUMP lookup: %@", n);
+            Class c = objc_lookUpClass(n.UTF8String);   // ② 不 realize
             if (c) { [all addObject:c]; realized++; }
         }
-        mfLog(@"CLASSDUMP realized=%u (skippedSwift=%u)", realized, skippedSwift);
+        mfLog(@"CLASSDUMP realized=%u (skipped=%u)", realized, skipped);
         unsigned total = (unsigned)all.count;
         Class *classes = (Class *)malloc(sizeof(Class) * (total ?: 1));
         for (unsigned i = 0; i < total; i++) classes[i] = all[i];
