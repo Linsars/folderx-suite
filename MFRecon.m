@@ -921,6 +921,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
     // =====================================================================
     {
         uint32_t gateOffs[16]; int nGateOff = 0;
+        // v2.58.107: 类归属指纹集 — 该类**全部** ivar 偏移(不只词表命中的)。
+        //   mf_debug_99 定谳: 旧实现 gateOffs 只装词表命中的 ivar, 而 HMVipProManager
+        //   只有 _isVipPro 命中 → 指纹集=1 个偏移 → 指纹门必然判"函数内无其它权益 ivar"
+        //   → 两个真点被自己的门误杀。类归属判据应是"该函数是否在操作**这个类**"
+        //   (看它的全部字段), 而不是"是否操作了多个权益命名字段"。
+        uint32_t clsFpOffs[32]; int nClsFp = 0;
         unsigned int nCls = 0;
         Class *clsList = objc_copyClassList(&nCls);
         if (clsList) {
@@ -942,41 +948,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 //    → 可原位替换为 mov w0,#1; ret, 同长度零副作用)。
                 //   纯内省(class_copyIvarList/class_copyMethodList), 零 hook 零 patch。
                 {
-                    // v2.58.100: 把找到的权益类/ivar 偏移**对外暴露**, 供其它引擎复用 —
-                    //   避免"每个模块各自 objc_copyClassList 找一遍"的重复(用户指摘)。
-                    extern void mfEntClsTargetSet(Class c, const char *ivarName, ptrdiff_t off);
-                    {
-                        unsigned int eN = 0;
-                        Ivar *eIvs = class_copyIvarList(c, &eN);
-                        for (unsigned int ei = 0; eIvs && ei < eN; ei++) {
-                            const char *eIn = ivar_getName(eIvs[ei]);
-                            if (!eIn) continue;
-                            static const char *kEntIv[] = {"isVip","isPro","hasPro","hasVip","entitled",
-                                                           "hasAccess","isPremium","isMember"};
-                            BOOL hit = NO;
-                            for (int w = 0; w < 8 && !hit; w++) {
-                                const char *pp = strstr(eIn, kEntIv[w]);
-                                if (pp && !(pp[strlen(kEntIv[w])] >= 'a' && pp[strlen(kEntIv[w])] <= 'z')) hit = YES;
-                            }
-                            if (!hit) continue;
-                            ptrdiff_t eo = ivar_getOffset(eIvs[ei]);
-                            if (eo < 0x40 || eo > 0x2000) continue;
-                            mfEntClsTargetSet(c, eIn, eo);
-                            // v2.58.104: 扫描/定位归侦查卡 — 用户定案架构:
-                            //   「侦查卡带扫描、判定总结, 把结果传到实验模拟页去执行」
-                            //   故实例在这里扫好入库, 实验页不再自己扫。
-                            //   只对**首个**权益类扫(512MB 扫描耗时, 多类会重复扫);
-                            //   mfEntClsTargetSet 已幂等, 这里用同样的门防重扫。
-                            static BOOL instCollected = NO;
-                            if (!instCollected) {
-                                instCollected = YES;
-                                extern int mfInstCollect(Class want, size_t budgetMB);
-                                mfInstCollect(c, 512);
-                            }
-                            break;
-                        }
-                        if (eIvs) free(eIvs);
-                    }
+                    // v2.58.107: 原先这里把权益类/ivar 喂给"实例直写"模块 ——
+                    //   该路线三次全败(43 处误报 / object_getClass 崩溃 / 再误报)已整体删除,
+                    //   喂入块一并移除。判定门改由 ivargate 引擎自己扫出
+                    //   (修掉下方指纹门两个 bug 后, 真点不再被误杀)。
                     // v2.58.96: 只 dump **主二进制(app 自己)** 的权益类。
                     //   mf_debug_93 实测: 8 个预算全被框架类耗尽 ——
                     //   StoreKit.StoreProductManager / LocalPurchasesManager /
@@ -1023,6 +998,15 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 unsigned int nIv = 0;
                 Ivar *ivs = class_copyIvarList(c, &nIv);
                 if (!ivs) continue;
+                // v2.58.107: 先收该类的**全部** ivar 偏移 → 类归属指纹集(供下方指纹门用)。
+                //   判据: 点位所在函数若在操作这个类, 必然同时访问它的多个字段
+                //   (字段跨度大, 不可能是数组元素偏移)。
+                nClsFp = 0;
+                for (unsigned int fi = 0; fi < nIv && nClsFp < 32; fi++) {
+                    ptrdiff_t fo = ivar_getOffset(ivs[fi]);
+                    if (fo < 0x40 || fo > 0x2000) continue;
+                    clsFpOffs[nClsFp++] = (uint32_t)fo;
+                }
                 for (unsigned int ii = 0; ii < nIv && nGateOff < 16; ii++) {
                     const char *in = ivar_getName(ivs[ii]);
                     if (!in) continue;
@@ -1103,13 +1087,24 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 int nOtherOff = 0;
                 for (uint64_t p = fnStart; p + 64 <= textSize && p < fnStart + 0x8000; p += 4) {
                     uint32_t wp = *(const uint32_t *)(bd + textFileOff + p);
-                    uint32_t bp = wp & 0xFFC00000;
-                    if (bp != 0x39400000 && bp != 0x39000000) continue;   // ldrb / strb
+                    // v2.58.107 修 bug2: 旧实现只认 ldrb/strb(0x39400000/0x39000000),
+                    //   而 0x100684de0 里的类字段访问是 **64 位 ldr/str** → 全漏。
+                    //   改为覆盖全部宽度: 字节/半字/字/双字 的 ldr/str。
+                    uint32_t bp = wp & 0x3FC00000;
+                    BOOL isLDST = (bp == 0x39400000 || bp == 0x39000000 ||   // byte
+                                   bp == 0x79400000 || bp == 0x79000000 ||   // half
+                                   bp == 0xB9400000 || bp == 0xB9000000 ||   // word
+                                   bp == 0xF9400000 || bp == 0xF9000000);    // double
+                    if (!isLDST) continue;
                     if ((wp & 0x1F) == 31 || ((wp >> 5) & 0x1F) == 31) continue;
                     uint32_t ip = (wp >> 10) & 0xFFF;
+                    // 按宽度换算真实偏移(立即数需 ×元素大小)
+                    uint32_t sz = (wp >> 30) & 3;
+                    uint32_t mult = (sz == 0) ? 1 : (sz == 1 ? 2 : (sz == 2 ? 4 : 8));
+                    ip *= mult;
                     if (ip == imm) continue;
-                    for (int k2 = 0; k2 < nGateOff; k2++)
-                        if (gateOffs[k2] == ip) { nOtherOff++; break; }
+                    for (int k2 = 0; k2 < nClsFp; k2++)
+                        if (clsFpOffs[k2] == ip) { nOtherOff++; break; }
                 }
                 if (nOtherOff < 1) {                                  // 函数内无第二个权益偏移 → 撞名
                     mfLog(@"[f8v2] ivargate 丢弃 @%#llx (偏移%#x 撞名: 函数 %#llx 内无其它权益 ivar)",

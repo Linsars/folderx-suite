@@ -1052,8 +1052,6 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
 - (void)mfAPKeychainStub;
 - (void)mfAPEntDelete:(NSString *)sym;   // v2.58.12: 左划删除 — 假点位手动清理解
-// v2.58.97: 运行时实例直写(免 patch) — 扫堆定位权益对象, 直接写其 bool 字段
-- (void)mfInstForceTap:(UIButton *)btn;
 @end
 
 static UITextView *g_apEditor = nil;
@@ -1221,39 +1219,6 @@ static MFAPEntList *g_apEntList = nil;
 //   删除是用户意图要尊重, 但误删必须能撤回: 清空墓碑后, 下次侦查可重新发现这些点。
 // v2.58.78: 交互改页内两次点击确认 — 用户指"系统弹窗和插件风格太割裂"(插件是
 //   bottom-sheet 页内交互, 系统 alert 是另一种模态, 视觉/手感都不连贯)。
-// v2.58.97: 运行时实例直写(免 patch) 的 UI 动作。
-//   六轮静态 patch 全不亮的根本反思: 静态偏移无法区分类, 猜"哪条指令读它"必然错。
-//   改走"对象路线": dylib 在 app 进程内 → 扫堆找到权益对象, 直接写它的字段。
-//   扫描必须在后台队列(256MB 逐块读), 结果回主线程 toast。
-//   写操作需两次点击确认(与清墓碑同风格) — 避免误触改坏运行中的 app。
-- (void)mfInstForceTap:(UIButton *)btn {
-    if (![objc_getAssociatedObject(btn, "mfArmInst") boolValue]) {
-        objc_setAssociatedObject(btn, "mfArmInst", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [btn setTitle:@"⚠️ 再点一次执行直写" forState:UIControlStateNormal];
-        btn.backgroundColor = [UIColor systemRedColor];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            objc_setAssociatedObject(btn, "mfArmInst", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [btn setTitle:@"⚡ 直写解锁" forState:UIControlStateNormal];
-            btn.backgroundColor = [UIColor systemGreenColor];
-        });
-        return;
-    }
-    objc_setAssociatedObject(btn, "mfArmInst", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    btn.enabled = NO;
-    [btn setTitle:@"⚡ 直写解锁" forState:UIControlStateNormal];
-    btn.backgroundColor = [UIColor systemGreenColor];
-    mfToast(@"⚡ 正在取实例并写入…");
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        extern int mfInstForceBool(void);
-        int ok = mfInstForceBool();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            btn.enabled = YES;
-            mfToast(ok > 0 ? [NSString stringWithFormat:@"⚡ 已写 %d 个实例 · 请看界面是否变化", ok]
-                           : @"未找到可写实例(详见日志)");
-        });
-    });
-}
-
 - (void)mfAPRestoreTombstones:(UIButton *)btn {
     NSUInteger n = mfAppPatchTombstoneCount();
     if (!n) { mfToast(@"无已删点位"); return; }
@@ -1548,43 +1513,6 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     }
     // v2.58.66: SK2/代码判定点第二张卡已删 — 与 🎯 判定点同义(用户: "又是什么鬼")。
     //   两类点(sk2pro/sk2get)本就入同一持久层, 由上面单卡统一展示与操作。
-
-    // v2.58.104: 架构归位(用户原话见 2.58.61 定案):
-    //   「侦查卡带扫描、判定总结, 根据判定类型把对应判定点传到实验模拟页对应卡片去」
-    //   → 侦查负责扫+定位, 实验页**只执行**。故删掉本页的"🔍 侦查实例"按钮。
-    //   实例定位由 MFRecon 的 ivargate 完成(它会调 mfInstCollect 把地址入库),
-    //   本卡片只显示已入库的实例数 + ⚡ 执行。
-    {
-        extern NSArray *mfInstAddrs(void);
-        NSArray *addrs = mfInstAddrs();
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
-        bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
-        bar.layer.cornerRadius = 10;
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, g_mfCardW - 46, 22)];
-        l.text = @"🧬 运行时实例直写(免 patch)";
-        l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-        [bar addSubview:l];
-        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 26, g_mfCardW - 46, 18)];
-        st.text = addrs.count
-            ? [NSString stringWithFormat:@"%lu 个实例已定位(侦查卡) → 写 _isVipPro=1, 不碰代码字节",
-               (unsigned long)addrs.count]
-            : @"未侦查 — 先在侦查卡跑一次(实例由侦查定位)";
-        st.font = [UIFont systemFontOfSize:10];
-        st.textColor = [UIColor secondaryLabelColor];
-        [bar addSubview:st];
-        UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
-        b2.frame = CGRectMake(10, 44, g_mfCardW - 44, 28);
-        b2.backgroundColor = addrs.count ? [UIColor systemGreenColor] : [UIColor tertiarySystemFillColor];
-        b2.layer.cornerRadius = 7;
-        b2.tintColor = UIColor.whiteColor;
-        b2.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
-        b2.enabled = addrs.count > 0;
-        [b2 setTitle:@"⚡ 直写解锁" forState:UIControlStateNormal];
-        [b2 addTarget:g_mfCtrl action:@selector(mfInstForceTap:) forControlEvents:UIControlEventTouchUpInside];
-        [bar addSubview:b2];
-        [page addSubview:bar];
-        y += 58;
-    }
 
     // v2.58.77 删: "keychain 票据(链B·开发中)" 占位按钮 + 说明块
     //   用户定案: "别老是搞一些死文案丢在那里" — 未落地的入口不上屏。
