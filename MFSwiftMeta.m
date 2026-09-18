@@ -26,16 +26,18 @@ static uintptr_t g_smTextLo = 0, g_smTextHi = 0;
 // 安全读: 失败绝不崩 (vm_read_overwrite 对未映射地址返回 KERN_INVALID_ADDRESS)
 static BOOL smRd(uintptr_t addr, void *dst, size_t len) {
     if (!addr || !len) return NO;
-    mach_vm_size_t out = 0;
-    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
-                                              (mach_vm_address_t)addr,
-                                              (mach_vm_size_t)len,
-                                              (mach_vm_address_t)dst, &out);
+    // v2.58.88: iOS SDK 14.5 只声明 vm_read_overwrite(非 mach_vm_*), 用它。
+    //   两者语义一致: 读失败(未映射)返回非 KERN_SUCCESS, 不产生 SIGSEGV。
+    vm_size_t out = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(),
+                                         (vm_address_t)addr,
+                                         (vm_size_t)len,
+                                         (vm_address_t)dst, &out);
     return (kr == KERN_SUCCESS && out == len);
 }
 static BOOL smRd32(uintptr_t addr, uint32_t *out) { return smRd(addr, out, 4); }
 static BOOL smRdI32(uintptr_t addr, int32_t *out) { return smRd(addr, out, 4); }
-static BOOL smRd64(uintptr_t addr, uint64_t *out) { return smRd(addr, out, 8); }
+static BOOL smRd64(uintptr_t addr, uintptr_t *out) { return smRd(addr, out, sizeof(uintptr_t)); }
 
 // 安全读 C 字符串 (逐字节 vm_read, 有上限)
 static BOOL smRdStr(uintptr_t addr, char *dst, size_t cap) {
