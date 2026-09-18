@@ -1052,6 +1052,9 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
 - (void)mfAPKeychainStub;
 - (void)mfAPEntDelete:(NSString *)sym;   // v2.58.12: 左划删除 — 假点位手动清理解
+// v2.58.97: 运行时实例直写(免 patch) — 扫堆定位权益对象, 直接写其 bool 字段
+- (void)mfInstProbeTap:(UIButton *)btn;
+- (void)mfInstForceTap:(UIButton *)btn;
 @end
 
 static UITextView *g_apEditor = nil;
@@ -1219,6 +1222,53 @@ static MFAPEntList *g_apEntList = nil;
 //   删除是用户意图要尊重, 但误删必须能撤回: 清空墓碑后, 下次侦查可重新发现这些点。
 // v2.58.78: 交互改页内两次点击确认 — 用户指"系统弹窗和插件风格太割裂"(插件是
 //   bottom-sheet 页内交互, 系统 alert 是另一种模态, 视觉/手感都不连贯)。
+// v2.58.97: 运行时实例直写(免 patch) 的 UI 动作。
+//   六轮静态 patch 全不亮的根本反思: 静态偏移无法区分类, 猜"哪条指令读它"必然错。
+//   改走"对象路线": dylib 在 app 进程内 → 扫堆找到权益对象, 直接写它的字段。
+//   扫描必须在后台队列(256MB 逐块读), 结果回主线程 toast。
+//   写操作需两次点击确认(与清墓碑同风格) — 避免误触改坏运行中的 app。
+- (void)mfInstProbeTap:(UIButton *)btn {
+    btn.enabled = NO;
+    mfToast(@"🧬 扫描中(只读, 约数秒)…");
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        extern NSDictionary *mfInstProbe(const char *clsSub, const char *ivarName, size_t budgetMB);
+        NSDictionary *r = mfInstProbe("VipProManager", "_isVipPro", 256);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            btn.enabled = YES;
+            if (!r) { mfToast(@"未找到权益类"); return; }
+            mfToast([NSString stringWithFormat:@"实例 %@ 个 · off=%@ · 详见日志",
+                     r[@"count"], r[@"off"]]);
+        });
+    });
+}
+- (void)mfInstForceTap:(UIButton *)btn {
+    if (![objc_getAssociatedObject(btn, "mfArmInst") boolValue]) {
+        objc_setAssociatedObject(btn, "mfArmInst", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [btn setTitle:@"⚠️ 再点一次执行直写" forState:UIControlStateNormal];
+        btn.backgroundColor = [UIColor systemRedColor];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            objc_setAssociatedObject(btn, "mfArmInst", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [btn setTitle:@"⚡ 直写解锁" forState:UIControlStateNormal];
+            btn.backgroundColor = [UIColor systemGreenColor];
+        });
+        return;
+    }
+    objc_setAssociatedObject(btn, "mfArmInst", nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    btn.enabled = NO;
+    [btn setTitle:@"⚡ 直写解锁" forState:UIControlStateNormal];
+    btn.backgroundColor = [UIColor systemGreenColor];
+    mfToast(@"⚡ 正在扫描并写入…");
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        extern int mfInstForceBool(const char *clsSub, const char *ivarName, size_t budgetMB);
+        int ok = mfInstForceBool("VipProManager", "_isVipPro", 256);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            btn.enabled = YES;
+            mfToast(ok > 0 ? [NSString stringWithFormat:@"⚡ 已写 %d 个实例 · 请看界面是否变化", ok]
+                           : @"未找到可写实例(详见日志)");
+        });
+    });
+}
+
 - (void)mfAPRestoreTombstones:(UIButton *)btn {
     NSUInteger n = mfAppPatchTombstoneCount();
     if (!n) { mfToast(@"无已删点位"); return; }
@@ -1513,6 +1563,44 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     }
     // v2.58.66: SK2/代码判定点第二张卡已删 — 与 🎯 判定点同义(用户: "又是什么鬼")。
     //   两类点(sk2pro/sk2get)本就入同一持久层, 由上面单卡统一展示与操作。
+
+    // v2.58.97: 运行时实例直写(新路线) — 六轮静态 patch 全不亮的根本反思:
+    //   静态偏移无法区分类(0x6d0 在几百个类里都有字段), 猜"哪条指令读它"必然错。
+    //   dylib 运行在 app 进程内 → 直接找到 HMVipProManager 的实例, 写它的 _isVipPro 字段。
+    //   不改任何代码字节, 不猜任何点位; 类名/ivar 名从参数来, 不硬编码 app。
+    {
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 76)];
+        bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+        bar.layer.cornerRadius = 10;
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, g_mfCardW - 46, 22)];
+        l.text = @"🧬 运行时实例直写(免 patch)";
+        l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        [bar addSubview:l];
+        UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 26, g_mfCardW - 46, 18)];
+        st.text = @"扫堆内存定位权益对象 → 写 _isVipPro=1(不碰代码字节)";
+        st.font = [UIFont systemFontOfSize:10];
+        st.textColor = [UIColor secondaryLabelColor];
+        [bar addSubview:st];
+        UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem];
+        b1.frame = CGRectMake(10, 44, (g_mfCardW - 44) / 2, 28);
+        b1.backgroundColor = [UIColor tertiarySystemFillColor];
+        b1.layer.cornerRadius = 7;
+        b1.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+        [b1 setTitle:@"🔍 侦查实例(只读)" forState:UIControlStateNormal];
+        [b1 addTarget:g_mfCtrl action:@selector(mfInstProbeTap:) forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:b1];
+        UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
+        b2.frame = CGRectMake(10 + (g_mfCardW - 44) / 2 + 4, 44, (g_mfCardW - 44) / 2, 28);
+        b2.backgroundColor = [UIColor systemGreenColor];
+        b2.layer.cornerRadius = 7;
+        b2.tintColor = UIColor.whiteColor;
+        b2.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
+        [b2 setTitle:@"⚡ 直写解锁" forState:UIControlStateNormal];
+        [b2 addTarget:g_mfCtrl action:@selector(mfInstForceTap:) forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:b2];
+        [page addSubview:bar];
+        y += 82;
+    }
 
     // v2.58.77 删: "keychain 票据(链B·开发中)" 占位按钮 + 说明块
     //   用户定案: "别老是搞一些死文案丢在那里" — 未落地的入口不上屏。

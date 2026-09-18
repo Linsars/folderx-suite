@@ -1,33 +1,26 @@
-// MFSwiftMeta.m — Swift 类方法表解析 (v2.58.91, 零 ObjC runtime 依赖)
+// MFSwiftMeta.m — Swift 类方法表解析 (v2.58.97, 零 ObjC realize 风险)
 //
-// ★★ 为什么不用 objc_getClass / objc_copyClassList:
-//   iOS26 SDK 下 force-realize 带泛型 conformance 的 Swift 类会走 _getWitnessTable 崩
-//   (v2.52.2 已记述; mf_debug_92 实测 CLASSDUMP names=61121 后即崩)。
-//   本模块改为**纯内存解析**: 已知 Swift 描述符地址 → 在 __DATA 里扫出 metadata
-//   → 解析 class_ro_t/ivar 表/vtable。全程只做 vm_read_overwrite, 不碰 ObjC runtime,
-//   不触发任何 realize → 结构上不可能因此崩溃。
+// v2.58.97 修两处 (mf_debug_94 实测):
+//   ① `ivars=0` → 标签全空。根因: 我从 meta+0x20 解 class_ro_t 再解 ivar_list 失败。
+//      改用 **class_copyIvarList(Class)** —— 类对象本来就有, 且 mf_debug_94 已证明它可信
+//      (13 个 ivar 名字+偏移全对: _isVipPro=1744=0x6d0)。
+//   ② `vtableRun=8` → 只找到 8 个。根因: Swift vtable 里大量槽是 `_swift_deletedMethodError`
+//      (bind 修复项, 不是 __text 指针), 把"最长连续 run"切碎。
+//      改用 **允许间隔扫描**: 在 vtable 区内收集全部落在 __text 的指针。
 //
-// 布局(实测 bplayer 的 HMVipProManager, arm64):
-//   meta + 0x20 → class_ro_t | flags   (ObjC 兼容头, 含 ivar 表)
-//   meta + 0x40 → Swift class descriptor (description 槽)
-//   meta + 0x48 → 之后是 immediate members; 方法 IMP 混在 8 字节槽里
-//   故: ① 用 desc 反查 meta(扫 __DATA 找指向 desc 的槽, meta = 槽 - 0x40)
-//       ② 在 meta+0x48 .. meta+0x1000 找最长连续落在 __text 的指针 run = vtable
-//       ③ 用该类的 ivar 偏移表(从 ro+48 解析)给每个 IMP 打语义标签
+// 布局(实测): meta+0x20 = class_ro_t, meta+0x40 = Swift 描述符, 之后是字段偏移向量 + vtable。
+// 槽可能是三种形态: 裸指针(运行时已重定位) / chained fixup 值(需掩码+基址) / bind(非代码)。
 
 #import <Foundation/Foundation.h>
+#import <objc/runtime.h>
 #import <string.h>
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import "MFPanel.h"
 
-#define SM_MAXSEG 8
-static uintptr_t g_segAddr[SM_MAXSEG], g_segSize[SM_MAXSEG];
-static int g_segN = 0;
 static uintptr_t g_textLo = 0, g_textHi = 0;
 
-// ---- 安全读 (失败绝不崩) ----
 static BOOL smRd(uintptr_t addr, void *dst, size_t len) {
     if (!addr || !len) return NO;
     vm_size_t out = 0;
@@ -36,26 +29,12 @@ static BOOL smRd(uintptr_t addr, void *dst, size_t len) {
     return (kr == KERN_SUCCESS && out == len);
 }
 static BOOL smRd32(uintptr_t a, uint32_t *o) { return smRd(a, o, 4); }
-static BOOL smRdI32(uintptr_t a, int32_t *o) { return smRd(a, o, 4); }
 static BOOL smRd64(uintptr_t a, uintptr_t *o) { return smRd(a, o, sizeof(uintptr_t)); }
-static BOOL smRdStr(uintptr_t addr, char *dst, size_t cap) {
-    if (!addr || cap < 2) return NO;
-    dst[0] = 0;
-    for (size_t i = 0; i + 1 < cap; i++) {
-        char ch = 0;
-        if (!smRd(addr + i, &ch, 1)) return i > 0;
-        if (!ch) return i > 0;
-        if (ch < 32 || ch > 126) return NO;
-        dst[i] = ch; dst[i + 1] = 0;
-    }
-    return YES;
-}
 
-// ---- 主镜像段表 + __text 范围 ----
-static void smInit(void) {
-    if (g_segN) return;
+static void smTextRange(void) {
+    if (g_textLo) return;
     uint32_t ic = _dyld_image_count();
-    for (uint32_t i = 0; i < ic && !g_segN; i++) {
+    for (uint32_t i = 0; i < ic && !g_textLo; i++) {
         const struct mach_header *mh = _dyld_get_image_header(i);
         if (!mh) continue;
         const struct mach_header_64 *h = (const struct mach_header_64 *)mh;
@@ -69,17 +48,9 @@ static void smInit(void) {
             if (lc->cmdsize < sizeof(struct load_command) || p + lc->cmdsize > end) break;
             if (lc->cmd == LC_SEGMENT_64) {
                 const struct segment_command_64 *sg = (const struct segment_command_64 *)p;
-                if (sg->fileoff == 0 && sg->vmaddr == 0) { p += lc->cmdsize; continue; }  // __PAGEZERO
-                if (strncmp(sg->segname, "__TEXT", 16) == 0 && sg->fileoff == 0) isMain = YES;
-                // v2.58.91: 只收 __DATA* 段做 metadata 反查 —— class metadata 在 __DATA 族,
-                //   而 __TEXT 有 21MB, 扫它纯属浪费且拖慢面板。
-                if (isMain && sg->vmsize > 0 && g_segN < SM_MAXSEG &&
-                    strncmp(sg->segname, "__DATA", 6) == 0) {
-                    g_segAddr[g_segN] = (uintptr_t)sg->vmaddr + slide;
-                    g_segSize[g_segN] = sg->vmsize;
-                    g_segN++;
-                }
-                if (isMain && strncmp(sg->segname, "__TEXT", 16) == 0) {
+                if (sg->fileoff == 0 && sg->vmaddr == 0) { p += lc->cmdsize; continue; }
+                if (strncmp(sg->segname, "__TEXT", 16) == 0 && sg->fileoff == 0) {
+                    isMain = YES;
                     const struct section_64 *sec = (const struct section_64 *)(sg + 1);
                     for (uint32_t s = 0; s < sg->nsects; s++, sec++) {
                         if (strncmp(sec->sectname, "__text", 16) == 0) {
@@ -91,105 +62,61 @@ static void smInit(void) {
             }
             p += lc->cmdsize;
         }
+        if (isMain && !g_textLo) continue;
     }
 }
 
-// ---- 由 Swift 描述符反查 metadata (扫 __DATA 段找指向 desc 的槽) ----
-static uintptr_t smMetaForDesc(uintptr_t desc) {
-    if (!desc) return 0;
-    static uint8_t buf[64 * 1024];
-    for (int s = 0; s < g_segN; s++) {
-        uintptr_t a = g_segAddr[s], sz = g_segSize[s];
-        if (sz < 0x1000 || sz > 0x4000000) continue;          // 跳过 __TEXT 等巨大段
-        for (uintptr_t off = 0; off + 8 <= sz; off += sizeof(buf)) {
-            size_t want = sizeof(buf);
-            if (off + want > sz) want = (size_t)(sz - off);
-            if (!smRd(a + off, buf, want)) continue;          // 未映射就跳过
-            for (size_t i = 0; i + 8 <= want; i += 8) {
-                uintptr_t v = 0;
-                memcpy(&v, buf + i, 8);
-                // v2.58.94: chained fixup 槽在运行时**不是裸指针** —— 低位 36 bit = 重定位后地址,
-                //   bit51~62 仍是 next 链字段(实测静态槽 0x00f0000001683c44: next=0xf, target=0x1683c44)。
-                //   直接 `v == desc` 必然不等(高位干扰) → 必须掩码。
-                //   双掩码: 36 bit(target 域) 与 51 bit(去 next 保留全地址) 都试一遍。
-                uintptr_t m36 = v & 0xFFFFFFFFFULL;
-                uintptr_t m51 = v & 0x7FFFFFFFFFFFFULL;
-                if (m36 != desc && m51 != desc && v != desc) continue;
-                uintptr_t cand = a + off + i - 0x40;          // meta = 槽 - 0x40
-                uintptr_t chk = 0;
-                if (smRd64(cand + 0x40, &chk)) {
-                    uintptr_t c36 = chk & 0xFFFFFFFFFULL, c51 = chk & 0x7FFFFFFFFFFFFULL;
-                    if (c36 == desc || c51 == desc || chk == desc) return cand;
-                }
-            }
-        }
+// 把槽值归一化为代码地址 (裸指针 / chained fixup 两种形态都试); 0 = 不是代码指针
+static uintptr_t smCodeAddr(uintptr_t v) {
+    if (!v) return 0;
+    if (v & (1ULL << 63)) return 0;                 // bind — 非本地代码
+    if (v >= g_textLo && v < g_textHi) return v;    // 运行时裸指针
+    uintptr_t c36 = v & 0xFFFFFFFFFULL;             // chained fixup: 低位 36 bit + 镜像基址
+    if (c36) {
+        uintptr_t t = c36 + 0x100000000ULL;
+        if (t >= g_textLo && t < g_textHi) return t;
     }
+    uintptr_t c51 = v & 0x7FFFFFFFFFFFFULL;
+    if (c51 >= g_textLo && c51 < g_textHi) return c51;
     return 0;
 }
 
-// ---- 从 meta 解析该类自己的 ivar 偏移表 (标签用) ----
-static int smIvarsFromMeta(uintptr_t meta, ptrdiff_t *offs, const char **names, int cap) {
-    uintptr_t ro = 0;
-    if (!smRd64(meta + 0x20, &ro)) return 0;
-    ro &= ~(uintptr_t)7;
-    uintptr_t ivp = 0;
-    if (!smRd64(ro + 48, &ivp) || !ivp) return 0;
-    uint32_t entsize = 0, count = 0;
-    if (!smRd32(ivp, &entsize) || !smRd32(ivp + 4, &count)) return 0;
-    if (count == 0 || count > 256) return 0;
-    if (entsize < 12 || entsize > 64) return 0;
-    int n = 0;
-    for (uint32_t k = 0; k < count && n < cap; k++) {
-        uintptr_t e = ivp + 8 + (uintptr_t)k * entsize;
-        uintptr_t offPtr = 0, namePtr = 0;
-        if (!smRd64(e, &offPtr) || !smRd64(e + 8, &namePtr)) continue;
-        int32_t ov = 0;
-        if (!offPtr || !smRdI32(offPtr, &ov)) continue;
-        char nb[128];
-        if (!smRdStr(namePtr, nb, sizeof(nb))) continue;
-        offs[n] = (ptrdiff_t)ov;
-        names[n] = strdup(nb);            // 调用方负责 free
-        if (names[n]) n++;
-    }
-    return n;
-}
-
-// ---- [xN,#imm] 访问判定 ----
 static int smAcc(uint32_t w, uint32_t *outOff) {
     uint32_t base = w & 0xFFC00000u;
     if ((w & 0x1Fu) == 31 || ((w >> 5) & 0x1Fu) == 31) return 0;
     uint32_t imm = (w >> 10) & 0xFFFu;
     switch (base) {
-        case 0x39400000u: *outOff = imm;      return 1;
-        case 0x39000000u: *outOff = imm;      return 2;
-        case 0x79400000u: *outOff = imm * 2;  return 1;
-        case 0x79000000u: *outOff = imm * 2;  return 2;
-        case 0xB9400000u: *outOff = imm * 4;  return 1;
-        case 0xB9000000u: *outOff = imm * 4;  return 2;
-        case 0xF9400000u: *outOff = imm * 8;  return 1;
-        case 0xF9000000u: *outOff = imm * 8;  return 2;
+        case 0x39400000u: *outOff = imm;      return 1;   // ldrb
+        case 0x39000000u: *outOff = imm;      return 2;   // strb
+        case 0x79400000u: *outOff = imm * 2;  return 1;   // ldrh
+        case 0x79000000u: *outOff = imm * 2;  return 2;   // strh
+        case 0xB9400000u: *outOff = imm * 4;  return 1;   // ldr w
+        case 0xB9000000u: *outOff = imm * 4;  return 2;   // str w
+        case 0xF9400000u: *outOff = imm * 8;  return 1;   // ldr x
+        case 0xF9000000u: *outOff = imm * 8;  return 2;   // str x
         default: return 0;
     }
 }
 
-static NSString *smLabelImp(uintptr_t imp, const ptrdiff_t *offs, const char **names, int nIv) {
+// 扫 IMP 函数体, 归纳它读了/写了哪些权益 ivar
+static NSString *smLabelImp(uintptr_t imp, const ptrdiff_t *ivOffs, const char **ivNames, int nIv) {
     if (imp < g_textLo || imp >= g_textHi) return nil;
-    uint32_t code[24];
+    uint32_t code[96];
     size_t need = sizeof(code);
     if (g_textHi - imp < need) need = (size_t)(g_textHi - imp);
     if (need < 16) return nil;
     if (!smRd(imp, code, need)) return nil;
     NSMutableString *lbl = [NSMutableString string];
-    BOOL hasRet = NO; int nIns = 0, nInsMax = (int)(need / 4);
-    for (int i = 0; i < nInsMax; i++) {
+    BOOL hasRet = NO; int nIns = 0, nMax = (int)(need / 4);
+    for (int i = 0; i < nMax; i++) {
         uint32_t w = code[i]; nIns++;
         if (w == 0xD65F03C0u) { hasRet = YES; break; }
         uint32_t off = 0;
         int acc = smAcc(w, &off);
         if (!acc) continue;
         for (int k = 0; k < nIv; k++) {
-            if ((ptrdiff_t)off != offs[k]) continue;
-            NSString *piece = [NSString stringWithFormat:@"%s %s", acc == 1 ? "reads" : "writes", names[k]];
+            if ((ptrdiff_t)off != ivOffs[k]) continue;
+            NSString *piece = [NSString stringWithFormat:@"%s %s", acc == 1 ? "reads" : "writes", ivNames[k]];
             if (![lbl containsString:piece]) {
                 if (lbl.length) [lbl appendString:@", "];
                 [lbl appendString:piece];
@@ -198,91 +125,67 @@ static NSString *smLabelImp(uintptr_t imp, const ptrdiff_t *offs, const char **n
         }
     }
     if (!lbl.length) return nil;
-    if (hasRet && nIns <= 10) [lbl appendString:@" (accessor)"];
+    if (hasRet && nIns <= 12) [lbl appendString:@" (accessor)"];
     return lbl;
 }
 
-// ---- 主入口 A: 由 metadata 指针直接产出 (最稳: Class 对象即 metadata) ----
+// ---- 主入口: meta = Class 指针 (Swift 类的 Class 对象就是 metadata) ----
 NSString *mfSwiftMethodTableForMeta(uintptr_t meta, const char *clsName) {
-    smInit();
+    smTextRange();
     if (!g_textLo || !meta) return nil;
+    Class c = (Class)meta;                  // Class 指针即 metadata
 
+    // ① ivar 表: 直接用 runtime API (mf_debug_94 证明可信), 不自己解 ro
+    unsigned int nIv0 = 0;
+    Ivar *ivs = class_copyIvarList(c, &nIv0);
+    ptrdiff_t offs[64]; const char *names[64]; int nIv = 0;
+    for (unsigned int i = 0; ivs && i < nIv0 && nIv < 64; i++) {
+        const char *in = ivar_getName(ivs[i]);
+        if (!in) continue;
+        offs[nIv] = ivar_getOffset(ivs[i]);
+        names[nIv] = strdup(in);
+        if (names[nIv]) nIv++;
+    }
+    if (ivs) free(ivs);
+
+    // ② 描述符 → numImmediateMembers (决定扫描跨度)
     uintptr_t desc = 0;
-    if (!smRd64(meta + 0x40, &desc)) return nil;
-    // 运行时 dyld 已把 rebase 槽写成裸指针; 静态文件里则是 chained fixup 值(需掩码+基址)
-    if (desc < g_textLo || desc > g_textHi + 0x1000000) {
-        uintptr_t d36 = desc & 0xFFFFFFFFFULL;
-        uintptr_t d51 = desc & 0x7FFFFFFFFFFFFULL;
-        if (d36 >= 0x100000000ULL && d36 < g_textHi + 0x1000000) desc = d36;
-        else if (d51 >= 0x100000000ULL && d51 < g_textHi + 0x1000000) desc = d51;
-        else return nil;
-    }
-
-    ptrdiff_t offs[64]; const char *names[64];
-    int nIv = smIvarsFromMeta(meta, offs, names, 64);
-
-    // vtable: meta+0x48 起找最长连续 __text 指针 run (每槽独立安全读)
-    uintptr_t bestStart = 0, runStart = 0; int bestLen = 0, runLen = 0;
-    for (uintptr_t p = meta + 0x48, e = meta + 0x1000; p < e; p += 8) {
-        uintptr_t v = 0;
-        if (!smRd64(p, &v)) { runLen = 0; continue; }
-        // 兼容两种形态: 运行时裸指针 / 未重定位的 chained fixup 值
-        uintptr_t cand = v;
-        if (cand < g_textLo || cand >= g_textHi) {
-            uintptr_t c36 = v & 0xFFFFFFFFFULL, c51 = v & 0x7FFFFFFFFFFFFULL;
-            if (c36 >= g_textLo && c36 < g_textHi) cand = c36;
-            else if (c51 >= g_textLo && c51 < g_textHi) cand = c51;
+    uint32_t nim = 0;
+    if (smRd64(meta + 0x40, &desc)) {
+        uintptr_t d = desc;
+        if (d < g_textLo || d > g_textHi + 0x1000000) {
+            d = smCodeAddr(desc) ? 0 : (desc & 0xFFFFFFFFFULL) + 0x100000000ULL;
         }
-        if (cand >= g_textLo && cand < g_textHi) {
-            if (!runLen) runStart = p;
-            runLen++;
-            if (runLen > bestLen) { bestLen = runLen; bestStart = runStart; }
-        } else runLen = 0;
+        if (d >= g_textLo) smRd32(d + 28, &nim);
     }
+    if (nim == 0 || nim > 4000) nim = 256;
 
+    // ③ 允许间隔地收集 vtable 区内所有代码指针 (deleted-method 槽会打断连续 run)
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"    // Swift meta=%#llx desc=%#llx ivars=%d vtableRun=%d@meta+%#llx\n",
-         (unsigned long long)meta, (unsigned long long)desc, nIv, bestLen,
-         (unsigned long long)(bestStart ? bestStart - meta : 0)];
-    if (bestLen >= 3) {
-        int tagged = 0;
-        for (int k = 0; k < bestLen && k < 256; k++) {
-            uintptr_t imp = 0;
-            if (!smRd64(bestStart + (uintptr_t)k * 8, &imp)) break;
-            uintptr_t cand = imp;
-            if (cand < g_textLo || cand >= g_textHi) {
-                uintptr_t c36 = imp & 0xFFFFFFFFFULL, c51 = imp & 0x7FFFFFFFFFFFFULL;
-                if (c36 >= g_textLo && c36 < g_textHi) cand = c36;
-                else if (c51 >= g_textLo && c51 < g_textHi) cand = c51;
-            }
-            NSString *lbl = smLabelImp(cand, offs, names, nIv);
-            if (lbl) {
-                tagged++;
-                [out appendFormat:@"    imp[%d] %#llx  %@\n", k, (unsigned long long)cand, lbl];
-            } else if (k < 10) {
-                [out appendFormat:@"    imp[%d] %#llx\n", k, (unsigned long long)cand];
-            }
+    [out appendFormat:@"    // Swift meta=%#llx nim=%u ivars=%d\n",
+         (unsigned long long)meta, nim, nIv];
+    int found = 0, tagged = 0;
+    uintptr_t base = meta + 0x48;
+    uintptr_t endP = base + ((uintptr_t)nim + 128) * 8;
+    for (uintptr_t p = base; p < endP; p += 8) {
+        uintptr_t v = 0;
+        if (!smRd64(p, &v)) break;
+        uintptr_t imp = smCodeAddr(v);
+        if (!imp) continue;
+        found++;
+        NSString *lbl = smLabelImp(imp, offs, names, nIv);
+        if (lbl) {
+            tagged++;
+            [out appendFormat:@"    slot[+%#lx] %#llx  %@\n", (long)(p - meta), (unsigned long long)imp, lbl];
+        } else if (found <= 12) {
+            [out appendFormat:@"    slot[+%#lx] %#llx\n", (long)(p - meta), (unsigned long long)imp];
         }
-        [out appendFormat:@"    // 小结: vtable IMP=%d, 带权益字段标签=%d\n", bestLen, tagged];
-    } else {
-        for (int k = 0; k < nIv; k++)
-            [out appendFormat:@"    ivar %s off=%#lx\n", names[k], (long)offs[k]];
     }
-    for (int k = 0; k < nIv; k++) if (names[k]) free((void *)names[k]);
-    (void)clsName;
-    return out;
+    [out appendFormat:@"    // 小结: 代码槽=%d, 带权益字段标签=%d\n", found, tagged];
+    for (int k = 0; k < nIv; k++) free((void *)names[k]);
+    return (found ? out : nil);
 }
 
-// ---- 主入口 B: 由描述符反查 metadata (classdump 只有描述符时用) ----
-NSString *mfSwiftMethodTableForDescriptor(uintptr_t desc, const char *clsName) {
-    smInit();
-    if (!g_textLo || !desc) return nil;
-    uintptr_t meta = smMetaForDesc(desc);
-    if (!meta) return nil;
-    return mfSwiftMethodTableForMeta(meta, clsName);
-}
-
-// ---- 旧入口保留 (避免别处引用编译失败) ----
 NSString *mfSwiftMethodTable(void *cls) {
     return mfSwiftMethodTableForMeta((uintptr_t)cls, NULL);
 }
