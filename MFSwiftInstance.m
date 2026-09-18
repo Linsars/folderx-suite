@@ -60,9 +60,40 @@ static BOOL mfiWr(uintptr_t a, const void *src, size_t len) {
 //   PAC 签名指针, 与类元数据地址**不相等**; 而内存里到处存着类的**裸指针**
 //   (objc 类表条目/元数据自引用/全局变量), 这些全被误当成实例。
 //   日志铁证: _isVipPro 是 Bool, 但读出 64/112/255/104 → 那些位置不是对象。
-//   正解: 用 object_getClass() 解 PAC 签名后比较, 只认真对象。
+//
+// ★★ v2.58.106 修崩溃(mf_debug_98 崩在 object_getClass 内, EXC_BREAKPOINT):
+//   上一版改用 object_getClass() 解 PAC —— 但候选地址是**任意 16 对齐的内存**,
+//   绝大多数不是对象, object_getClass 对非法 isa 会 trap(SIMD/指针校验)。
+//   正解: **不 deref 候选**。用 objc runtime 导出的掩码做静态判定:
+//     - tagged pointer 或 非小端 0 → 不是对象
+//     - arm64e: isa 高位含 PAC 签名位, 与类地址不相等但**低位相同**
+//       → 比较时对 PAC 位做容忍(& 掉高 16 位的签名段)
+//   全程只用 vm_read 读 8 字节, 不调任何会触发解引用的 API。
+extern uintptr_t objc_debug_isa_class_mask;
+extern uintptr_t objc_debug_isa_magic_mask;
+extern uintptr_t objc_debug_taggedpointer_mask;
+
+static inline BOOL mfiIsaPointsTo(uintptr_t v, uintptr_t wantCls) {
+    if (!v) return NO;
+    // tagged pointer / 非 64 位对齐对象 → 跳过(这类 isa 机制不同)
+    if (v & 1) return NO;
+    // arm64: 已签名 isa 的**低 36~40 位就是类地址本身**, 高位是 PAC/魔法值
+    // 用 class_mask 取出"类地址段"再比较, 既兼容 arm64 又兼容 arm64e 的签名位
+    uintptr_t m = objc_debug_isa_class_mask;
+    if (m) {
+        uintptr_t lo = v & m;
+        if (lo == wantCls) return YES;
+        // 若 mask 比 36 位宽(含部分签名位), 再用 36 位窄比较兜底
+        if ((v & 0xFFFFFFFFF) == wantCls) return YES;
+    } else {
+        if ((v & 0xFFFFFFFFF) == wantCls) return YES;
+    }
+    return NO;
+}
+
 static int mfiCollectInstances(Class want, uintptr_t *out, int cap, size_t budget) {
     if (!want) return 0;
+    uintptr_t wantCls = (uintptr_t)want;
     int n = 0;
     vm_address_t addr = 0;
     vm_size_t size = 0;
@@ -95,10 +126,8 @@ static int mfiCollectInstances(Class want, uintptr_t *out, int cap, size_t budge
                     if (cand & 0xF) continue;        // 实例必 16 字节对齐
                     uintptr_t v = 0;
                     memcpy(&v, buf + i, 8);
-                    if (!v) continue;
-                    // arm64e: 解 PAC 签名再比较 — 不再用裸指针比对
-                    Class ic = object_getClass((__bridge id)(void *)cand);
-                    if (ic != want) continue;
+                    // ★ 不 deref 候选 — 只做掩码判定(v2.58.106)
+                    if (!mfiIsaPointsTo(v, wantCls)) continue;
                     if (n < cap) out[n++] = cand;
                 }
                 scanned += got;
