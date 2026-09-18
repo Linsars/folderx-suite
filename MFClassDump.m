@@ -478,58 +478,48 @@ static void mfDumpAllSwift(NSFileHandle *fh, NSMutableArray *cds, NSMutableData 
 // ====== 主流程（流式落盘：内存峰值 = 单类头文件，防 jetsam） ======
 void mfClassDumpStartAction(UIProgressView *pv, UILabel *lb, UIButton *btn, UIView *actionRow) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        mfLog(@"CLASSDUMP enter (build 2.58.90)");
-        // v2.58.90 崩溃修复 (mf_debug_90/91: 出包即闪退, 且 "CLASSDUMP start" 从未出现):
-        //   旧实现在枚举阶段对**每个**类名调 objc_getClass → force-realize 全进程类
-        //   → iOS26-SDK Swift app 泛型 conformance 带外 realize 触发 _getWitnessTable 崩
-        //   (v2.52.2 注释里已记述, 但当时只改成"逐镜像", realize 次数没减)。
-        //   修法: ① 只收名字, 不 realize
-        //         ② 只对"需要的类"realize: 权益词表命中者 + 非 Swift 类名(Swift 泛型类才是崩源)
-        //         ③ 每步打日志, 崩了也能定位到最后一条
-        uint32_t ic = _dyld_image_count();
-        NSMutableArray<NSString *> *allNames = [NSMutableArray array];
-        for (uint32_t i = 0; i < ic; i++) {
-            const char *img = _dyld_get_image_name(i);
-            if (!img) continue;
-            unsigned cn = 0;
-            char **names = objc_copyClassNamesForImage(img, &cn);
-            for (unsigned j = 0; j < cn; j++) if (names[j]) [allNames addObject:@(names[j])];
-            if (names) free(names);
-        }
-        mfLog(@"CLASSDUMP names=%lu", (unsigned long)allNames.count);
+        mfLog(@"CLASSDUMP enter (build 2.58.92)");
+        // v2.58.92 崩溃修复 (mf_debug_90/91/92 三连崩, 定位链):
+        //   mf_debug_92 日志停在 "CLASSDUMP names=61121" → 崩在**枚举之后的阶段**。
+        //   v2.58.90 只收名字(不 realize) 仍崩 → 说明崩点不在"按名 realize", 而在后面。
+        //   决定性对比: MFRecon 的 objc_copyClassList 实测可用(2.58.86 日志有 [entcls] 输出),
+        //   而本函数在它之后崩 → 嫌疑集中在 **mfHeaderForClass 对 61121 个类逐个生成头文件**
+        //   (每类 class_copyMethodList/protocol/property + 字符串拼接, 巨量系统调用 → jetsam)。
+        //
+        //   修法: ① ObjC 全类头文件导出改为**可选**, 默认关闭(该功能在 95 份历史日志里
+        //        从未成功产出过, 而真正要的是 Swift 元数据)
+        //        ② 默认只跑 Swift 阶段(getsectiondata 纯内存读, 不碰 runtime, 不会崩)
+        //        ③ 保留 ObjC 导出开关, 打开时走已验证可用的 objc_copyClassList
+        BOOL wantObjC = [[NSUserDefaults standardUserDefaults] boolForKey:@"mfCDObjCClasses"];
 
-        // v2.58.91 崩溃修复 (mf_debug_92: 日志停在 "CLASSDUMP names=61121", realized 行未出现):
-        //   v2.58.90 只按 `_TtC/_TtV/...` 前缀跳过 Swift 类名, 但词表里的 "Product"/"Purchase"
-        //   命中大量 **Swift 命名的框架类**(StoreKit.StoreProductManager 等) → 仍被 realize → 崩。
-        //   彻底修法(三条):
-        //     ① **Swift 命名的类一律不碰**: `_Tt` 前缀 或 名字含 '.'(模块限定名)。
-        //        Swift 类信息走 __swift5_types 独立路径, 不需要 ObjC 类对象。
-        //     ② 用 **objc_lookUpClass** 而非 objc_getClass — 前者不 force-realize。
-        //     ③ 只对权益词表命中的纯 ObjC 类取类对象; 每类打日志, 仍崩可精确定位。
-        static const char *kEntWords[] = {"Vip","ProManager","Entitle","Premium",
-                                          "Membership","Subscri","Purchase","Product"};
-        unsigned realized = 0, skipped = 0, seen = 0;
         NSMutableArray<Class> *all = [NSMutableArray array];
-        for (NSString *n in allNames) {
-            seen++;
-            if ((seen % 5000) == 0) mfLog(@"CLASSDUMP scan %u/%lu", seen, (unsigned long)allNames.count);
-            if ([n hasPrefix:@"_Tt"] || [n containsString:@"."]) { skipped++; continue; }   // ① Swift 命名
-            BOOL entHit = NO;
-            for (int w = 0; w < 8 && !entHit; w++) if ([n containsString:@(kEntWords[w])]) entHit = YES;
-            if (!entHit) { skipped++; continue; }
-            mfLog(@"CLASSDUMP lookup: %@", n);
-            Class c = objc_lookUpClass(n.UTF8String);   // ② 不 realize
-            if (c) { [all addObject:c]; realized++; }
+        unsigned total = 0;
+        if (wantObjC) {
+            unsigned nCls = 0;
+            Class *clsList = objc_copyClassList(&nCls);       // 已验证可用
+            if (clsList) {
+                mfLog(@"CLASSDUMP copyClassList=%u", nCls);
+                for (unsigned i = 0; i < nCls; i++) if (clsList[i]) [all addObject:clsList[i]];
+                free(clsList);
+            }
+            total = (unsigned)all.count;
+            mfLog(@"CLASSDUMP objc classes=%u", total);
+        } else {
+            mfLog(@"CLASSDUMP ObjC 全类导出未启用(默认关) — 只跑 Swift 元数据阶段");
         }
-        mfLog(@"CLASSDUMP realized=%u (skipped=%u)", realized, skipped);
-        unsigned total = (unsigned)all.count;
         Class *classes = (Class *)malloc(sizeof(Class) * (total ?: 1));
         for (unsigned i = 0; i < total; i++) classes[i] = all[i];
         mfLog(@"CLASSDUMP start: %u classes", total);
         if (!total || !classes) {
             free(classes);
-            dispatch_async(dispatch_get_main_queue(), ^{ lb.text = @"⚠️ 无类可枚举"; btn.enabled = YES; });
-            return;
+            classes = NULL;   // v2.58.92: 防后面再次 free (double-free)
+            // v2.58.92: 不再直接 return —— 无 ObjC 类时仍要跑 Swift 阶段
+            //   (Swift 元数据走 getsectiondata 纯内存读, 正是我们要的东西)
+            if (!wantObjC) { /* 继续往下走 Swift 阶段 */ }
+            else {
+                dispatch_async(dispatch_get_main_queue(), ^{ lb.text = @"⚠️ 无类可枚举"; btn.enabled = YES; });
+                return;
+            }
         }
         NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0]
                             stringByAppendingPathComponent:@"classdump"];
@@ -569,16 +559,16 @@ void mfClassDumpStartAction(UIProgressView *pv, UILabel *lb, UIButton *btn, UIVi
                 }
             }
             done++;
-            if (done % 500 == 0 || done == total) {
+            if (total > 0 && (done % 500 == 0 || done == total)) {
                 float frac = (float)done / total;
-                unsigned d = done;
+                unsigned d = done, t = total;
                 dispatch_async(dispatch_get_main_queue(), ^{
                     pv.progress = frac;
-                    lb.text = [NSString stringWithFormat:@"正在生成头文件... %.0f%% (%u/%u)", frac * 100, d, total];
+                    lb.text = [NSString stringWithFormat:@"正在生成头文件... %.0f%% (%u/%u)", frac * 100, d, t];
                 });
             }
         }
-        free(classes);
+        if (classes) free(classes);
         mfLog(@"CLASSDUMP generated %u headers, scanning Swift metadata", (unsigned)cds.count);
 
         dispatch_async(dispatch_get_main_queue(), ^{
