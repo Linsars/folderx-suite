@@ -51,13 +51,6 @@ static BOOL mfiWr(uintptr_t a, const void *src, size_t len) {
 //   方式: 递归遍历对象的全部 ivar (对象引用型), 深度/数量都有上限。
 //   安全: 只读 ivar 指针值; 指针是否有效由后续 mfiRd 判定, 不 deref。
 // =====================================================================
-static const void *mfiSafeClass(id obj) {
-    if (!obj) return NULL;
-    // 只处理指针型对象; 用 object_getClass 拿真实类(不触发消息)
-    Class c = object_getClass(obj);
-    return c;
-}
-
 static int mfiWalk(id root, Class want, void **out, int cap, int depth, int *budget) {
     if (!root || !want || depth > 6 || *budget <= 0) return 0;
     int n = 0;
