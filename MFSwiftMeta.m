@@ -1,27 +1,55 @@
-// MFSwiftMeta.m — 运行时 Swift 类方法表解析 (v2.58.87)
+// MFSwiftMeta.m — 运行时 Swift 类方法表解析 (v2.58.88)
 //
 // 回答: "classdump 运行时能不能加上解析 swift 的?"
-//   能 —— 而且运行时**比本地静态容易**:
-//     静态文件里 vtable 槽是未绑定的 chained fixup(指向外部的显示 bind,
-//     内部的是未解析值), 本地要手写 fixup 解码器才能读;
-//     运行时 dyld 已全部重定位, 槽里就是现成的 IMP 指针, 直接读。
+//   能 — 且运行时比本地静态省事: 静态 vtable 槽是未绑定 chained fixup(需手写解码器),
+//   运行时 dyld 已重定位, 槽里就是现成 IMP 指针。
 //
-// 纯 Swift 类(如 HMVipProManager)的 ObjC class_ro_t.baseMethods = null,
-//   所以 class-dump 只看得到字段、看不到方法 —— 方法在 Swift 元数据的 vtable 区。
-//   本模块补上这一半: 枚举 vtable IMP + 用类自己的 ivar 表反汇编打语义标签。
+// 纯 Swift 类(HMVipProManager)的 class_ro_t.baseMethods=null → class-dump 只见字段,
+//   方法在 Swift 元数据 vtable 里。本模块补上这一半。
 //
-// 定位策略(不硬编码偏移, 对布局不确定性鲁棒):
-//   从 meta+0x48 起, 在 meta..meta+0x4000 内找**最长连续落在主二进制 __text 的
-//   指针 run**, 该 run 即 vtable。(运行时全部已重定位 → run 是稠密的)
+// ★ v2.58.88 崩溃修复 (mf_debug_90: 2.58.87 出包即闪退):
+//   v2.58.87 用裸指针解引用(*(uintptr_t*)addr / nmp[i] 逐字节), 全部是野读,
+//   一旦越界就是 SIGSEGV/SIGBUS — **@try 接不住**, app 直接死。
+//   本版: 所有内存读取一律经 smRd()(mach_vm_read_overwrite), 读失败返回 NO 并跳过;
+//   任何一步拿不到数据都只是"没有输出", 绝不崩。宁可少输出, 不可崩 app。
 
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <string.h>
+#import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import "MFPanel.h"
 
 static uintptr_t g_smTextLo = 0, g_smTextHi = 0;
+
+// 安全读: 失败绝不崩 (vm_read_overwrite 对未映射地址返回 KERN_INVALID_ADDRESS)
+static BOOL smRd(uintptr_t addr, void *dst, size_t len) {
+    if (!addr || !len) return NO;
+    mach_vm_size_t out = 0;
+    kern_return_t kr = mach_vm_read_overwrite(mach_task_self(),
+                                              (mach_vm_address_t)addr,
+                                              (mach_vm_size_t)len,
+                                              (mach_vm_address_t)dst, &out);
+    return (kr == KERN_SUCCESS && out == len);
+}
+static BOOL smRd32(uintptr_t addr, uint32_t *out) { return smRd(addr, out, 4); }
+static BOOL smRdI32(uintptr_t addr, int32_t *out) { return smRd(addr, out, 4); }
+static BOOL smRd64(uintptr_t addr, uint64_t *out) { return smRd(addr, out, 8); }
+
+// 安全读 C 字符串 (逐字节 vm_read, 有上限)
+static BOOL smRdStr(uintptr_t addr, char *dst, size_t cap) {
+    if (!addr || !cap) return NO;
+    dst[0] = 0;
+    for (size_t i = 0; i + 1 < cap; i++) {
+        char ch = 0;
+        if (!smRd(addr + i, &ch, 1)) return i > 0;   // 读到映射边界: 有内容就算成功
+        if (!ch) return i > 0;
+        if (ch < 32 || ch > 126) return NO;          // 非可打印 → 判为坏指针
+        dst[i] = ch; dst[i + 1] = 0;
+    }
+    return YES;
+}
 
 static void smTextRange(void) {
     if (g_smTextLo) return;
@@ -40,10 +68,10 @@ static void smTextRange(void) {
             if (lc->cmd == LC_SEGMENT_64) {
                 const struct segment_command_64 *sg = (const struct segment_command_64 *)p;
                 if (sg->fileoff == 0 && sg->vmaddr == 0) { p += lc->cmdsize; continue; }   // __PAGEZERO
-                if (strcmp(sg->segname, "__TEXT") == 0 && sg->fileoff == 0) {
+                if (strncmp(sg->segname, "__TEXT", 16) == 0 && sg->fileoff == 0) {
                     const struct section_64 *sec = (const struct section_64 *)(sg + 1);
                     for (uint32_t s = 0; s < sg->nsects; s++, sec++) {
-                        if (strcmp(sec->sectname, "__text") == 0) {
+                        if (strncmp(sec->sectname, "__text", 16) == 0) {
                             g_smTextLo = (uintptr_t)sec->addr + slide;
                             g_smTextHi = g_smTextLo + sec->size;
                         }
@@ -55,29 +83,35 @@ static void smTextRange(void) {
     }
 }
 
-// 该指令是否访问 [xN,#imm]: 0=否 1=读 2=写; *outOff = 字节偏移
+// [xN,#imm] 访问: 0=否 1=读 2=写
 static int smAcc(uint32_t w, uint32_t *outOff) {
     uint32_t base = w & 0xFFC00000u;
     if ((w & 0x1Fu) == 31 || ((w >> 5) & 0x1Fu) == 31) return 0;
     uint32_t imm = (w >> 10) & 0xFFFu;
     switch (base) {
-        case 0x39400000u: *outOff = imm;      return 1;   // ldrb
-        case 0x39000000u: *outOff = imm;      return 2;   // strb
-        case 0x79400000u: *outOff = imm * 2;  return 1;   // ldrh
-        case 0x79000000u: *outOff = imm * 2;  return 2;   // strh
-        case 0xB9400000u: *outOff = imm * 4;  return 1;   // ldr w
-        case 0xB9000000u: *outOff = imm * 4;  return 2;   // str w
-        case 0xF9400000u: *outOff = imm * 8;  return 1;   // ldr x
-        case 0xF9000000u: *outOff = imm * 8;  return 2;   // str x
+        case 0x39400000u: *outOff = imm;      return 1;
+        case 0x39000000u: *outOff = imm;      return 2;
+        case 0x79400000u: *outOff = imm * 2;  return 1;
+        case 0x79000000u: *outOff = imm * 2;  return 2;
+        case 0xB9400000u: *outOff = imm * 4;  return 1;
+        case 0xB9000000u: *outOff = imm * 4;  return 2;
+        case 0xF9400000u: *outOff = imm * 8;  return 1;
+        case 0xF9000000u: *outOff = imm * 8;  return 2;
         default: return 0;
     }
 }
 
 static NSString *smLabelImp(uintptr_t imp, const ptrdiff_t *ivOffs, const char **ivNames, int nIv) {
-    const uint32_t *code = (const uint32_t *)imp;
+    if (imp < g_smTextLo || imp > g_smTextHi) return nil;
+    uint32_t code[24];
+    size_t need = sizeof(code);
+    if (g_smTextHi - imp < need) need = (size_t)(g_smTextHi - imp);
+    if (need < 16) return nil;
+    if (!smRd(imp, code, need)) return nil;               // ★ 安全读, 越界不崩
+    int nInsMax = (int)(need / 4);
     NSMutableString *lbl = [NSMutableString string];
     BOOL hasRet = NO; int nIns = 0;
-    for (int i = 0; i < 24; i++) {
+    for (int i = 0; i < nInsMax; i++) {
         uint32_t w = code[i]; nIns++;
         if (w == 0xD65F03C0u) { hasRet = YES; break; }
         uint32_t off = 0;
@@ -98,48 +132,44 @@ static NSString *smLabelImp(uintptr_t imp, const ptrdiff_t *ivOffs, const char *
     return lbl;
 }
 
-// 读类描述符名 (meta+0x28..meta+0x60 扫描, 找 name 可读的那个)
-static BOOL smClassIdentity(Class c, char *outName, size_t cap, uint32_t *outNim, uintptr_t *outDesc) {
+// 读类描述符名; 成功则输出 name/numImmediateMembers
+static BOOL smClassIdentity(Class c, char *outName, size_t cap, uint32_t *outNim) {
     uintptr_t meta = (uintptr_t)c;
     for (uintptr_t d = 0x28; d <= 0x60; d += 8) {
-        uintptr_t desc = *(const uintptr_t *)(meta + d);
-        if (desc < g_smTextLo || desc > g_smTextHi + 0x800000) continue;
-        int32_t nrel = 0; memcpy(&nrel, (const void *)(desc + 8), 4);
-        const char *nmp = (const char *)(desc + 8 + (intptr_t)nrel);
-        if ((uintptr_t)nmp < g_smTextLo) continue;
-        char tmp[256]; tmp[0] = 0;
-        for (int i = 0; i < 255; i++) {
-            char ch = nmp[i];
-            if (!ch) break;
-            if (ch < 32 || ch > 126) { tmp[0] = 0; break; }
-            tmp[i] = ch; tmp[i+1] = 0;
-        }
-        if (!tmp[0]) continue;
-        uint32_t nim = 0; memcpy(&nim, (const void *)(desc + 28), 4);
+        uintptr_t desc = 0;
+        if (!smRd64(meta + d, &desc)) continue;
+        if (desc < g_smTextLo || desc > g_smTextHi + 0x1000000) continue;
+        int32_t nrel = 0;
+        if (!smRdI32(desc + 8, &nrel)) continue;
+        uintptr_t nmp = desc + 8 + (intptr_t)nrel;
+        if (nmp < g_smTextLo || nmp > g_smTextHi + 0x1000000) continue;
+        if (!smRdStr(nmp, outName, cap)) continue;
+        uint32_t nim = 0;
+        if (!smRd32(desc + 28, &nim)) continue;
         if (nim == 0 || nim > 4000) continue;
-        strncpy(outName, tmp, cap - 1); outName[cap-1] = 0;
-        *outNim = nim; *outDesc = desc;
+        *outNim = nim;
         return YES;
     }
     return NO;
 }
 
-// 返回该类的 Swift 方法表文本 (nil = 非 Swift 类 / 无 vtable)
+// 返回该类的 Swift 方法表文本 (nil = 非 Swift 类 / 无数据 / 读失败)
 NSString *mfSwiftMethodTable(Class c) {
     if (!c) return nil;
     smTextRange();
     if (!g_smTextLo) return nil;
 
-    char cls[256]; uint32_t nim = 0; uintptr_t desc = 0;
-    if (!smClassIdentity(c, cls, sizeof(cls), &nim, &desc)) return nil;
+    char cls[256]; uint32_t nim = 0;
+    if (!smClassIdentity(c, cls, sizeof(cls), &nim)) return nil;
 
     uintptr_t meta = (uintptr_t)c;
-    // 找最长连续 __text 指针 run = vtable
-    uintptr_t bestStart = 0; int bestLen = 0;
-    uintptr_t runStart = 0; int runLen = 0;
-    for (uintptr_t p = meta + 0x48; p < meta + 0x4000; p += 8) {
-        uintptr_t v = *(const uintptr_t *)p;
-        if (v >= g_smTextLo && v < g_smTextHi) {
+    // 找最长连续落在 __text 的指针 run = vtable (运行时已重定位 → run 稠密)
+    // ★ 每槽独立 smRd64, 越界槽自然失败并被当作 run 断开, 不会崩
+    uintptr_t bestStart = 0, runStart = 0; int bestLen = 0, runLen = 0;
+    int scanned = 0;
+    for (uintptr_t p = meta + 0x48; p < meta + 0x1000 && scanned < 512; p += 8, scanned++) {
+        uintptr_t v = 0;
+        if (smRd64(p, &v) && v >= g_smTextLo && v < g_smTextHi) {
             if (!runLen) runStart = p;
             runLen++;
             if (runLen > bestLen) { bestLen = runLen; bestStart = runStart; }
@@ -161,8 +191,9 @@ NSString *mfSwiftMethodTable(Class c) {
     [out appendFormat:@"    // Swift vtable: name=%s numImmediateMembers=%u run=%d@meta+%#llx ivars=%d\n",
          cls, nim, bestLen, (unsigned long long)(bestStart - meta), n];
     int tagged = 0;
-    for (int k = 0; k < bestLen; k++) {
-        uintptr_t imp = *(const uintptr_t *)(bestStart + (uintptr_t)k * 8);
+    for (int k = 0; k < bestLen && k < 256; k++) {
+        uintptr_t imp = 0;
+        if (!smRd64(bestStart + (uintptr_t)k * 8, &imp)) break;
         NSString *lbl = smLabelImp(imp, offs, names, n);
         if (lbl) {
             tagged++;

@@ -7,6 +7,7 @@
 #include <zlib.h>
 #include <time.h>
 #include <ctype.h>
+#include <string.h>
 
 // ====== 类型编码 → C 类型（精简版 CDTypeParser） ======
 static NSString *mfDecOne(const char *e, NSUInteger *ip) {
@@ -422,15 +423,26 @@ static NSString *mfSwiftDumpImage(const struct mach_header *mh, intptr_t slide, 
         }
         // v2.58.87: 纯 Swift 类无 ObjC 方法表(baseMethods=null), 方法在 Swift vtable 里 —
         //   运行时补上这一半(静态需解 chained fixup, 运行时 dyld 已重定位故直接可读)
-        if (kind == 16) {   // class
-            @try {
-                Class sc = objc_getClass(tname);
-                if (sc) {
-                    extern NSString *mfSwiftMethodTable(Class c);
-                    NSString *mt = mfSwiftMethodTable(sc);
-                    if (mt) [out appendString:mt];
-                }
-            } @catch (NSException *ex) { (void)ex; }
+        // v2.58.88: 只对权益相关类做方法表解析。
+        //   v2.58.87 无条件对全部 Swift 类型(class, 本二进制 3347 个类型)调用 →
+        //   每类数十~数百次 vm_read ⇒ 百万级系统调用, 进程被 jetsam 杀 / 卡死。
+        //   词表门把工作量限定在个位数类, 且这些正是我们要找的目标。
+        if (kind == 16) {
+            static const char *kMTWords[] = {"Vip","ProManager","Entitle","Premium",
+                                             "Membership","Subscri","Purchase","Product"};
+            BOOL mtHit = NO;
+            for (int wi = 0; wi < 8 && !mtHit; wi++) if (strstr(tname, kMTWords[wi])) mtHit = YES;
+            if (mtHit) {
+                @try {
+                    mfLog(@"[swiftmt] try %s", tname);
+                    Class sc = objc_getClass(tname);
+                    if (sc) {
+                        extern NSString *mfSwiftMethodTable(Class c);
+                        NSString *mt = mfSwiftMethodTable(sc);
+                        if (mt) { [out appendString:mt]; mfLog(@"[swiftmt] %s ok", tname); }
+                    }
+                } @catch (NSException *ex) { mfLog(@"[swiftmt] %s ex=%@", tname, ex.name); }
+            }
         }
         [out appendString:@"}\n\n"];
         count++;
