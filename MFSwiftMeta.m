@@ -202,12 +202,21 @@ static NSString *smLabelImp(uintptr_t imp, const ptrdiff_t *offs, const char **n
     return lbl;
 }
 
-// ---- 主入口: 由描述符地址产出方法表文本 (nil = 无数据/读失败, 绝不崩) ----
-NSString *mfSwiftMethodTableForDescriptor(uintptr_t desc, const char *clsName) {
+// ---- 主入口 A: 由 metadata 指针直接产出 (最稳: Class 对象即 metadata) ----
+NSString *mfSwiftMethodTableForMeta(uintptr_t meta, const char *clsName) {
     smInit();
-    if (!g_textLo || !desc) return nil;
-    uintptr_t meta = smMetaForDesc(desc);
-    if (!meta) return nil;
+    if (!g_textLo || !meta) return nil;
+
+    uintptr_t desc = 0;
+    if (!smRd64(meta + 0x40, &desc)) return nil;
+    // 运行时 dyld 已把 rebase 槽写成裸指针; 静态文件里则是 chained fixup 值(需掩码+基址)
+    if (desc < g_textLo || desc > g_textHi + 0x1000000) {
+        uintptr_t d36 = desc & 0xFFFFFFFFFULL;
+        uintptr_t d51 = desc & 0x7FFFFFFFFFFFFULL;
+        if (d36 >= 0x100000000ULL && d36 < g_textHi + 0x1000000) desc = d36;
+        else if (d51 >= 0x100000000ULL && d51 < g_textHi + 0x1000000) desc = d51;
+        else return nil;
+    }
 
     ptrdiff_t offs[64]; const char *names[64];
     int nIv = smIvarsFromMeta(meta, offs, names, 64);
@@ -216,7 +225,15 @@ NSString *mfSwiftMethodTableForDescriptor(uintptr_t desc, const char *clsName) {
     uintptr_t bestStart = 0, runStart = 0; int bestLen = 0, runLen = 0;
     for (uintptr_t p = meta + 0x48, e = meta + 0x1000; p < e; p += 8) {
         uintptr_t v = 0;
-        if (smRd64(p, &v) && v >= g_textLo && v < g_textHi) {
+        if (!smRd64(p, &v)) { runLen = 0; continue; }
+        // 兼容两种形态: 运行时裸指针 / 未重定位的 chained fixup 值
+        uintptr_t cand = v;
+        if (cand < g_textLo || cand >= g_textHi) {
+            uintptr_t c36 = v & 0xFFFFFFFFFULL, c51 = v & 0x7FFFFFFFFFFFFULL;
+            if (c36 >= g_textLo && c36 < g_textHi) cand = c36;
+            else if (c51 >= g_textLo && c51 < g_textHi) cand = c51;
+        }
+        if (cand >= g_textLo && cand < g_textHi) {
             if (!runLen) runStart = p;
             runLen++;
             if (runLen > bestLen) { bestLen = runLen; bestStart = runStart; }
@@ -232,21 +249,40 @@ NSString *mfSwiftMethodTableForDescriptor(uintptr_t desc, const char *clsName) {
         for (int k = 0; k < bestLen && k < 256; k++) {
             uintptr_t imp = 0;
             if (!smRd64(bestStart + (uintptr_t)k * 8, &imp)) break;
-            NSString *lbl = smLabelImp(imp, offs, names, nIv);
+            uintptr_t cand = imp;
+            if (cand < g_textLo || cand >= g_textHi) {
+                uintptr_t c36 = imp & 0xFFFFFFFFFULL, c51 = imp & 0x7FFFFFFFFFFFFULL;
+                if (c36 >= g_textLo && c36 < g_textHi) cand = c36;
+                else if (c51 >= g_textLo && c51 < g_textHi) cand = c51;
+            }
+            NSString *lbl = smLabelImp(cand, offs, names, nIv);
             if (lbl) {
                 tagged++;
-                [out appendFormat:@"    imp[%d] %#llx  %@\n", k, (unsigned long long)imp, lbl];
+                [out appendFormat:@"    imp[%d] %#llx  %@\n", k, (unsigned long long)cand, lbl];
             } else if (k < 10) {
-                [out appendFormat:@"    imp[%d] %#llx\n", k, (unsigned long long)imp];
+                [out appendFormat:@"    imp[%d] %#llx\n", k, (unsigned long long)cand];
             }
         }
         [out appendFormat:@"    // 小结: vtable IMP=%d, 带权益字段标签=%d\n", bestLen, tagged];
-    }
-    // 无 vtable run 时, 退化为打印该类 ivar 表 (仍有价值: 验证 0x6d0 归属)
-    if (bestLen < 3) {
+    } else {
         for (int k = 0; k < nIv; k++)
             [out appendFormat:@"    ivar %s off=%#lx\n", names[k], (long)offs[k]];
     }
     for (int k = 0; k < nIv; k++) if (names[k]) free((void *)names[k]);
+    (void)clsName;
     return out;
+}
+
+// ---- 主入口 B: 由描述符反查 metadata (classdump 只有描述符时用) ----
+NSString *mfSwiftMethodTableForDescriptor(uintptr_t desc, const char *clsName) {
+    smInit();
+    if (!g_textLo || !desc) return nil;
+    uintptr_t meta = smMetaForDesc(desc);
+    if (!meta) return nil;
+    return mfSwiftMethodTableForMeta(meta, clsName);
+}
+
+// ---- 旧入口保留 (避免别处引用编译失败) ----
+NSString *mfSwiftMethodTable(void *cls) {
+    return mfSwiftMethodTableForMeta((uintptr_t)cls, NULL);
 }

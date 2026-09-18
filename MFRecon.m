@@ -943,7 +943,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 //   纯内省(class_copyIvarList/class_copyMethodList), 零 hook 零 patch。
                 {
                     static int nEntClsDump = 0;
-                    if (nEntClsDump < 6) {
+                    if (nEntClsDump < 8) {
                         nEntClsDump++;
                         NSMutableString *ds = [NSMutableString string];
                         unsigned int dIv = 0;
@@ -953,6 +953,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                              ivar_getName(divs[di]) ?: "?", (long)ivar_getOffset(divs[di]),
                              ivar_getTypeEncoding(divs[di]) ?: "?"];
                         if (divs) free(divs);
+                        // ObjC 方法表(纯 Swift 类为 0, 但有基类时仍有值)
                         unsigned int dM = 0;
                         Method *dms = class_copyMethodList(c, &dM);
                         for (unsigned int dm = 0; dms && dm < dM; dm++) {
@@ -963,6 +964,13 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                 [ds appendFormat:@"\n      sel %-28s vmaddr=%#llx", sn ?: "?", vm];
                         }
                         if (dms) free(dms);
+                        // v2.58.95: 纯 Swift 类无 ObjC 方法表(baseMethods=null),
+                        //   方法在 Swift 元数据 vtable 里 —— 运行时解析:
+                        //   Swift 类的 Class 指针 **就是** metadata 地址, 直接可用,
+                        //   无需从描述符反查。运行时槽已由 dyld 重定位, 直接读即可。
+                        extern NSString *mfSwiftMethodTableForMeta(uintptr_t meta, const char *clsName);
+                        NSString *mt = mfSwiftMethodTableForMeta((uintptr_t)c, cn);
+                        if (mt) [ds appendString:mt];
                         mfLog(@"[entcls] %s ivars=%u methods=%u%@", cn, dIv, dM, ds);
                     }
                 }
