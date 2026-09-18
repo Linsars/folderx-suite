@@ -34,6 +34,12 @@ void mfEntClsTargetSet(Class c, const char *ivarName, ptrdiff_t off) {
           class_getName(c), ivarName, (long)off);
 }
 
+// =====================================================================
+// v2.58.104: 侦查卡收集的实例地址(持久层) — 实验页只读, 不再自己扫
+// =====================================================================
+static uintptr_t g_instAddrs[64];
+static int g_instN = 0;
+
 static BOOL mfiRd(uintptr_t a, void *dst, size_t len) {
     if (!a || !len) return NO;
     vm_size_t got = 0;
@@ -133,12 +139,6 @@ int mfInstForceBool(void) {
     mfLog(@"[inst] 写完成: %d/%d 实例已置 %s=1", ok, n, g_entIvar);
     return ok;
 }
-
-// =====================================================================
-// v2.58.104: 对外查询 —— 侦查卡写入的实例地址, 实验页只读
-// =====================================================================
-static uintptr_t g_instAddrs[64];
-static int g_instN = 0;
 
 NSArray *mfInstAddrs(void) {
     NSMutableArray *a = [NSMutableArray array];
