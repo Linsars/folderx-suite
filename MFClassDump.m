@@ -478,23 +478,41 @@ static void mfDumpAllSwift(NSFileHandle *fh, NSMutableArray *cds, NSMutableData 
 // ====== 主流程（流式落盘：内存峰值 = 单类头文件，防 jetsam） ======
 void mfClassDumpStartAction(UIProgressView *pv, UILabel *lb, UIButton *btn, UIView *actionRow) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        // v2.52.2: 逐镜像枚举——objc_copyClassList 会 force-realize 全进程类,
-        // iOS26-SDK Swift app 泛型 conformance 带外 realize 会 _getWitnessTable 崩(Real Crash 2026-09-06)
+        mfLog(@"CLASSDUMP enter (build 2.58.90)");
+        // v2.58.90 崩溃修复 (mf_debug_90/91: 出包即闪退, 且 "CLASSDUMP start" 从未出现):
+        //   旧实现在枚举阶段对**每个**类名调 objc_getClass → force-realize 全进程类
+        //   → iOS26-SDK Swift app 泛型 conformance 带外 realize 触发 _getWitnessTable 崩
+        //   (v2.52.2 注释里已记述, 但当时只改成"逐镜像", realize 次数没减)。
+        //   修法: ① 只收名字, 不 realize
+        //         ② 只对"需要的类"realize: 权益词表命中者 + 非 Swift 类名(Swift 泛型类才是崩源)
+        //         ③ 每步打日志, 崩了也能定位到最后一条
         uint32_t ic = _dyld_image_count();
-        unsigned total = 0;
-        NSMutableArray<Class> *all = [NSMutableArray array];
+        NSMutableArray<NSString *> *allNames = [NSMutableArray array];
         for (uint32_t i = 0; i < ic; i++) {
             const char *img = _dyld_get_image_name(i);
             if (!img) continue;
             unsigned cn = 0;
             char **names = objc_copyClassNamesForImage(img, &cn);
-            for (unsigned j = 0; j < cn; j++) {
-                Class c = objc_getClass(names[j]);
-                if (c) [all addObject:c];
-            }
+            for (unsigned j = 0; j < cn; j++) if (names[j]) [allNames addObject:@(names[j])];
             if (names) free(names);
         }
-        total = (unsigned)all.count;
+        mfLog(@"CLASSDUMP names=%lu", (unsigned long)allNames.count);
+
+        static const char *kEntWords[] = {"Vip","ProManager","Entitle","Premium",
+                                          "Membership","Subscri","Purchase","Product"};
+        unsigned realized = 0, skippedSwift = 0;
+        NSMutableArray<Class> *all = [NSMutableArray array];
+        for (NSString *n in allNames) {
+            BOOL entHit = NO;
+            for (int w = 0; w < 8 && !entHit; w++) if ([n rangeOfString:@(kEntWords[w])].location != NSNotFound) entHit = YES;
+            // Swift 泛型/私有类名 = witness table 崩源; 除非是我们要找的权益类, 一律跳过
+            BOOL swiftish = [n hasPrefix:@"_TtC"] || [n hasPrefix:@"_TtV"] || [n hasPrefix:@"_TtGC"] || [n hasPrefix:@"_TtO"];
+            if (swiftish && !entHit) { skippedSwift++; continue; }
+            Class c = objc_getClass(n.UTF8String);   // 只 realize 白名单内的
+            if (c) { [all addObject:c]; realized++; }
+        }
+        mfLog(@"CLASSDUMP realized=%u (skippedSwift=%u)", realized, skippedSwift);
+        unsigned total = (unsigned)all.count;
         Class *classes = (Class *)malloc(sizeof(Class) * (total ?: 1));
         for (unsigned i = 0; i < total; i++) classes[i] = all[i];
         mfLog(@"CLASSDUMP start: %u classes", total);
