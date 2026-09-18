@@ -1053,7 +1053,6 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPKeychainStub;
 - (void)mfAPEntDelete:(NSString *)sym;   // v2.58.12: 左划删除 — 假点位手动清理解
 // v2.58.97: 运行时实例直写(免 patch) — 扫堆定位权益对象, 直接写其 bool 字段
-- (void)mfInstProbeTap:(UIButton *)btn;
 - (void)mfInstForceTap:(UIButton *)btn;
 @end
 
@@ -1227,20 +1226,6 @@ static MFAPEntList *g_apEntList = nil;
 //   改走"对象路线": dylib 在 app 进程内 → 扫堆找到权益对象, 直接写它的字段。
 //   扫描必须在后台队列(256MB 逐块读), 结果回主线程 toast。
 //   写操作需两次点击确认(与清墓碑同风格) — 避免误触改坏运行中的 app。
-- (void)mfInstProbeTap:(UIButton *)btn {
-    btn.enabled = NO;
-    mfToast(@"🧬 从对象图取实例(只读)…");
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        extern NSDictionary *mfInstProbe(void);
-        NSDictionary *r = mfInstProbe();
-        dispatch_async(dispatch_get_main_queue(), ^{
-            btn.enabled = YES;
-            if (!r) { mfToast(@"尚未定位权益类 — 请先跑一次侦查"); return; }
-            mfToast([NSString stringWithFormat:@"实例 %@ 个 · off=%@ · 详见日志",
-                     r[@"count"], r[@"off"]]);
-        });
-    });
-}
 - (void)mfInstForceTap:(UIButton *)btn {
     if (![objc_getAssociatedObject(btn, "mfArmInst") boolValue]) {
         objc_setAssociatedObject(btn, "mfArmInst", @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1564,12 +1549,15 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
     // v2.58.66: SK2/代码判定点第二张卡已删 — 与 🎯 判定点同义(用户: "又是什么鬼")。
     //   两类点(sk2pro/sk2get)本就入同一持久层, 由上面单卡统一展示与操作。
 
-    // v2.58.97: 运行时实例直写(新路线) — 六轮静态 patch 全不亮的根本反思:
-    //   静态偏移无法区分类(0x6d0 在几百个类里都有字段), 猜"哪条指令读它"必然错。
-    //   dylib 运行在 app 进程内 → 直接找到 HMVipProManager 的实例, 写它的 _isVipPro 字段。
-    //   不改任何代码字节, 不猜任何点位; 类名/ivar 名从参数来, 不硬编码 app。
+    // v2.58.104: 架构归位(用户原话见 2.58.61 定案):
+    //   「侦查卡带扫描、判定总结, 根据判定类型把对应判定点传到实验模拟页对应卡片去」
+    //   → 侦查负责扫+定位, 实验页**只执行**。故删掉本页的"🔍 侦查实例"按钮。
+    //   实例定位由 MFRecon 的 ivargate 完成(它会调 mfInstCollect 把地址入库),
+    //   本卡片只显示已入库的实例数 + ⚡ 执行。
     {
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 76)];
+        extern NSArray *mfInstAddrs(void);
+        NSArray *addrs = mfInstAddrs();
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(12, y, g_mfCardW - 24, 52)];
         bar.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
         bar.layer.cornerRadius = 10;
         UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, 6, g_mfCardW - 46, 22)];
@@ -1577,29 +1565,25 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         l.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         [bar addSubview:l];
         UILabel *st = [[UILabel alloc] initWithFrame:CGRectMake(12, 26, g_mfCardW - 46, 18)];
-        st.text = @"扫堆内存定位权益对象 → 写 _isVipPro=1(不碰代码字节)";
+        st.text = addrs.count
+            ? [NSString stringWithFormat:@"%lu 个实例已定位(侦查卡) → 写 _isVipPro=1, 不碰代码字节",
+               (unsigned long)addrs.count]
+            : @"未侦查 — 先在侦查卡跑一次(实例由侦查定位)";
         st.font = [UIFont systemFontOfSize:10];
         st.textColor = [UIColor secondaryLabelColor];
         [bar addSubview:st];
-        UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem];
-        b1.frame = CGRectMake(10, 44, (g_mfCardW - 44) / 2, 28);
-        b1.backgroundColor = [UIColor tertiarySystemFillColor];
-        b1.layer.cornerRadius = 7;
-        b1.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-        [b1 setTitle:@"🔍 侦查实例(只读)" forState:UIControlStateNormal];
-        [b1 addTarget:g_mfCtrl action:@selector(mfInstProbeTap:) forControlEvents:UIControlEventTouchUpInside];
-        [bar addSubview:b1];
         UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
-        b2.frame = CGRectMake(10 + (g_mfCardW - 44) / 2 + 4, 44, (g_mfCardW - 44) / 2, 28);
-        b2.backgroundColor = [UIColor systemGreenColor];
+        b2.frame = CGRectMake(10, 44, g_mfCardW - 44, 28);
+        b2.backgroundColor = addrs.count ? [UIColor systemGreenColor] : [UIColor tertiarySystemFillColor];
         b2.layer.cornerRadius = 7;
         b2.tintColor = UIColor.whiteColor;
         b2.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightBold];
+        b2.enabled = addrs.count > 0;
         [b2 setTitle:@"⚡ 直写解锁" forState:UIControlStateNormal];
         [b2 addTarget:g_mfCtrl action:@selector(mfInstForceTap:) forControlEvents:UIControlEventTouchUpInside];
         [bar addSubview:b2];
         [page addSubview:bar];
-        y += 82;
+        y += 58;
     }
 
     // v2.58.77 删: "keychain 票据(链B·开发中)" 占位按钮 + 说明块

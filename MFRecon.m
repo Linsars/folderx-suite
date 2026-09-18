@@ -962,6 +962,17 @@ static NSDictionary *mfReconF8v2Scan(void) {
                             ptrdiff_t eo = ivar_getOffset(eIvs[ei]);
                             if (eo < 0x40 || eo > 0x2000) continue;
                             mfEntClsTargetSet(c, eIn, eo);
+                            // v2.58.104: 扫描/定位归侦查卡 — 用户定案架构:
+                            //   「侦查卡带扫描、判定总结, 把结果传到实验模拟页去执行」
+                            //   故实例在这里扫好入库, 实验页不再自己扫。
+                            //   只对**首个**权益类扫(512MB 扫描耗时, 多类会重复扫);
+                            //   mfEntClsTargetSet 已幂等, 这里用同样的门防重扫。
+                            static BOOL instCollected = NO;
+                            if (!instCollected) {
+                                instCollected = YES;
+                                extern int mfInstCollect(Class want, size_t budgetMB);
+                                mfInstCollect(c, 512);
+                            }
                             break;
                         }
                         if (eIvs) free(eIvs);
