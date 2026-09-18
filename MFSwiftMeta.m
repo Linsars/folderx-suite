@@ -133,7 +133,9 @@ static NSString *smLabelImp(uintptr_t imp, const ptrdiff_t *ivOffs, const char *
 NSString *mfSwiftMethodTableForMeta(uintptr_t meta, const char *clsName) {
     smTextRange();
     if (!g_textLo || !meta) return nil;
-    Class c = (Class)meta;                  // Class 指针即 metadata
+    // ARC 下 uintptr_t → Class 需走 __bridge (mfSwiftMethodTableForMeta 是底层入口,
+    //   调用方传的就是类指针; 这里只用来调 class_copyIvarList)
+    Class c = (__bridge Class)(void *)meta;
 
     // ① ivar 表: 直接用 runtime API (mf_debug_94 证明可信), 不自己解 ro
     unsigned int nIv0 = 0;
@@ -149,14 +151,16 @@ NSString *mfSwiftMethodTableForMeta(uintptr_t meta, const char *clsName) {
     if (ivs) free(ivs);
 
     // ② 描述符 → numImmediateMembers (决定扫描跨度)
+    //   运行时 dyld 已重定位, meta+0x40 应是裸指针; 若不像, 试 chained fixup 掩码形态。
     uintptr_t desc = 0;
     uint32_t nim = 0;
-    if (smRd64(meta + 0x40, &desc)) {
+    if (smRd64(meta + 0x40, &desc) && desc) {
         uintptr_t d = desc;
-        if (d < g_textLo || d > g_textHi + 0x1000000) {
-            d = smCodeAddr(desc) ? 0 : (desc & 0xFFFFFFFFFULL) + 0x100000000ULL;
+        if (d < 0x100000000ULL || d > 0x200000000ULL) {
+            uintptr_t t = (desc & 0xFFFFFFFFFULL) + 0x100000000ULL;
+            if (t >= 0x100000000ULL && t <= 0x200000000ULL) d = t;
         }
-        if (d >= g_textLo) smRd32(d + 28, &nim);
+        if (d >= 0x100000000ULL && d <= 0x200000000ULL) smRd32(d + 28, &nim);
     }
     if (nim == 0 || nim > 4000) nim = 256;
 
