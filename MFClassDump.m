@@ -432,11 +432,15 @@ static NSString *mfSwiftDumpImage(const struct mach_header *mh, intptr_t slide, 
                                              "Membership","Subscri","Purchase","Product"};
             BOOL mtHit = NO;
             for (int wi = 0; wi < 8 && !mtHit; wi++) if (strstr(tname, kMTWords[wi])) mtHit = YES;
-            if (mtHit) {
+            // v2.58.92 两道保险 (Swift 阶段与 ObjC 阶段一样从未跑过, 同样需要设防):
+            //   ① 只处理**主二进制**的类型 — 方法表反查只在主二进制 __DATA 里找,
+            //      处理 StoreKit 等框架类型纯属白扫(每类 ~1.5MB vm_read)
+            //   ② 硬上限 — 即使词表命中很多, 也只解析前 24 个, 把工作量钉死在可控范围
+            static int nMTDone = 0;
+            BOOL isMainImg = (mh == _dyld_get_image_header(0));
+            if (mtHit && isMainImg && nMTDone < 24) {
+                nMTDone++;
                 @try {
-                    // v2.58.91: **不再调 objc_getClass**(会 force-realize Swift 类 →
-                    //   iOS26 _getWitnessTable 崩, mf_debug_92 实测定谳)。
-                    //   直接用手头已有的描述符地址 descAddr 做纯内存解析。
                     mfLog(@"[swiftmt] try %s desc=%#llx", tname, (unsigned long long)descAddr);
                     extern NSString *mfSwiftMethodTableForDescriptor(uintptr_t desc, const char *clsName);
                     NSString *mt = mfSwiftMethodTableForDescriptor(descAddr, tname);
