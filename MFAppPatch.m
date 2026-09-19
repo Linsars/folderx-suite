@@ -793,6 +793,12 @@ void apEntDumpsApply(void) {
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"20008052");   // mov w0,#1 兜底
+        } else if ([d[@"sym"] hasPrefix:@"sk2vfy@"]) {
+            // v2.58.114: SK2 验证判定门 — b.cond → NOP(让"无效"分支失效)
+            //   sym 格式 sk2vfy@0x<off>; new 存库内字节(nop)
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"1f2003d5");   // nop 兜底
         } else if ([d[@"sym"] hasPrefix:@"sk2br@"]) {
             // v2.58.78: 分支粒度判定点 — Pro 门的"逃逸分支"→ NOP(fall through 到汇聚点)。
             //   与函数头短路(sk2pro/sk2get)不同: 不改函数入口, 只改门的分支决策,
@@ -1329,6 +1335,11 @@ static MFAPEntList *g_apEntList = nil;
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"20008052");   // mov w0,#1 兜底
+        } else if ([sym hasPrefix:@"sk2vfy@"]) {
+            // v2.58.114: SK2 验证判定门 — b.cond → NOP
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"1f2003d5");   // nop 兜底
         } else if ([sym hasPrefix:@"sk2br@"]) {
             // v2.58.78: 分支粒度 — Pro 门逃逸分支 NOP(不改函数头, 保留完整逻辑)
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
@@ -1447,6 +1458,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
             NSString *sh = dd[@"shape"] ?: @"";
             BOOL sem = [sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2get"]
                     || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"sk2br"]
+                    || [sh isEqualToString:@"sk2vfy"]
                     || [sh isEqualToString:@"deepslot"]
                     || [sh isEqualToString:@"ivarRead"] || [sh isEqualToString:@"ivarGetter"]
                     || [sh isEqualToString:@"sk2ver"]

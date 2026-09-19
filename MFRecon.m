@@ -290,6 +290,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
     // ---- stub → slot 匹配 → SK 词表过滤 ----
     // slot 查找 O(nSlot)×596 — nSlot~1600 可接受; skStubNames 直接指向 symPool(静态区, 生命周期 OK)
     uint64_t skStubVM[128]; const char *skStubNames[128]; int nSkStub = 0;
+    // v2.58.114 sk2vfy: 验证类 stub 独立存一份(含非 SK 前缀的 StoreKit 符号,
+    //   如 TransactionV19currentEntitlements / VerificationResult), 供下方判据点扫描用
+    uint64_t vfyStubVM[32]; const char *vfyStubNames[32]; int nVfyStub = 0;
+    static const char *kVfyNames[] = { "currentEntitlements", "jwsRepresentation", "payloadValue",
+                                       "revocationDate", "expirationDate", "TransactionV7updates",
+                                       "makeAsyncIterator", "EnvironmentV8rawValue" };
     int nCE = 0, nUpd = 0, nPID = 0;
     for (uint64_t off = 0; off + 12 <= stubSize && nSkStub < 128; off += stubStep) {
         uintptr_t a = (uintptr_t)stubVM + (uintptr_t)slide + off;
@@ -311,6 +317,17 @@ static NSDictionary *mfReconF8v2Scan(void) {
             break;
         }
         if (!nm) continue;
+        // v2.58.114 sk2vfy: 验证类符号单独收(所有验证符号都在 8StoreKit 命名空间内,
+        //   通过 nm 判定即可 — 是 C1 的锚点)
+        if (nVfyStub < 32) {
+            for (int w2 = 0; w2 < 8; w2++)
+                if (strstr(nm, kVfyNames[w2])) {
+                    vfyStubVM[nVfyStub] = stubVM + off;
+                    vfyStubNames[nVfyStub] = nm;
+                    nVfyStub++;
+                    break;
+                }
+        }
         if (strstr(nm, "currentEntitlements")) nCE++;
         if (strstr(nm, "7updates")) nUpd++;
         if (strstr(nm, "9productID")) nPID++;
@@ -904,6 +921,105 @@ static NSDictionary *mfReconF8v2Scan(void) {
             mfLog(@"[f8v2] sk2br: SKU串=%d 引用函数=%d 门分支点=%d 个", nSku2, nRefFn, nBr);
         } else {
             mfLog(@"[f8v2] sk2br: __cstring 区(%#llx+%#llx) 无 SKU 形态串", cstrVM, cstrSize);
+        }
+    }
+
+    // =====================================================================
+    // sk2vfy (v2.58.114): SK2 权益验证判定点 — C1 路线。
+    //   动机(用户定案): SK2 无收据可伪造 — appStoreReceiptURL/transactionReceipt 都是
+    //   SK1 机制; SK2 权益源 = Transaction.currentEntitlements → JWS 验签,
+    //   本地无有效交易 → 整链恒 false → 只能代码 patch。
+    //   判据(通用, 零 app 硬编码; 本地原型 29 候选/9 函数, 目标点全中):
+    //     ① 锚点 = 验证类 stub 调用点(vfyStubVM: currentEntitlements/
+    //        jwsRepresentation/payloadValue/revocationDate/expirationDate/
+    //        updates/makeAsyncIterator/Environment — 符号名来自 LINKEDIT imports 池)
+    //     ② 锚点所在函数(向前找序言) = SK2 验证函数
+    //     ③ 函数体 ±0x400 内扫 (cmp wT,#1 ; b.cond 前向分支) = "交易有效?"判定
+    //   执行: b.cond → NOP, 让"无效"分支失效(fall through 到有效路径)。
+    //   隔离: 新 shape sk2vfy(独立 sym 前缀 + 独立执行分支), 老 shape 不动。
+    // =====================================================================
+    {
+        int nVfy = 0;
+        if (nVfyStub > 0) {
+            // ① 找验证 stub 的调用点
+            static uint64_t vfyCallPC[256];
+            int nVfyCall = 0;
+            for (uint64_t off = 0; off + 4 <= textSize && nVfyCall < 256; off += 4) {
+                uint32_t ins = *(const uint32_t *)((uintptr_t)textVM + (uintptr_t)slide + off);
+                uint32_t op = ins >> 26;
+                if (op != 0x25 && op != 0x05) continue;      // bl / b
+                int64_t imm = (int64_t)(ins & 0x3FFFFFF);
+                if (imm & (1 << 25)) imm -= (int64_t)(1 << 26);
+                uint64_t tgt = textVM + off + ((uint64_t)imm << 2);
+                for (int k = 0; k < nVfyStub; k++)
+                    if (vfyStubVM[k] == tgt) { vfyCallPC[nVfyCall++] = textVM + off; break; }
+            }
+            // ② 调用点所在函数(向前找序言)
+            uint64_t vfyFn[64]; int nVfyFn = 0;
+            for (int i = 0; i < nVfyCall && nVfyFn < 64; i++) {
+                uint64_t pc = vfyCallPC[i];
+                for (uint64_t back = 0; back < 0x4000; back += 4) {
+                    if (pc < textVM + back) break;
+                    uintptr_t ha = (uintptr_t)(pc - back) + (uintptr_t)slide;
+                    uint32_t q = *(const uint32_t *)ha;
+                    BOOL isHead = NO;
+                    if (q == 0xD503237F) isHead = YES;
+                    else if ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) isHead = YES;
+                    else if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) isHead = YES;
+                    else if (q == 0xB24003BD) isHead = YES;      // async 序言 orr x29,x29,#0x1
+                    if (isHead) {
+                        uint64_t h = pc - back;
+                        BOOL dup = NO;
+                        for (int j = 0; j < nVfyFn; j++) if (vfyFn[j] == h) { dup = YES; break; }
+                        if (!dup) vfyFn[nVfyFn++] = h;
+                        break;
+                    }
+                }
+            }
+            // ③ 验证函数体内 ±0x400 扫 (cmp wT,#1 ; b.cond)
+            for (int fi = 0; fi < nVfyFn; fi++) {
+                uint64_t fh = vfyFn[fi];
+                uint64_t lo = (fh > textVM + 0x400) ? fh - 0x400 : textVM;
+                uint64_t hi = fh + 0x1000;
+                if (hi > textVM + textSize) hi = textVM + textSize;
+                for (uint64_t p = lo; p + 8 <= hi; p += 4) {
+                    uint32_t w1v = *(const uint32_t *)((uintptr_t)p + (uintptr_t)slide);
+                    // b.cond: 0x54000000 mask 0xFF000010
+                    if ((w1v & 0xFF000010) != 0x54000000) continue;
+                    uint32_t cond = w1v & 0xF;
+                    if (cond != 1 && cond != 0) continue;        // 只要 b.ne / b.eq
+                    int32_t im19 = (int32_t)((w1v >> 5) & 0x7FFFF);
+                    if (im19 & (1 << 18)) im19 -= (1 << 19);
+                    uint64_t bTgt = p + ((uint64_t)im19 << 2);
+                    if (bTgt <= p) continue;                     // 只收前向分支
+                    // 前 3 条找 cmp wT,#1
+                    uint64_t cPos = 0; BOOL cOK = NO;
+                    for (int k = 1; k <= 3; k++) {
+                        if (p < textVM + (uint64_t)k * 4) break;
+                        uint32_t w2v = *(const uint32_t *)((uintptr_t)(p - k * 4) + (uintptr_t)slide);
+                        if ((w2v & 0xFFFFFC1F) == 0x7100041F) { cPos = p - k * 4; cOK = YES; break; }
+                    }
+                    if (!cOK) continue;
+                    nVfy++;
+                    [sk2pts addObject:@{
+                        @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                        @"sym": [NSString stringWithFormat:@"sk2vfy@%#llx", (unsigned long long)(p - textVM)],
+                        @"vmaddr": @(p),
+                        @"slide": @((long)slide),
+                        @"score": @(97),
+                        @"calls": @(0),
+                        @"shape": @"sk2vfy",
+                        @"kind": @"sk2vfy",
+                        @"old": mfLeHex(w1v),
+                        @"new": mfLeHex(0xD503201Fu),   // nop → 恒 fall through 到有效路径
+                    }];
+                    mfLog(@"[f8v2] ★sk2vfy @%#llx (SK2验证门: b.%@ → NOP, cmp@%#llx, fn=%#llx)",
+                          (unsigned long long)(p - textVM), (cond == 1) ? @"ne" : @"eq",
+                          (unsigned long long)(cPos - textVM), (unsigned long long)(fh - textVM));
+                }
+            }
+            mfLog(@"[f8v2] sk2vfy: 验证stub=%d 调用点=%d 验证函数=%d 判定门=%d 个",
+                  nVfyStub, nVfyCall, nVfyFn, nVfy);
         }
     }
 
@@ -1872,7 +1988,7 @@ NSDictionary *mfReconFingerprint(void) {
     BOOL sk2LocalType = NO;
     {
         NSUInteger nS = 0;
-        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]
+        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"] || [f[@"shape"] isEqualToString:@"sk2vfy"]
                 ) nS++;
         if (!cloudBrands.count && !mach && nS >= 1 &&
             (mfRecFind(p, n, "verification failed") || mfRecFind(p, n, "could not be verified") || mfRecFind(p, n, "snapshot verification")))
@@ -2052,7 +2168,7 @@ NSDictionary *mfReconFingerprint(void) {
                 for (NSDictionary *f in sk2ptsRef) {
                     NSString *sh = f[@"shape"] ?: @"";
                     // v2.58.78: sk2br(SKU 锚 + 分支粒度)= 强证据; 只有它才压 sk2dat
-                    if ([sh isEqualToString:@"sk2br"]) { haveBetter = YES; break; }
+                    if ([sh isEqualToString:@"sk2br"] || [sh isEqualToString:@"sk2vfy"]) { haveBetter = YES; break; }
                     if (![sh isEqualToString:@"sk2dat"] && sh.length) { haveBetter = YES; break; }
                 }
                 if (!haveBetter && [candsRef isKindOfClass:[NSArray class]]) {
@@ -2156,7 +2272,7 @@ NSDictionary *mfReconFingerprint(void) {
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
-            || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]
+            || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"] || [f[@"shape"] isEqualToString:@"sk2vfy"]
             ) nCodePts++;
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
