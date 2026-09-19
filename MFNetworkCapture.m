@@ -211,6 +211,18 @@ static void mfRecordCapture(MFNetRecord *rec) {
     self.record.reqHeaders = req.allHTTPHeaderFields;
     self.record.reqBody = req.HTTPBody;
     self.record.timestamp = [NSDate date];
+    // v2.58.111: iap 类 URL 请求体落日志(诊断: 看请求侧真实发的是什么)
+    if ([self.record.url containsString:@"/iap/"]) {
+        NSString *bodyDesc = nil;
+        if (req.HTTPBody) {
+            bodyDesc = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
+            if (!bodyDesc) bodyDesc = [NSString stringWithFormat:@"<binary %luB>", (unsigned long)req.HTTPBody.length];
+            else if (bodyDesc.length > 300) bodyDesc = [bodyDesc substringToIndex:300];
+        } else {
+            bodyDesc = @"<none|stream>";
+        }
+        mfLog(@"[net-req] %@ body=%@", self.record.url.lastPathComponent, bodyDesc);
+    }
     
     // 应用请求拦截规则（增强版：direction + reject + 四象限）
     mfLoadRules();
@@ -333,7 +345,12 @@ static void mfRecordCapture(MFNetRecord *rec) {
 }
 
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
-    if (self.replacingBody) return;  // 原始 body 不转发（已被规则替换）
+    if (self.replacingBody) {
+        // v2.58.111: 仍然累积原始数据(不转发) —— 诊断需要, 见 didCompleteWithError
+        //   64KB 上限: 诊断用途, 防病态大响应占内存
+        if (self.data.length < 65536) [self.data appendData:data];
+        return;
+    }
     [self.data appendData:data];
     [self.client URLProtocol:self didLoadData:data];
 }
@@ -348,8 +365,23 @@ static void mfRecordCapture(MFNetRecord *rec) {
             // 发送替换后的 body（正常路径数据已在 didReceiveData 转发，此处只发替换 body）
             self.record.respBody = self.replaceBody;
             [self.client URLProtocol:self didLoadData:self.replaceBody];
+            // v2.58.111: 把服务端**原文**记进日志 —— 这是唯一能看到真实响应 schema 的位置。
+            //   (规则启用后原始 body 不转发, 之前直接丢弃 → 无法确认字段名, 只能靠猜)
+            if (self.data.length > 0) {
+                NSString *orig = [[NSString alloc] initWithData:self.data encoding:NSUTF8StringEncoding];
+                if (!orig) orig = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)self.data.length];
+                if (orig.length > 400) orig = [orig substringToIndex:400];
+                mfLog(@"[net-orig] %@ -> %@", self.record.url.lastPathComponent, orig);
+            }
         } else {
             self.record.respBody = self.data;
+            // v2.58.111: 未替换的 /iap/ 响应也记原文(schema 诊断)
+            if ([self.record.url containsString:@"/iap/"] && self.data.length > 0) {
+                NSString *orig = [[NSString alloc] initWithData:self.data encoding:NSUTF8StringEncoding];
+                if (!orig) orig = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)self.data.length];
+                if (orig.length > 400) orig = [orig substringToIndex:400];
+                mfLog(@"[net-orig] %@ -> %@", self.record.url.lastPathComponent, orig);
+            }
         }
         [self.client URLProtocolDidFinishLoading:self];
     }
