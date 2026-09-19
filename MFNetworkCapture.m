@@ -12,7 +12,11 @@
 // ====== 全局捕获存储 ======
 static NSMutableArray *g_capturedRecords = nil;
 BOOL g_captureEnabled = NO;
-BOOL g_rewriteEnabled = NO;
+// v2.58.109: 默认 ON——规则管理页自述"有规则即生效", 但引擎里这个门默认 NO 且不持久化,
+//   唯一能开它的"网络修改"页早已从菜单移除(仅保存规则后自动跳转才可见) →
+//   所有规则被静默挡住。实证: 全历史日志 0 条 "rewrite ->" / 0 条 "body replaced"。
+//   总开关语义保留(可达时仍可一键旁路), 仅默认值对齐设计意图。
+BOOL g_rewriteEnabled = YES;
 NSMutableArray *g_rewriteRules = nil;
 #define MF_MAX_RECORDS 200
 
