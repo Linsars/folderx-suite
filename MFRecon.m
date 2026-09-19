@@ -30,7 +30,7 @@ static const char *mfStrCaseStr(const char *hay, const char *needle) {
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
 #import <string.h>
-#import <objc/runtime.h>   // v2.58.80: ivargate — class_copyIvarList/ivar_getOffset
+#import <objc/runtime.h>
 #import "MFPanel.h"
 
 extern CGFloat g_mfCardW;
@@ -907,349 +907,6 @@ static NSDictionary *mfReconF8v2Scan(void) {
         }
     }
 
-    // =====================================================================
-    // ivargate (v2.58.80): 运行时驱动的权益读侧门控点。
-    //   动机(mf_debug_82 + VansonMod 桥实证): bplayer 的 6 个形态点全在交易处理链
-    //   (无购买时根本不执行, patch 全空转); 真闸门是 HMVipProManager._isVipPro
-    //   (ivar 偏移运行时才有值, 静态文件里是 0) 的读侧门控:
-    //     ldrb wT,[xN,#<ivarOff>] ; cmp wT,#1 ; b.cond
-    //   → patch ldrb 为 mov wT,#1 = UI 每次读到"已购"。
-    //   算法(纯运行时 API, 零 app 硬编码):
-    //     ① objc_copyClassList 遍历 → 类名/ivar 名过权益词表 → 收 ivar 偏移
-    //     ② 单遍扫 __TEXT: ldrb wT,[xN,#off] + cmp wT,#1 + b.cond 三连 → 门控点
-    //   隔离: 新 shape ivargate(独立 sym 前缀 + 独立执行分支), 老 shape 不动。
-    // =====================================================================
-    {
-        uint32_t gateOffs[16]; int nGateOff = 0;
-        // v2.58.107: 类归属指纹集 — 该类**全部** ivar 偏移(不只词表命中的)。
-        //   mf_debug_99 定谳: 旧实现 gateOffs 只装词表命中的 ivar, 而 HMVipProManager
-        //   只有 _isVipPro 命中 → 指纹集=1 个偏移 → 指纹门必然判"函数内无其它权益 ivar"
-        //   → 两个真点被自己的门误杀。类归属判据应是"该函数是否在操作**这个类**"
-        //   (看它的全部字段), 而不是"是否操作了多个权益命名字段"。
-        uint32_t clsFpOffs[32]; int nClsFp = 0;
-        unsigned int nCls = 0;
-        Class *clsList = objc_copyClassList(&nCls);
-        if (clsList) {
-            for (unsigned int ci = 0; ci < nCls && nGateOff < 16; ci++) {
-                Class c = clsList[ci];
-                if (!c) continue;
-                const char *cn = class_getName(c);
-                if (!cn) continue;
-                static const char *kClsWords[] = {"Vip","VIP","ProManager","Entitle","Premium",
-                                                  "Membership","Subscri","Purchase"};
-                BOOL clsHit = NO;
-                for (int w = 0; w < 8; w++) if (strstr(cn, kClsWords[w])) { clsHit = YES; break; }
-                if (!clsHit) continue;
-                // v2.58.86: 运行时类内省 — 拿到权益类的完整 ivar/method 映射。
-                //   动机: 静态偏移在混淆二进制里无法区分类(0x6d0 在几百个类里都有字段),
-                //   四轮点位全错即此因。类元数据是类专属的, 不会被撞名欺骗。
-                //   getter IMP = "读侧收敛点": 一处 patch 全部读取者生效, 且不毁栈
-                //   (Swift 存储属性 getter 通常 8 字节: ldrb w0,[x0,#imm]; ret
-                //    → 可原位替换为 mov w0,#1; ret, 同长度零副作用)。
-                //   纯内省(class_copyIvarList/class_copyMethodList), 零 hook 零 patch。
-                {
-                    // v2.58.107: 原先这里把权益类/ivar 喂给"实例直写"模块 ——
-                    //   该路线三次全败(43 处误报 / object_getClass 崩溃 / 再误报)已整体删除,
-                    //   喂入块一并移除。判定门改由 ivargate 引擎自己扫出
-                    //   (修掉下方指纹门两个 bug 后, 真点不再被误杀)。
-                    // v2.58.96: 只 dump **主二进制(app 自己)** 的权益类。
-                    //   mf_debug_93 实测: 8 个预算全被框架类耗尽 ——
-                    //   StoreKit.StoreProductManager / LocalPurchasesManager /
-                    //   CloudSubscriptionFeatures.* 都含 "Subscri"/"Purchase",
-                    //   而 HMVipProManager 排在其后 → 永远轮不到。
-                    //   判据: class_getImageName(c) 与主二进制路径一致(运行时信息, 不硬编码 app)。
-                    //   兜底: 该 API 返回 NULL 时不做归属过滤(保持旧行为, 不至于零输出)。
-                    extern const char *class_getImageName(Class cls);
-                    const char *img = class_getImageName(c);
-                    BOOL isMainCls = YES;
-                    if (img && mainPath) isMainCls = (strcmp(img, mainPath) == 0);
-                    static int nEntClsDump = 0;
-                    if (isMainCls && nEntClsDump < 10) {
-                        nEntClsDump++;
-                        NSMutableString *ds = [NSMutableString string];
-                        unsigned int dIv = 0;
-                        Ivar *divs = class_copyIvarList(c, &dIv);
-                        for (unsigned int di = 0; divs && di < dIv; di++)
-                            [ds appendFormat:@"\n      ivar %-24s off=%-5ld %s",
-                             ivar_getName(divs[di]) ?: "?", (long)ivar_getOffset(divs[di]),
-                             ivar_getTypeEncoding(divs[di]) ?: "?"];
-                        if (divs) free(divs);
-                        // ObjC 方法表(纯 Swift 类为 0, 但有基类时仍有值)
-                        unsigned int dM = 0;
-                        Method *dms = class_copyMethodList(c, &dM);
-                        for (unsigned int dm = 0; dms && dm < dM; dm++) {
-                            const char *sn = sel_getName(method_getName(dms[dm]));
-                            uint64_t imp = (uint64_t)method_getImplementation(dms[dm]);
-                            uint64_t vm = imp - (uint64_t)slide;
-                            if (vm >= 0x100000000ULL && vm < 0x1014b0000ULL)   // 只在主二进制内(可 patch)
-                                [ds appendFormat:@"\n      sel %-28s vmaddr=%#llx", sn ?: "?", vm];
-                        }
-                        if (dms) free(dms);
-                        // v2.58.95: 纯 Swift 类无 ObjC 方法表(baseMethods=null),
-                        //   方法在 Swift 元数据 vtable 里 —— 运行时解析:
-                        //   Swift 类的 Class 指针 **就是** metadata 地址, 直接可用,
-                        //   无需从描述符反查。运行时槽已由 dyld 重定位, 直接读即可。
-                        extern NSString *mfSwiftMethodTableForMeta(uintptr_t meta, const char *clsName);
-                        NSString *mt = mfSwiftMethodTableForMeta((uintptr_t)c, cn);
-                        if (mt) [ds appendString:mt];
-                        mfLog(@"[entcls] %s ivars=%u methods=%u%@", cn, dIv, dM, ds);
-                    }
-                }
-                unsigned int nIv = 0;
-                Ivar *ivs = class_copyIvarList(c, &nIv);
-                if (!ivs) continue;
-                // v2.58.107: 先收该类的**全部** ivar 偏移 → 类归属指纹集(供下方指纹门用)。
-                //   判据: 点位所在函数若在操作这个类, 必然同时访问它的多个字段
-                //   (字段跨度大, 不可能是数组元素偏移)。
-                nClsFp = 0;
-                for (unsigned int fi = 0; fi < nIv && nClsFp < 32; fi++) {
-                    ptrdiff_t fo = ivar_getOffset(ivs[fi]);
-                    if (fo < 0x40 || fo > 0x2000) continue;
-                    clsFpOffs[nClsFp++] = (uint32_t)fo;
-                }
-                for (unsigned int ii = 0; ii < nIv && nGateOff < 16; ii++) {
-                    const char *in = ivar_getName(ivs[ii]);
-                    if (!in) continue;
-                    // v2.58.81 修: 旧实现裸子串匹配 → "isPro" 命中 isProfiling/isProgressive/
-                    //   isProcessingInstruction/isProxy(Nuke/Sentry/Amplitude 字段, 偏移 0x8/0x20
-                    //   = 对象头) → 249 个噪声点(mf_debug_83)。
-                    //   修法: ①前缀词 ②词边界(后跟字符不能是小写字母) ③黑名单二次排除
-                    static const char *kIvWords[] = {"isVip","isPro","hasPro","hasVip","entitled",
-                                                     "hasAccess","isPremium","isMember","vipStatus",
-                                                     "proStatus","isSubscribed","hasEntitle",
-                                                     "vipActive","isUnlocked","hasPurchas"};
-                    static const char *kIvBlack[] = {"Profiling","Processing","Progressive","Proxy",
-                                                     "Probe","Promo","Property","Provider","Protocol",
-                                                     "Program","Progress"};
-                    BOOL ivHit = NO;
-                    for (int w = 0; w < 15 && !ivHit; w++) {
-                        const char *pp = strstr(in, kIvWords[w]);
-                        if (!pp) continue;
-                        char nxt = pp[strlen(kIvWords[w])];
-                        if (nxt >= 'a' && nxt <= 'z') continue;   // 词边界: 后跟小写 = 别的词
-                        ivHit = YES;
-                    }
-                    if (ivHit) for (int w = 0; w < 11; w++) if (strstr(in, kIvBlack[w])) { ivHit = NO; break; }
-                    if (!ivHit) continue;
-                    ptrdiff_t off = ivar_getOffset(ivs[ii]);
-                    // v2.58.81: 偏移门 — 0x8/0x20 是对象头(isa/引用计数), 真业务字段在后面
-                    if (off < 0x40 || off > 0x2000) continue;
-                    BOOL dup = NO;
-                    for (int k = 0; k < nGateOff; k++) if (gateOffs[k] == (uint32_t)off) { dup = YES; break; }
-                    if (!dup) gateOffs[nGateOff++] = (uint32_t)off;
-                }
-                free(ivs);
-            }
-            free(clsList);
-        }
-        if (nGateOff) {
-            int nGate = 0;
-            for (uint64_t o = 0; o + 12 <= textSize; o += 4) {
-                uint32_t w1 = *(const uint32_t *)(bd + textFileOff + o);
-                if ((w1 & 0xFFC00000) != 0x39400000) continue;      // ldrb wT,[xN,#imm]
-                uint32_t T = w1 & 0x1F;
-                if (T == 31) continue;
-                if (((w1 >> 5) & 0x1F) == 31) continue;
-                uint32_t imm = (w1 >> 10) & 0xFFF;
-                BOOL offHit = NO;
-                for (int k = 0; k < nGateOff; k++) if (gateOffs[k] == imm) { offHit = YES; break; }
-                if (!offHit) continue;
-                // v2.58.81: cmp 窗口放宽到 4 条 — 桥实测 0x100660ed8 的形态是
-                //   ldrb → add → bl → cmp → b.ne(中间插了 2 条), 旧窗口 1~2 条会漏
-                // v2.58.108 定谳(mf_debug_100 不亮 + 本地穷尽扫描):
-                //   真 UI 读侧**不带 cmp #1 形态** —— 实测 6 个真类方法
-                //   (0x1007e28b8 / 0x100be9a6c / 0x100beac9c / 0x100beb138 /
-                //    0x100beb254 / 0x100bec194) 全是"直接读字段就返回/使用", 无分支。
-                //   旧实现要求 ldrb + cmp #1 + b.cond → 真点全被过滤, 只剩
-                //   0x100684e34(唯一带 cmp 的) —— 上轮 patch 它没亮, 正因它不是 UI 门。
-                //   改法: cmp 形态降级为**线索**(仅用于日志标注), 主判据 = 同基址类归属。
-                BOOL hasGate = NO;
-                for (int k = 1; k <= 4 && !hasGate; k++) {
-                    if (o + (uint64_t)(k + 1) * 4 + 4 > textSize) break;
-                    uint32_t w2 = *(const uint32_t *)(bd + textFileOff + o + (uint64_t)k * 4);
-                    if ((w2 & 0xFFFFFC1F) != 0x7100041F) continue;   // cmp wT,#1
-                    if (((w2 >> 5) & 0x1F) != T) continue;
-                    uint32_t w3 = *(const uint32_t *)(bd + textFileOff + o + (uint64_t)(k + 1) * 4);
-                    if (((w3 & 0xFF000010) == 0x54000000) ||
-                        ((w3 & 0x7F000000) == 0x34000000)) hasGate = YES;
-                }
-                // ------------------------------------------------------------------
-                // v2.58.84 (mf_debug_86 定谳): 类归属指纹门 — ivargate 的三轮不亮根源。
-                //   静态偏移在 Swift 混淆的 30MB 二进制里无法区分类: 0x660ed8/0x684e34 两个
-                //   "门控点" 实测分别位于 fn 0x100660d58(读 x22 上 #0x2970) 与
-                //   fn 0x100684de0(Swift Array 逐元素 0xd8 memcpy) — 两者都不是 HMVipProManager
-                //   的方法, 只是某个无关结构在该偏移恰好有字段 → 纯偏移撞名。
-                //   判据: HMVipProManager 自身代码必然同时碰多个权益 ivar 偏移
-                //   (指纹实测 fn 0x1001cdb2c 命中 6 种: 0x6d0/0x6e0/0x6f0/0x700/0x8c0/0x8d0)。
-                //   故要求: 点位所在函数内出现 >=2 个不同 gateOffs 才认类归属。
-                //   偏好精确而非召回 — 三轮假阳性已证明"召回过宽"是主要损失来源。
-                uint64_t fnStart = o;
-                for (uint64_t back = 0; back < 0x10000 && o >= back; back += 4) {
-                    uint32_t q = *(const uint32_t *)(bd + textFileOff + o - back);
-                    if (q == 0xD503237F) { fnStart = o - back; break; }
-                    if ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) { fnStart = o - back; break; }
-                    if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) { fnStart = o - back; break; }
-                }
-                int nOtherOff = 0;
-                // v2.58.108 定谳(mf_debug_100 两个假阳性): 判据必须是**同一基址寄存器**。
-                //   旧实现统计"函数内任意寄存器访问类字段" → 大拷贝/解码函数必然命中
-                //   十几个偏移 → 假阳性(0x100660d58 指纹=37 就是指令条数, 不是字段数)。
-                //   实测区分度(本地穷尽扫描):
-                //     假阳性 0x100660ed8 base=x8  → 同基址类字段 0 个
-                //     真点   0x100684e34 base=x22 → 同基址类字段 3 个
-                //     真点   0x1007e28b8 base=x19 → 6 个 / 0x100beac9c base=x20 → 8 个
-                //   判据: 同一条基址寄存器上出现该类**其它**字段(跨度大, 非数组元素)。
-                uint32_t baseRn = (w1 >> 5) & 0x1F;
-                // v2.58.108: 窗口必须限定在**本函数范围内**。
-                //   旧实现用 fnStart + 0x8000 硬窗口 → 越界扫进相邻函数,
-                //   把邻居的类字段访问算进本函数 → 假阳性 0x100660ed8(本函数仅 0x3dc 字节,
-                //   多出的字段全来自邻居)。本地验证: 收紧到函数末尾后, 该点字段数 3→0 被正确丢弃。
-                uint64_t fnEnd = textSize;
-                for (uint64_t fwd = 4; fwd < 0x10000; fwd += 4) {
-                    if (o + fwd + 4 > textSize) break;
-                    uint32_t q = *(const uint32_t *)(bd + textFileOff + o + fwd);
-                    if (q == 0xD503237F) { fnEnd = o + fwd; break; }
-                    if ((q & 0x7FC00000) == 0x29800000 && ((q >> 5) & 0x1F) == 31) { fnEnd = o + fwd; break; }
-                    if ((q & 0xFFC003FF) == 0xD10003FF && ((q >> 10) & 0xFFF)) { fnEnd = o + fwd; break; }
-                }
-                for (uint64_t p = fnStart; p + 64 <= fnEnd; p += 4) {
-                    uint32_t wp = *(const uint32_t *)(bd + textFileOff + p);
-                    uint32_t bp = wp & 0x3FC00000;
-                    BOOL isLDST = (bp == 0x39400000 || bp == 0x39000000 ||   // byte
-                                   bp == 0x79400000 || bp == 0x79000000 ||   // half
-                                   bp == 0xB9400000 || bp == 0xB9000000 ||   // word
-                                   bp == 0xF9400000 || bp == 0xF9000000);    // double
-                    if (!isLDST) continue;
-                    if ((wp & 0x1F) == 31 || ((wp >> 5) & 0x1F) == 31) continue;
-                    if (((wp >> 5) & 0x1F) != baseRn) continue;              // ★ 同一基址寄存器
-                    uint32_t ip = (wp >> 10) & 0xFFF;
-                    uint32_t sz = (wp >> 30) & 3;
-                    uint32_t mult = (sz == 0) ? 1 : (sz == 1 ? 2 : (sz == 2 ? 4 : 8));
-                    ip *= mult;
-                    if (ip == imm) continue;
-                    for (int k2 = 0; k2 < nClsFp; k2++)
-                        if (clsFpOffs[k2] == ip) { nOtherOff++; break; }
-                }
-                if (nOtherOff < 1) {                                  // 函数内无第二个权益偏移 → 撞名
-                    mfLog(@"[f8v2] ivargate 丢弃 @%#llx (偏移%#x 撞名: 函数 %#llx 内无其它权益 ivar)",
-                          (unsigned long long)(textVM + o), imm, (unsigned long long)(textVM + fnStart));
-                    continue;
-                }
-                nGate++;
-                uint32_t movNew = 0x52800020u | T;                   // mov wT,#1
-                [sk2pts addObject:@{
-                    @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
-                    @"sym": [NSString stringWithFormat:@"ivargate@%#llx.%u", (unsigned long long)o, T],
-                    @"vmaddr": @(textVM + o),
-                    @"slide": @((long)slide),
-                    @"score": @(94),
-                    @"calls": @(0),
-                    @"shape": @"ivargate",
-                    @"kind": @"ivargate",
-                    @"old": mfLeHex(w1),
-                    @"new": mfLeHex(movNew),
-                }];
-                mfLog(@"[f8v2] ★ivargate @%#llx (权益 ivar 读侧: ldrb w%u,[xN,#%#x]→mov w%u,#1, fn=%#llx 同基址类字段=%d%@)",
-                      (unsigned long long)(textVM + o), T, imm, T,
-                      (unsigned long long)(textVM + fnStart), nOtherOff,
-                      hasGate ? @" [带cmp门]" : @"");
-            }
-            mfLog(@"[f8v2] ivargate: 权益类 ivar 偏移=%d 个, 读侧门控点=%d 个", nGateOff, nGate);
-
-            // =============================================================
-            // ivargate+ (v2.58.110): 权益 ivar **写侧**设置点。
-            //   动机(mf_debug_104 深挖, 前七轮全败的根因): 读侧 ldrb 点全在
-            //   "判定者"位置, 而真闸门是**写侧**: 某 async 任务被唤醒后才写
-            //   `strb wT,[xN,#gateOff]`(= _isVipPro=1)。写侧有两个 tbz/tbnz 守卫,
-            //   守卫不满足就直接跳过写入块 → 读侧改多少都没用(没人写)。
-            //   实测形态(bplayer, HMVipProManager._isVipPro @0x6d0):
-            //     tbnz w9,#0,→写入块    ← 守卫1(参数开关)
-            //     tbz  w9,#0,→写入块    ← 守卫2(内存标志)
-            //   判据(通用, 零 app 硬编码):
-            //     ① tbz/tbnz 分支, 目标在 ±0x400 内
-            //     ② 目标块 16 条内出现 strb wT,[xN,#gateOff] (gateOff = 运行时权益 ivar 偏移)
-            //     ③ 同函数内该基址寄存器还访问过其它权益类字段(类归属, 防撞名)
-            //   执行: 守卫 → b(无条件跳转), 强制进入写入块。
-            //   隔离: 新 shape ivargateplus(独立 sym 前缀 + 独立执行分支), 老 shape 不动。
-            // =============================================================
-            {
-                int nPlus = 0;
-                for (uint64_t o = 0; o + 8 <= textSize; o += 4) {
-                    uint32_t w1p = *(const uint32_t *)(bd + textFileOff + o);
-                    uint32_t opP = w1p & 0x7F000000;
-                    if (opP != 0x36000000 && opP != 0x37000000) continue;   // tbz / tbnz
-                    // 分支目标
-                    int32_t imm19 = (int32_t)((w1p >> 5) & 0x7FFFF);
-                    if (imm19 & (1 << 18)) imm19 -= (1 << 19);
-                    int64_t tgt = (int64_t)o + ((int64_t)imm19 << 2);
-                    if (tgt <= (int64_t)o || tgt + 4 > (int64_t)textSize) continue;
-                    // v2.58.110: 目标块内找 strb 到权益偏移(16 条窗口)
-                    uint32_t hitOff = 0, hitRt = 31, hitRn = 31;
-                    uint64_t hitPos = 0;
-                    BOOL hit = NO;
-                    for (uint64_t q = (uint64_t)tgt, n = 0; q + 4 <= textSize && n < 16; q += 4, n++) {
-                        uint32_t wq = *(const uint32_t *)(bd + textFileOff + q);
-                        if ((wq & 0xFFC00000) == 0xD65F0000) break;      // ret — 块结束
-                        if ((wq & 0xFFC00000) != 0x39000000) continue;   // 只要 STRB imm
-                        uint32_t rt = wq & 0x1F, rn = (wq >> 5) & 0x1F;
-                        if (rt == 31 || rn == 31) continue;
-                        uint32_t ip = (wq >> 10) & 0xFFF;
-                        BOOL offHit = NO;
-                        for (int k = 0; k < nGateOff; k++) if (gateOffs[k] == ip) { offHit = YES; break; }
-                        if (!offHit) continue;
-                        hitOff = ip; hitRt = rt; hitRn = rn; hitPos = q; hit = YES;
-                        break;
-                    }
-                    if (!hit) continue;
-                    // v2.58.110 值门(本地原型定谳): 写侧续体**不适用**读侧那套类归属门。
-                    //   实测: 真点所在 async 续体只访问 0x6d0/0x6d2/0x6d3(同一布尔簇),
-                    //   "同基址访问其它权益 ivar" = 0 → 真点被误杀(本地原型: 归属门 0 命中,
-                    //   值门 2 命中)。改用**值门**: [tgt, strbPos] 窗口内最后一次写 hitRt 的
-                    //   MOVZ/MOVN 必须是 mov #1 —— 保证强制跳转执行的是"置真块"而非"清零块"。
-                    //   特异性已足够: 30MB 二进制全扫仅 2 个命中, 且都与权益偏移吻合。
-                    BOOL valOK = NO, sawDef = NO;
-                    for (uint64_t q = (uint64_t)tgt; q <= hitPos; q += 4) {
-                        uint32_t wq = *(const uint32_t *)(bd + textFileOff + q);
-                        if (((wq & 0x7F800000) == 0x52800000 || (wq & 0x7F800000) == 0xD2800000 ||
-                             (wq & 0x7F800000) == 0x12800000 || (wq & 0x7F800000) == 0x92800000) &&
-                            (wq & 0x1F) == hitRt) {
-                            sawDef = YES;
-                            BOOL isMovz = ((wq & 0x7F800000) == 0x52800000 || (wq & 0x7F800000) == 0xD2800000);
-                            valOK = isMovz && ((wq >> 5) & 0xFFFF) == 1 && ((wq >> 21) & 3) == 0;
-                        }
-                    }
-                    if (!valOK) {
-                        mfLog(@"[f8v2] ivargate+ 丢弃 @%#llx (值门: %@)",
-                              (unsigned long long)(textVM + o), sawDef ? @"窗口内非 mov #1" : @"窗口内无值定义");
-                        continue;
-                    }
-                    // patch: 守卫 → b (强制进写入块)
-                    int64_t delta = tgt - (int64_t)o;
-                    uint32_t bIns = 0x14000000u | (uint32_t)((delta >> 2) & 0x3FFFFFF);
-                    nPlus++;
-                    [sk2pts addObject:@{
-                        @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
-                        @"sym": [NSString stringWithFormat:@"ivargate+@%#llx.%u", (unsigned long long)o, hitRt],
-                        @"vmaddr": @(textVM + o),
-                        @"slide": @((long)slide),
-                        @"score": @(96),
-                        @"calls": @(0),
-                        @"shape": @"ivargateplus",
-                        @"kind": @"ivargateplus",
-                        @"old": mfLeHex(w1p),
-                        @"new": mfLeHex(bIns),
-                    }];
-                    mfLog(@"[f8v2] ★ivargate+ @%#llx (%@ w%u 守卫 → b %#llx 强制写入 strb w%u,[x%u,#%#x] 值门=mov #1)",
-                          (unsigned long long)(textVM + o),
-                          (opP == 0x37000000) ? @"tbnz" : @"tbz", w1p & 0x1F,
-                          (unsigned long long)(textVM + tgt), hitRt, hitRn, hitOff);
-                }
-                mfLog(@"[f8v2] ivargate+: 写侧守卫点=%d 个", nPlus);
-            }
-        } else {
-            mfLog(@"[f8v2] ivargate: 无权益类 ivar(运行时类表未命中词表)");
-        }
-    }
 
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";
     NSMutableArray *out = [NSMutableArray array];
@@ -2216,7 +1873,7 @@ NSDictionary *mfReconFingerprint(void) {
     {
         NSUInteger nS = 0;
         for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]
-                || [f[@"shape"] isEqualToString:@"ivargate"] || [f[@"shape"] isEqualToString:@"ivargateplus"]) nS++;
+                ) nS++;
         if (!cloudBrands.count && !mach && nS >= 1 &&
             (mfRecFind(p, n, "verification failed") || mfRecFind(p, n, "could not be verified") || mfRecFind(p, n, "snapshot verification")))
             sk2LocalType = YES;
@@ -2395,7 +2052,7 @@ NSDictionary *mfReconFingerprint(void) {
                 for (NSDictionary *f in sk2ptsRef) {
                     NSString *sh = f[@"shape"] ?: @"";
                     // v2.58.78: sk2br(SKU 锚 + 分支粒度)= 强证据; 只有它才压 sk2dat
-                    if ([sh isEqualToString:@"sk2br"] || [sh isEqualToString:@"ivargate"] || [sh isEqualToString:@"ivargateplus"]) { haveBetter = YES; break; }
+                    if ([sh isEqualToString:@"sk2br"]) { haveBetter = YES; break; }
                     if (![sh isEqualToString:@"sk2dat"] && sh.length) { haveBetter = YES; break; }
                 }
                 if (!haveBetter && [candsRef isKindOfClass:[NSArray class]]) {
@@ -2500,7 +2157,7 @@ NSDictionary *mfReconFingerprint(void) {
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
             || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"]
-            || [f[@"shape"] isEqualToString:@"ivargate"] || [f[@"shape"] isEqualToString:@"ivargateplus"]) nCodePts++;
+            ) nCodePts++;
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
