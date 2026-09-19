@@ -794,6 +794,15 @@ void apEntDumpsApply(void) {
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"1f2003d5");   // nop 兜底
+        } else if ([d[@"sym"] hasPrefix:@"ivargate+"]) {
+            // v2.58.110: 权益 ivar 写侧守卫 — tbz/tbnz → b(强制进写入块, 让 _isVipPro=1 被执行)
+            //   sym 格式 ivargate+@0x<off>.<T>; new 存库内字节(b 指令)
+            //   与 ivargate(读侧) 不同: 不改判定值, 改"是否执行写入"这个分支决策。
+            //   动机: 写侧有两个守卫(参数开关/内存标志), 任一不满足就跳过写入块 →
+            //   UI 永远读不到 1。强制跳转后写入块必然执行。
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"00000014");   // b .+0 兜底(理论上不会用到, 库内必有 new)
         } else if ([d[@"sym"] hasPrefix:@"ivargate@"]) {
             // v2.58.80: 权益 ivar 读侧门 — ldrb wT,[xN,#off] → mov wT,#1(UI 每次读到已购)
             //   sym 格式 ivargate@0x<off>.<T>; new 存库内字节(mov wT,#1)
@@ -1342,6 +1351,11 @@ static MFAPEntList *g_apEntList = nil;
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"1f2003d5");   // nop 兜底
+        } else if ([sym hasPrefix:@"ivargate+"]) {
+            // v2.58.110: 权益 ivar 写侧守卫 — tbz/tbnz → b(强制进写入块)
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"00000014");   // b .+0 兜底
         } else if ([sym hasPrefix:@"ivargate@"]) {
             // v2.58.80: 权益 ivar 读侧门 — ldrb wT,[xN,#off] → mov wT,#1
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
@@ -1468,7 +1482,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
             NSString *sh = dd[@"shape"] ?: @"";
             BOOL sem = [sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2get"]
                     || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"sk2br"]
-                    || [sh isEqualToString:@"ivargate"]
+                    || [sh isEqualToString:@"ivargate"] || [sh isEqualToString:@"ivargateplus"]
                     || [sh isEqualToString:@"deepslot"]
                     || [sh isEqualToString:@"ivarRead"] || [sh isEqualToString:@"ivarGetter"]
                     || [sh isEqualToString:@"sk2ver"]
