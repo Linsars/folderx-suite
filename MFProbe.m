@@ -82,16 +82,17 @@ static void mfDumpHex(NSString *tag, uintptr_t addr, int n, uint64_t off) {
 
 // —— active 状态模板(源自目标函数内已存在的构造序列, 非凭空伪造) ——
 //   80 字节结构字段: +0x00 disc · +0x08 周期(small) · +0x18 名称(large immortal)
-//   +0x28 来源(small) · +0x38 double 有效期 · +0x40 状态(small)
+//   +0x28 来源(small) · +0x38 double 有效期(毫秒 since 1970) · +0x40 状态(small)
+//   plan 用 lifetime(永久, 无续期/过期): 名称指向常量前缀 "pro_lifetime"(count=12)
 static void mfBuildActiveTemplate(uint8_t *p, uintptr_t base) {
     memset(p, 0, 80);
     p[0x00] = 0x01;                                            // disc = active
-    memcpy(p + 0x08, "monthly", 7);  p[0x17] = 0xE7;           // 周期 small string(count7)
-    *(uint64_t *)(p + 0x18) = 0xD000000000000010ULL;           // 名称 countAndFlags(count16 immortal)
-    *(uint64_t *)(p + 0x20) = ((uint64_t)(base + 0x3bb29a0)) | 0x8000000000000000ULL; // 名称 ptr → "pro_monthly_2026"(base+off, 运行时定位)
-    memcpy(p + 0x28, "storekit", 8); p[0x37] = 0xE8;           // 来源 small string(count8)
-    double exp = 4102444800.0;       memcpy(p + 0x38, &exp, 8); // 有效期(远未来, 防过期判定)
-    memcpy(p + 0x40, "active", 6);   p[0x4f] = 0xE6;           // 状态 small string(count6)
+    memcpy(p + 0x08, "lifetime", 8); p[0x17] = 0xE8;          // 周期 small string(count8)
+    *(uint64_t *)(p + 0x18) = 0xD00000000000000CULL;          // 名称 countAndFlags(count12 immortal large)
+    *(uint64_t *)(p + 0x20) = ((uint64_t)(base + 0x3bb2800)) | 0x8000000000000000ULL; // 名称 ptr → "pro_lifetime"(常量前 12 字节, base+off 运行时定位)
+    memcpy(p + 0x28, "storekit", 8); p[0x37] = 0xE8;          // 来源 small string(count8)
+    double exp = 4102444800000.0;    memcpy(p + 0x38, &exp, 8); // 有效期(毫秒 since 1970 → 2100年, 防过期)
+    memcpy(p + 0x40, "active", 6);   p[0x4f] = 0xE6;          // 状态 small string(count6)
 }
 
 // self = x20(状态管理实例) → 入口注入 active 模板, 令随后的选择器本体读到 active
