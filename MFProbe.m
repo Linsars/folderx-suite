@@ -90,8 +90,9 @@ typedef enum {
     MF_FLD_U8 = 0,     // 单字节
     MF_FLD_BYTES,      // 内联字节串(small string payload)
     MF_FLD_U64,        // 8 字节小端立即数
-    MF_FLD_F64,        // double
+    MF_FLD_F64,        // double(固定值)
     MF_FLD_IMMSTR,     // immortal String storage 指针 = (base + arg) | 0x8000000000000000
+    MF_FLD_NOWPLUS,    // double 有效期 = (当前时间 + arg 年) 毫秒 since 1970(运行时算, 不写死魔数)
 } MFFieldType;
 
 typedef struct {
@@ -124,6 +125,12 @@ static void mfApplyRecipe(uint8_t *p, const MFInjectRecipe *r, uintptr_t base) {
             case MF_FLD_U64:    *(uint64_t *)(p + f->off) = f->arg; break;
             case MF_FLD_F64:    memcpy(p + f->off, &f->f64, 8); break;
             case MF_FLD_IMMSTR: *(uint64_t *)(p + f->off) = ((uint64_t)(base + f->arg)) | 0x8000000000000000ULL; break;
+            case MF_FLD_NOWPLUS: {
+                // 运行时: 当前时间 + arg 年, 毫秒 since 1970(不依赖魔数, 避开签发时间区间校验穿帮)
+                double ms = ([[NSDate date] timeIntervalSince1970] + (double)f->arg * 365.25 * 86400.0) * 1000.0;
+                memcpy(p + f->off, &ms, 8);
+                break;
+            }
         }
     }
 }
@@ -160,7 +167,7 @@ static NSDictionary *mfSeedRecipe(void) {
             @{@"off": @(0x20), @"type": @"immstr", @"v": @(0x3bb2800)},
             @{@"off": @(0x28), @"type": @"bytes",  @"s": @"storekit"},
             @{@"off": @(0x37), @"type": @"u8",     @"v": @(0xE8)},
-            @{@"off": @(0x38), @"type": @"f64",    @"f": @(4102444800000.0)},
+            @{@"off": @(0x38), @"type": @"now_plus", @"years": @(100)},   // 有效期 = now+100年(运行时算)
             @{@"off": @(0x40), @"type": @"bytes",  @"s": @"active"},
             @{@"off": @(0x4f), @"type": @"u8",     @"v": @(0xE6)},
         ],
@@ -201,6 +208,7 @@ static const MFInjectRecipe *mfParseRecipe(NSDictionary *d) {
         if ([ty isEqualToString:@"u8"])      { fs[i].type = MF_FLD_U8;     fs[i].arg = mfParseU64(f[@"v"]); }
         else if ([ty isEqualToString:@"u64"]){ fs[i].type = MF_FLD_U64;    fs[i].arg = mfParseU64(f[@"v"]); }
         else if ([ty isEqualToString:@"immstr"]){ fs[i].type = MF_FLD_IMMSTR; fs[i].arg = mfParseU64(f[@"v"]); }
+        else if ([ty isEqualToString:@"now_plus"]){ fs[i].type = MF_FLD_NOWPLUS; fs[i].arg = mfParseU64(f[@"years"] ?: @(100)); }
         else if ([ty isEqualToString:@"f64"]){ fs[i].type = MF_FLD_F64;    fs[i].f64 = [f[@"f"] doubleValue]; }
         else if ([ty isEqualToString:@"bytes"]) {
             fs[i].type = MF_FLD_BYTES;
@@ -228,12 +236,18 @@ static const MFInjectRecipe *mfInjectLoadActive(void) {
         mfLog(@"[stobs] 配方库为空 → 写入内置种子 r0(可在持久层改/删)");
     }
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    for (NSDictionary *d in arr) {
-        if (![d[@"on"] boolValue]) continue;
-        NSString *bm = d[@"bundleMatch"];
-        if ([bm isKindOfClass:[NSString class]] && bm.length && ![bid containsString:bm]) continue;
-        cached = mfParseRecipe(d);
-        if (cached) { mfLog(@"[stobs] 加载配方 '%s'(selOff=%#llx fields=%d)", cached->name, cached->sel_off, cached->n_fields); break; }
+    // 优先选侦查自动产出配方(name 前缀 auto_), 种子/手工只作兜底 —— 保证全自动链路被验证
+    for (int pass = 0; pass < 2 && !cached; pass++) {
+        for (NSDictionary *d in arr) {
+            if (![d[@"on"] boolValue]) continue;
+            NSString *nm = d[@"name"] ?: @"";
+            BOOL isAuto = [nm hasPrefix:@"auto_"];
+            if (pass == 0 && !isAuto) continue;      // 第一轮只认 auto_
+            NSString *bm = d[@"bundleMatch"];
+            if ([bm isKindOfClass:[NSString class]] && bm.length && ![bid containsString:bm]) continue;
+            const MFInjectRecipe *c = mfParseRecipe(d);
+            if (c) { cached = c; mfLog(@"[stobs] 加载配方 '%s'(%@, selOff=%#llx fields=%d)", c->name, isAuto ? @"侦查自动" : @"种子/手工", c->sel_off, c->n_fields); break; }
+        }
     }
     return cached;
 }

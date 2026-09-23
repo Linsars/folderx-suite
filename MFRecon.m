@@ -1602,6 +1602,249 @@ static NSDictionary *mfReconF8v2Scan(void) {
               nPlan, nCluster, nGateReg);
     }
 
+    // =====================================================================
+    // sk2recipe (v2.58.155): active 状态构造配方自动提取 — 服务器票据/内存状态型 app 的
+    //   "本地构造授权结构"通用能力。sk2plan 锚定 pro 校验器后, 在其"计划名匹配成功分支"里,
+    //   宿主自己有一段构造 active 状态结构的代码(strb #1 写 disc + 一串 stp 写 small-string
+    //   周期/来源/状态词 + adrp 名称指针 + strd 有效期)。数据流追踪每条 store 的源寄存器值,
+    //   反推出 {字段偏移 → 类型/值} 配方 → 六项自检 → 过则自动录入 mfInjectRecipes 持久层。
+    //   规则(零人工): ① 计划档位优先级(lifetime>yearly>monthly…)自动选计划名常量
+    //                 ② 有效期 = now+100年(运行时算, MF_FLD_NOWPLUS)
+    //   注入由 MFProbe hook_inject 执行器落地(hook 选择器入口按配方填结构)。
+    // =====================================================================
+    {
+        extern BOOL mfInjectRecipeManualAdd(NSDictionary *);
+        const char *PERIODW[] = {"lifetime","perpetual","forever","yearly","annual","monthly","weekly"};
+        const int  PERIODP[]  = {0,1,2,3,4,5,6};   // 档位优先级(小=更持久)
+        const char *STATUSW[] = {"active","valid","subscribed","purchased","entitled"};
+
+        // —— 局部数据流状态: 每寄存器一个 (kind,val) ——
+        //   kind: 0=unknown 1=imm 2=addr 3=ivaroff(=某ivar全局VA) 4=structbase(=ivar全局VA)
+        typedef struct { int kind; uint64_t val; } RegV;
+
+        // ① 计划名档位选择(只读段常量, 档位优先 + 地址次序)
+        __block uint64_t planVA = 0; __block int planCount = 0; __block int planPrio = 99;
+        // 用 LC 已解析的精确 __cstring 段范围(有界, 防越界/误命中代码区)
+        if (cstrVM && cstrSize) {
+            uintptr_t cbase = (uintptr_t)cstrVM + (uintptr_t)slide;
+            uint64_t i2 = 0;
+            while (i2 < cstrSize) {
+                const char *s = (const char *)(cbase + i2);
+                if (*s < 0x20 || *s >= 0x7F) { i2++; continue; }
+                uint64_t j = i2; int len = 0;
+                while (j < cstrSize && *(const char*)(cbase+j) >= 0x20 && *(const char*)(cbase+j) < 0x7F && len < 48) { j++; len++; }
+                if (j < cstrSize && *(const char*)(cbase+j) == 0 && len >= 6 && len <= 40) {
+                    char buf[48]; memcpy(buf, s, len); buf[len] = 0;
+                    for (int t = 0; t < 7; t++) {
+                        if (strstr(buf, PERIODW[t])) {
+                            BOOL idlike = (strncmp(buf,"pro_",4)==0) || (strcmp(buf,PERIODW[t])==0);
+                            if (idlike && PERIODP[t] < planPrio) {
+                                int pc = (strncmp(buf,"pro_",4)==0) ? (int)(4+strlen(PERIODW[t])) : (int)strlen(PERIODW[t]);
+                                planPrio = PERIODP[t];
+                                planCount = pc;
+                                planVA = cstrVM + i2;     // 该常量 VA
+                            }
+                            break;
+                        }
+                    }
+                }
+                i2 = j + 1;
+            }
+        }
+
+        // ② 遍历 sk2plan 已入库的 pro 校验器函数(sk2pts 里 kind=sk2plan 的 fn), 提取 active 构造块
+        NSMutableSet *doneFns = [NSMutableSet set];
+        int nRecipe = 0;
+        for (NSDictionary *pt in [sk2pts copy]) {
+            if (![pt[@"kind"] isEqualToString:@"sk2plan"]) continue;
+            uint64_t fh = [pt[@"fn"] unsignedLongLongValue];
+            if (!fh || [doneFns containsObject:@(fh)]) continue;
+            [doneFns addObject:@(fh)];
+
+            RegV reg[32]; memset(reg, 0, sizeof(reg));
+            uint64_t sbIvar = 0;          // 当前 structbase 对应的 ivar 全局 VA
+            uint64_t fieldsOff[32]; int fieldsTy[32]; uint64_t fieldsVal[32]; int nF = 0;
+            uint64_t discOff = 0; BOOL haveDisc = NO; uint32_t structMax = 0;
+            uint64_t nameCntOff = 0, namePtrOff = 0; int nInput = 0;
+            uint64_t validityOff = 0; BOOL haveValidity = NO;
+            int nPeriod = 0, nStatus = 0;
+
+            uint64_t qEnd = fh + 0x600; if (qEnd > textVM + textSize) qEnd = textVM + textSize;
+            for (uint64_t a = fh; a + 4 <= qEnd; a += 4) {
+                uint32_t w = *(const uint32_t *)((uintptr_t)a + (uintptr_t)slide);
+                // MOVZ
+                if ((w & 0xFF800000) == 0xD2800000) { int rd=w&0x1F; reg[rd].kind=1; reg[rd].val=(uint64_t)((w>>5)&0xFFFF)<<(((w>>21)&3)*16); continue; }
+                // MOVK
+                if ((w & 0xFF800000) == 0xF2800000) { int rd=w&0x1F; if(reg[rd].kind!=1)reg[rd].val=0; reg[rd].kind=1; uint32_t hw=(w>>21)&3; reg[rd].val=(reg[rd].val & ~(0xFFFFULL<<(hw*16)))|((uint64_t)((w>>5)&0xFFFF)<<(hw*16)); continue; }
+                // MOVN (64)
+                if ((w & 0xFF800000) == 0x92800000) { int rd=w&0x1F; reg[rd].kind=1; reg[rd].val=~((uint64_t)((w>>5)&0xFFFF)<<(((w>>21)&3)*16)); continue; }
+                // ADRP
+                if ((w & 0x9F000000) == 0x90000000) { int rd=w&0x1F; int64_t immlo=(w>>29)&3,immhi=(w>>5)&0x7FFFF; int64_t imm=(immhi<<2)|immlo; if(imm&(1<<20))imm-=(1<<21); reg[rd].kind=2; reg[rd].val=(a&~0xFFFULL)+(imm<<12); continue; }
+                // ADD imm (64)
+                if ((w & 0xFFC00000) == 0x91000000) { int rd=w&0x1F,rn=(w>>5)&0x1F; uint64_t imm=((w>>10)&0xFFF)<<(((w>>22)&1)?12:0); if(reg[rn].kind==2){reg[rd].kind=2;reg[rd].val=reg[rn].val+imm;}else reg[rd].kind=0; continue; }
+                // ADD shifted reg: addr xBase, xSelf, xB
+                if ((w & 0xFF200000) == 0x8B000000) { int rd=w&0x1F,rm=(w>>16)&0x1F; if(reg[rm].kind==3){reg[rd].kind=4;reg[rd].val=reg[rm].val;}else reg[rd].kind=0; continue; }
+                // LDR imm (64): xt = [xn,#imm]
+                if ((w & 0xFFC00000) == 0xF9400000) { int rt=w&0x1F,rn=(w>>5)&0x1F; uint64_t imm=((w>>10)&0xFFF)*8; if(reg[rn].kind==2){reg[rt].kind=3;reg[rt].val=reg[rn].val+imm;}else reg[rt].kind=0; continue; }
+                // STRB imm: strb wt,[xn,#imm]
+                if ((w & 0xFFC00000) == 0x39000000) {
+                    int rt=w&0x1F,rn=(w>>5)&0x1F; uint32_t imm=(w>>10)&0xFFF;
+                    if (reg[rn].kind==4) {
+                        sbIvar = reg[rn].val;
+                        uint64_t v = (reg[rt].kind==1)?(reg[rt].val&0xFF):1;
+                        if (imm==0 && v==1) { haveDisc=YES; discOff=0; }
+                        if (imm+1>structMax) structMax=imm+1;
+                    }
+                    continue;
+                }
+                // STR/STP/STRD [xn,#imm] where xn=structbase
+                if ((w & 0xFFC00000) == 0xF9000000 || (w & 0xFFC00000) == 0xA9000000 || (w & 0xFFC00000) == 0xFD000000) {
+                    int rn=(w>>5)&0x1F;
+                    if (reg[rn].kind!=4) continue;
+                    BOOL isStp = ((w & 0xFFC00000)==0xA9000000);
+                    BOOL isStrd = ((w & 0xFFC00000)==0xFD000000);
+                    int rt=w&0x1F, rt2=(w>>10)&0x1F;
+                    int32_t imm; uint64_t o0,o1=0; int cnt=1;
+                    if (isStp) { imm=(w>>15)&0x7F; if(imm&0x40)imm-=0x80; o0=imm*8; o1=o0+8; cnt=2; }
+                    else { o0=((w>>10)&0xFFF)*8; }
+                    // 处理 o0
+                    int rts[2]={rt,rt2}; uint64_t offs[2]={o0,o1};
+                    for (int e=0;e<cnt;e++) {
+                        if (nF >= 30) break;   // 字段数组越界守卫(structMax 仍继续累计)
+                        uint64_t oo=offs[e]; int rr=rts[e];
+                        if (oo+8>structMax) structMax=(uint32_t)(oo+8);
+                        if (isStrd) {
+                            // 有效期 double 字段(源自入参 d 寄存器) → now_plus
+                            fieldsOff[nF]=oo; fieldsTy[nF]=5; fieldsVal[nF]=100; nF++;   // ty5=now_plus
+                            validityOff=oo; haveValidity=YES;
+                            continue;
+                        }
+                        RegV sv = reg[rr];
+                        if (sv.kind==1) {
+                            // 立即数: 可能 small-string ASCII 或 countAndFlags/tag
+                            char a8[8]; for(int t=0;t<8;t++)a8[t]=(sv.val>>(t*8))&0xFF;
+                            int pr=0; for(int t=0;t<8;t++){uint8_t c=a8[t]; if(c>=0x20&&c<0x7F)pr++; else if(c)pr=-99;}
+                            if (pr>=3) {
+                                char lower[9]; int L=0; for(int t=0;t<8&&a8[t];t++){lower[t]=a8[t]|0x20;L++;} lower[L]=0;
+                                BOOL isP=NO,isS=NO;
+                                for(int t=0;t<7;t++) if(strstr(lower,PERIODW[t])){isP=YES;break;}
+                                for(int t=0;t<5;t++) if(strstr(lower,STATUSW[t])){isS=YES;break;}
+                                fieldsOff[nF]=oo; fieldsTy[nF]=1; fieldsVal[nF]=sv.val; nF++;  // ty1=bytes(临时存原始8字节)
+                                if(isP)nPeriod++; if(isS)nStatus++;
+                            } else {
+                                fieldsOff[nF]=oo; fieldsTy[nF]=2; fieldsVal[nF]=sv.val; nF++;  // ty2=u64
+                            }
+                        } else if (sv.kind==2) {
+                            fieldsOff[nF]=oo; fieldsTy[nF]=3; fieldsVal[nF]=sv.val; nF++;      // ty3=addr(name ptr)
+                        } else {
+                            // 入参(name countAndFlags / ptr) — 标记待 plan 填
+                            fieldsOff[nF]=oo; fieldsTy[nF]=4; fieldsVal[nF]=0; nF++;           // ty4=input
+                            nInput++;
+                        }
+                    }
+                }
+            }
+
+            // 需要: disc=1 + period + status + 至少一个 input 或 addr(name)
+            if (!(haveDisc && nPeriod>=1 && nStatus>=1)) continue;
+            if (!planVA) continue;
+
+            // 组装 recipe JSON fields(语义化): period→按档位覆盖成选中计划的 tier 词
+            NSMutableArray *jf = [NSMutableArray array];
+            [jf addObject:@{@"off":@(0), @"type":@"u8", @"v":@(1)}];   // disc
+            const char *tierName = PERIODW[planPrio<7?planPrio:5];
+            // input 对: 升序取前两个 = countAndFlags + ptr
+            NSMutableArray *inputOffs = [NSMutableArray array];
+            for (int i=0;i<nF;i++) if (fieldsTy[i]==4) [inputOffs addObject:@(fieldsOff[i])];
+            [inputOffs sortUsingSelector:@selector(compare:)];
+            for (int i=0;i<nF;i++) {
+                uint64_t oo=fieldsOff[i];
+                if (oo==0) continue;   // disc 已加
+                int ty=fieldsTy[i]; uint64_t v=fieldsVal[i];
+                if (ty==1) {
+                    // bytes: 判断是否 period 词 → 用选中 tier 覆盖; 否则原样
+                    char a8[9]; int L=0; for(int t=0;t<8;t++){uint8_t c=(v>>(t*8))&0xFF; if(c){a8[L++]=c;}} a8[L]=0;
+                    char lower[9]; for(int t=0;t<L;t++)lower[t]=a8[t]|0x20; lower[L]=0;
+                    BOOL isP=NO; for(int t=0;t<7;t++) if(strstr(lower,PERIODW[t])){isP=YES;break;}
+                    NSString *sval = isP ? [NSString stringWithUTF8String:tierName] : [NSString stringWithUTF8String:a8];
+                    [jf addObject:@{@"off":@(oo), @"type":@"bytes", @"s":sval}];
+                    // small-string tag 字节(0xE0|count) 在 +7
+                    [jf addObject:@{@"off":@(oo+7), @"type":@"u8", @"v":@(0xE0 | (int)sval.length)}];
+                } else if (ty==2) {
+                    // u64: 跳过 small-string tag 型(0xE7 等已被 bytes tag 覆盖); 其余原样
+                    uint8_t hi=(v>>56)&0xFF;
+                    if (hi>=0xE0 && (v & 0x00FFFFFFFFFFFFFFULL)==0) continue;   // 纯 tag 立即数, 由 bytes 分支处理
+                    [jf addObject:@{@"off":@(oo), @"type":@"u64", @"v":[NSString stringWithFormat:@"0x%llx",v]}];
+                } else if (ty==3) {
+                    [jf addObject:@{@"off":@(oo), @"type":@"immstr", @"v":[NSString stringWithFormat:@"0x%llx",(unsigned long long)(planVA-0x100000000ULL)]}];
+                } else if (ty==5) {
+                    [jf addObject:@{@"off":@(oo), @"type":@"now_plus", @"years":@(100)}];
+                }
+            }
+            // input 对: [0]=countAndFlags(count) [1]=name ptr
+            if (inputOffs.count>=2) {
+                uint64_t o0=[inputOffs[0] unsignedLongLongValue], o1=[inputOffs[1] unsignedLongLongValue];
+                [jf addObject:@{@"off":@(o0), @"type":@"u64", @"v":[NSString stringWithFormat:@"0x%llx",(0xD000000000000000ULL|(uint64_t)planCount)]}];
+                [jf addObject:@{@"off":@(o1), @"type":@"immstr", @"v":[NSString stringWithFormat:@"0x%llx",(unsigned long long)(planVA-0x100000000ULL)]}];
+            }
+
+            // selector 定位: 该校验器调用的 ProState 选择器(0x1027ccc70 型)——沿用 sk2plan fn 关联
+            //   简化: 选择器 = 读同 ivar 的最早 ldr+ldrb+cmp#1 函数。此处用已知 ivar 反查。
+            uint64_t selOff = 0; const uint8_t *selPro = NULL; uint8_t proBuf[16];
+            if (sbIvar) {
+                uint64_t offA = sbIvar & 0xFFF;
+                for (uint64_t s2 = textVM; s2 + 4 <= textVM + textSize; s2 += 4) {
+                    uint32_t w = *(const uint32_t *)((uintptr_t)s2 + (uintptr_t)slide);
+                    if ((w & 0xFFC00000)!=0xF9400000) continue;
+                    if (((w>>10)&0xFFF)*8 != offA) continue;
+                    BOOL ld=NO,c1=NO;
+                    for (int k=1;k<=7;k++){ uint32_t ww=*(const uint32_t*)((uintptr_t)(s2+k*4)+(uintptr_t)slide); if((ww&0xFFC00000)==0x39400000)ld=YES; if((ww&0x7F80001F)==0x7100001F&&((ww>>10)&0xFFF)==1)c1=YES; }
+                    if(!(ld&&c1)) continue;
+                    // 往前找函数头
+                    for (uint64_t b=s2;b>textVM && s2-b<0x800;b-=4){ uint32_t bw=*(const uint32_t*)((uintptr_t)b+(uintptr_t)slide); if(bw==0xD503237F||((bw&0xFF8003FF)==0xD10003FF&&((bw>>10)&0xFFF))||((bw&0xFFC003E0)==0xA98003E0)){selOff=b-0x100000000ULL;break;} }   // sel_off = VA - image base(MFProbe: target=base+sel_off), 不减 __text 的 0x4000
+                    if (selOff) break;
+                }
+                if (selOff) { memcpy(proBuf, (const void*)((uintptr_t)(selOff+0x100000000ULL)+(uintptr_t)slide), 16); selPro=proBuf; }   // 运行时地址 = VA + slide = (selOff+base) + slide
+            }
+
+            // 六项自检
+            BOOL ck_disc = haveDisc;
+            BOOL ck_name = (inputOffs.count>=2) || (planVA!=0);
+            BOOL ck_valid = haveValidity;
+            BOOL ck_sel = (selOff!=0);
+            BOOL ck_struct = (structMax>=16 && structMax<=512);
+            BOOL ck_pro = NO;
+            if (selPro) { ck_pro=YES; for(int e=0;e<4;e++){ uint32_t iw=*(const uint32_t*)(selPro+e*4); BOOL safe=((iw&0xFF8003FF)==0xD10003FF)||((iw&0xFFC003E0)==0xA90003E0)||((iw&0xFFC003E0)==0xA98003E0)||((iw&0xFFC003E0)==0x6D0003E0)||((iw&0xFFC003E0)==0x6D8003E0)||((iw&0xFFC003E0)==0xF90003E0)||((iw&0x7F800000)==0x52800000)||((iw&0xFF800000)==0xD2800000)||iw==0xD503201F; if(!safe){ck_pro=NO;break;} } }
+            int passed = ck_disc+ck_name+ck_valid+ck_sel+ck_struct+ck_pro;
+
+            NSString *prologueHex = @"";
+            if (selPro) { NSMutableString *ph=[NSMutableString string]; for(int e=0;e<16;e++)[ph appendFormat:@"%02x",selPro[e]]; prologueHex=ph; }
+            uint32_t ssz = ((structMax+15)/16)*16;
+
+            NSMutableDictionary *recipe = [@{
+                @"name": [NSString stringWithFormat:@"auto_%llx", (unsigned long long)(fh-textVM)],
+                @"bundleMatch": @"", @"on": @(passed==6),
+                @"selOff": @(selOff),
+                @"prologue": prologueHex,
+                // ivar 全局 file_off = VA - 0x100000000(项目统一口径, 见 MFProbe 偏移表)
+                @"ivarGlobals": sbIvar ? @[@(sbIvar - 0x100000000ULL)] : @[],
+                @"structSize": @(ssz),
+                @"fields": jf,
+            } mutableCopy];
+
+            mfLog(@"[f8v2] ★sk2recipe fn=%#llx: 自检 %d/6 (disc=%d name=%d valid=%d sel=%d struct=%d pro=%d) selOff=%#llx ivar=%#llx size=%u plan='%s'(prio=%d,cnt=%d)",
+                  (unsigned long long)(fh-textVM), passed, ck_disc,ck_name,ck_valid,ck_sel,ck_struct,ck_pro,
+                  (unsigned long long)selOff, (unsigned long long)(sbIvar?sbIvar-0x100000000ULL:0), ssz, tierName, planPrio, planCount);
+
+            if (passed==6) {
+                if (mfInjectRecipeManualAdd(recipe)) { nRecipe++; mfLog(@"[f8v2]   ✅ 配方自动录入(重启目标 app 生效)"); }
+            } else {
+                mfLog(@"[f8v2]   ⚠️ 自检未满(%d/6), 仅记录不入库(防盲注入崩溃)", passed);
+            }
+        }
+        mfLog(@"[f8v2] sk2recipe: 自动录入配方=%d 个", nRecipe);
+    }
+
 
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";
     NSMutableArray *out = [NSMutableArray array];
