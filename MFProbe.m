@@ -16,6 +16,8 @@
 #import <libkern/OSCacheControl.h>
 #import <malloc/malloc.h>
 #import <string.h>
+#import <stdlib.h>
+#import <stdio.h>
 #import <dlfcn.h>
 
 extern void mfLog(NSString *fmt, ...);
@@ -126,33 +128,131 @@ static void mfApplyRecipe(uint8_t *p, const MFInjectRecipe *r, uintptr_t base) {
     }
 }
 
-// —— 内置配方(源自宿主 active 构造序列, 逐字段抄; 下一步由侦查引擎自动产出) ——
-static const uint8_t kR0Prologue[16] = {
-    0xff,0xc3,0x04,0xd1, 0xe9,0x23,0x0c,0x6d, 0xfc,0x6f,0x0d,0xa9, 0xfa,0x67,0x0e,0xa9 };
-static const MFField kR0Fields[] = {
-    {0x00, MF_FLD_U8,     .arg=0x01},                    // disc = active
-    {0x08, MF_FLD_BYTES,  .bytes="lifetime", .blen=8},   // 周期 small string
-    {0x17, MF_FLD_U8,     .arg=0xE8},                    //   small tag(count8)
-    {0x18, MF_FLD_U64,    .arg=0xD00000000000000CULL},   // 名称 countAndFlags(count12 immortal)
-    {0x20, MF_FLD_IMMSTR, .arg=0x3bb2800},               // 名称 ptr → 计划名常量前 12 字节
-    {0x28, MF_FLD_BYTES,  .bytes="storekit", .blen=8},   // 来源 small string
-    {0x37, MF_FLD_U8,     .arg=0xE8},
-    {0x38, MF_FLD_F64,    .f64=4102444800000.0},         // 有效期(毫秒 since 1970 → 2100年)
-    {0x40, MF_FLD_BYTES,  .bytes="active", .blen=6},     // 状态 small string
-    {0x4f, MF_FLD_U8,     .arg=0xE6},
-};
-static const MFInjectRecipe kR0 = {
-    .name = "r0",
-    .sel_off = 0x27ccc70,
-    .prologue = kR0Prologue,
-    .ivar_globals = {0x4727510, 0x4727508, 0, 0},
-    .struct_size = 80,
-    .fields = kR0Fields,
-    .n_fields = 10,
-};
+// ===================== 配方持久层(数据注册, 对齐 manual 录入范式) =====================
+//   prefs 键 mfInjectRecipes = 配方 JSON 数组。运行时 install 时解析首个启用配方为 C 结构缓存,
+//   热路径注入用缓存的 C 结构(不在每次选择器调用里做字典解析)。
+//   配方来源: ① 内置种子(首次运行写入 prefs, 之后即数据可改/可删)
+//             ② 侦查引擎产出(下一步) ③ 人工录入(mfInjectRecipeManualAdd)。
+//   JSON 字段: name / bundleMatch / selOff(num) / prologue(hex16B) / ivarGlobals([num])
+//             / structSize(num) / on(bool) / fields:[{off, type, v/s/f}]
+//     type: "u8"(v=num) "bytes"(s=ascii) "u64"(v=hexstr) "f64"(f=double) "immstr"(v=num/hex)
+static NSString * const kMFRecipesKey = @"mfInjectRecipes";
 
-// 选中的活动配方(当前内置 kR0; 下一步可由持久层/侦查产出切换)
-static const MFInjectRecipe *g_mfRecipe = &kR0;
+static uint64_t mfParseU64(id v) {
+    if ([v isKindOfClass:[NSNumber class]]) return [v unsignedLongLongValue];
+    if ([v isKindOfClass:[NSString class]]) return strtoull([v UTF8String], NULL, 0);
+    return 0;
+}
+
+// 内置种子配方(源自宿主 active 构造序列, 逐字段抄) — 首次运行写入 prefs 后即为可管理数据
+static NSDictionary *mfSeedRecipe(void) {
+    return @{
+        @"name": @"r0", @"bundleMatch": @"", @"on": @YES,
+        @"selOff": @(0x27ccc70),
+        @"prologue": @"ffc304d1e9230c6dfc6f0da9fa670ea9",
+        @"ivarGlobals": @[@(0x4727510), @(0x4727508)],
+        @"structSize": @(80),
+        @"fields": @[
+            @{@"off": @(0x00), @"type": @"u8",     @"v": @(0x01)},
+            @{@"off": @(0x08), @"type": @"bytes",  @"s": @"lifetime"},
+            @{@"off": @(0x17), @"type": @"u8",     @"v": @(0xE8)},
+            @{@"off": @(0x18), @"type": @"u64",    @"v": @"0xD00000000000000C"},
+            @{@"off": @(0x20), @"type": @"immstr", @"v": @(0x3bb2800)},
+            @{@"off": @(0x28), @"type": @"bytes",  @"s": @"storekit"},
+            @{@"off": @(0x37), @"type": @"u8",     @"v": @(0xE8)},
+            @{@"off": @(0x38), @"type": @"f64",    @"f": @(4102444800000.0)},
+            @{@"off": @(0x40), @"type": @"bytes",  @"s": @"active"},
+            @{@"off": @(0x4f), @"type": @"u8",     @"v": @(0xE6)},
+        ],
+    };
+}
+
+// 解析配方字典 → malloc 的 C 结构(进程生命期常驻, 不释放)。失败返 NULL。
+static const MFInjectRecipe *mfParseRecipe(NSDictionary *d) {
+    if (![d isKindOfClass:[NSDictionary class]]) return NULL;
+    NSArray *fields = d[@"fields"];
+    if (![fields isKindOfClass:[NSArray class]] || fields.count == 0) return NULL;
+
+    MFInjectRecipe *r = calloc(1, sizeof(MFInjectRecipe));
+    MFField *fs = calloc(fields.count, sizeof(MFField));
+    r->fields = fs; r->n_fields = (int)fields.count;
+    r->name = strdup([(d[@"name"] ?: @"?") UTF8String]);
+    r->sel_off = mfParseU64(d[@"selOff"]);
+    r->struct_size = (uint32_t)mfParseU64(d[@"structSize"]);
+    // prologue hex → 16 字节
+    NSString *ph = d[@"prologue"];
+    if ([ph isKindOfClass:[NSString class]] && ph.length >= 32) {
+        uint8_t *pb = calloc(1, 16);
+        for (int i = 0; i < 16; i++) {
+            char hx[3] = { [ph characterAtIndex:i*2], [ph characterAtIndex:i*2+1], 0 };
+            pb[i] = (uint8_t)strtoul(hx, NULL, 16);
+        }
+        r->prologue = pb;
+    }
+    // ivarGlobals
+    NSArray *igs = d[@"ivarGlobals"];
+    for (int i = 0; i < 4 && [igs isKindOfClass:[NSArray class]] && i < (int)igs.count; i++)
+        r->ivar_globals[i] = mfParseU64(igs[i]);
+    // fields
+    for (int i = 0; i < r->n_fields; i++) {
+        NSDictionary *f = fields[i];
+        fs[i].off = (uint32_t)mfParseU64(f[@"off"]);
+        NSString *ty = f[@"type"];
+        if ([ty isEqualToString:@"u8"])      { fs[i].type = MF_FLD_U8;     fs[i].arg = mfParseU64(f[@"v"]); }
+        else if ([ty isEqualToString:@"u64"]){ fs[i].type = MF_FLD_U64;    fs[i].arg = mfParseU64(f[@"v"]); }
+        else if ([ty isEqualToString:@"immstr"]){ fs[i].type = MF_FLD_IMMSTR; fs[i].arg = mfParseU64(f[@"v"]); }
+        else if ([ty isEqualToString:@"f64"]){ fs[i].type = MF_FLD_F64;    fs[i].f64 = [f[@"f"] doubleValue]; }
+        else if ([ty isEqualToString:@"bytes"]) {
+            fs[i].type = MF_FLD_BYTES;
+            const char *s = [(f[@"s"] ?: @"") UTF8String];
+            uint32_t bl = (uint32_t)strlen(s);
+            char *cp = malloc(bl + 1); memcpy(cp, s, bl + 1);
+            fs[i].bytes = cp; fs[i].blen = bl;
+        } else { free(fs); free(r); return NULL; }   // 未知类型 → 拒绝(防注入垃圾)
+    }
+    return r;
+}
+
+// 加载活动配方: 读 prefs 数组(空则写入种子); 取首个 on=YES 且 bundleMatch 命中者; 解析缓存。
+static const MFInjectRecipe *mfInjectLoadActive(void) {
+    static const MFInjectRecipe *cached = NULL;
+    static BOOL loaded = NO;
+    if (loaded) return cached;
+    loaded = YES;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSArray *arr = [ud arrayForKey:kMFRecipesKey];
+    if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) {
+        arr = @[ mfSeedRecipe() ];                         // 首次: 写入种子 → 之后即可管理数据
+        [ud setObject:arr forKey:kMFRecipesKey];
+        [ud synchronize];
+        mfLog(@"[stobs] 配方库为空 → 写入内置种子 r0(可在持久层改/删)");
+    }
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    for (NSDictionary *d in arr) {
+        if (![d[@"on"] boolValue]) continue;
+        NSString *bm = d[@"bundleMatch"];
+        if ([bm isKindOfClass:[NSString class]] && bm.length && ![bid containsString:bm]) continue;
+        cached = mfParseRecipe(d);
+        if (cached) { mfLog(@"[stobs] 加载配方 '%s'(selOff=%#llx fields=%d)", cached->name, cached->sel_off, cached->n_fields); break; }
+    }
+    return cached;
+}
+
+// 人工录入配方(逆向定位成果进持久层, 不硬编码): 传入完整配方字典, 合并进 prefs 数组。
+BOOL mfInjectRecipeManualAdd(NSDictionary *recipe) {
+    if (![recipe isKindOfClass:[NSDictionary class]] || !recipe[@"fields"]) return NO;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSMutableArray *arr = [([ud arrayForKey:kMFRecipesKey] ?: @[]) mutableCopy];
+    NSString *nm = recipe[@"name"] ?: @"?";
+    [arr filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(id o, NSDictionary *b) {
+        return ![[o objectForKey:@"name"] isEqual:nm];      // 同名覆盖
+    }]];
+    [arr addObject:recipe];
+    [ud setObject:arr forKey:kMFRecipesKey];
+    [ud synchronize];
+    mfLog(@"[stobs] ✍️ 录入配方 '%@'(重启目标 app 生效)", nm);
+    return YES;
+}
 
 // self = x20(状态管理实例) → 入口按配方注入, 令随后的选择器本体读到目标状态
 void mf_stObsLog(void *selfPtr) {
@@ -160,7 +260,7 @@ void mf_stObsLog(void *selfPtr) {
     uintptr_t self = (uintptr_t)selfPtr;
     uintptr_t base = mfProbeMainBase();
     if (!self || !base) return;
-    const MFInjectRecipe *r = g_mfRecipe;
+    const MFInjectRecipe *r = mfInjectLoadActive();
     if (!r) return;
 
     size_t isz = malloc_size((void *)self);
@@ -236,7 +336,7 @@ void mfProbeInstall(void) {
     static BOOL done = NO;
     if (done) return;
     if (!mfStateObsIsOn()) return;                 // 开关门控(默认关): 静默跳过
-    const MFInjectRecipe *r = g_mfRecipe;
+    const MFInjectRecipe *r = mfInjectLoadActive();
     if (!r || !r->sel_off) return;
     uintptr_t base = mfProbeMainBase();
     if (!base) return;
