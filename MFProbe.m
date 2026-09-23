@@ -15,6 +15,7 @@
 #import <mach/mach.h>
 #import <libkern/OSCacheControl.h>
 #import <malloc/malloc.h>
+#import <string.h>
 #import <dlfcn.h>
 
 extern void mfLog(NSString *fmt, ...);
@@ -79,43 +80,44 @@ static void mfDumpHex(NSString *tag, uintptr_t addr, int n, uint64_t off) {
     mfLog(@"[stobs]   %@ [+0x%llx, %dB]:\n[stobs]          %@", tag, off, n, s);
 }
 
-// self = x20(状态管理实例) → dump 有效状态结构快照
+// —— active 状态模板(源自目标函数内已存在的构造序列, 非凭空伪造) ——
+//   80 字节结构字段: +0x00 disc · +0x08 周期(small) · +0x18 名称(large immortal)
+//   +0x28 来源(small) · +0x38 double 有效期 · +0x40 状态(small)
+static void mfBuildActiveTemplate(uint8_t *p, uintptr_t base) {
+    memset(p, 0, 80);
+    p[0x00] = 0x01;                                            // disc = active
+    memcpy(p + 0x08, "monthly", 7);  p[0x17] = 0xE7;           // 周期 small string(count7)
+    *(uint64_t *)(p + 0x18) = 0xD000000000000010ULL;           // 名称 countAndFlags(count16 immortal)
+    *(uint64_t *)(p + 0x20) = ((uint64_t)(base + 0x3bb29a0)) | 0x8000000000000000ULL; // 名称 ptr → "pro_monthly_2026"(base+off, 运行时定位)
+    memcpy(p + 0x28, "storekit", 8); p[0x37] = 0xE8;           // 来源 small string(count8)
+    double exp = 4102444800.0;       memcpy(p + 0x38, &exp, 8); // 有效期(远未来, 防过期判定)
+    memcpy(p + 0x40, "active", 6);   p[0x4f] = 0xE6;           // 状态 small string(count6)
+}
+
+// self = x20(状态管理实例) → 入口注入 active 模板, 令随后的选择器本体读到 active
 void mf_stObsLog(void *selfPtr) {
     static uint32_t cnt = 0;
-    if (cnt >= 6) return;          // 高频选择器, 限量防刷屏
-    cnt++;
     uintptr_t self = (uintptr_t)selfPtr;
     uintptr_t base = mfProbeMainBase();
-    if (!self || !base) { mfLog(@"[stobs] self/base=0 跳过"); return; }
+    if (!self || !base) return;
 
     size_t isz = malloc_size((void *)self);
-    uint64_t offA    = mfIvarOff(base, 0x4727510);
-    uint64_t offB    = mfIvarOff(base, 0x4727508);
-    uint64_t offScope = mfIvarOff(base, 0x4727518);
-    mfLog(@"[stobs] ===== 状态选择器触发 #%u self=%p instSize=%zu offA=0x%llx offB=0x%llx offScope=0x%llx =====",
-          cnt, selfPtr, isz, offA, offB, offScope);
-
-    // 选择器逻辑: A 首字节==1 用 A, 否则 B → 两份都 dump 便于对比
-    if (offA && offA + 80 <= isz) mfDumpHex(@"stateA", self + offA, 80, offA);
-    else mfLog(@"[stobs]   ⛔ A off 越界(0x%llx / size %zu)", offA, isz);
-    if (offB && offB + 80 <= isz) mfDumpHex(@"stateB", self + offB, 80, offB);
-    else mfLog(@"[stobs]   ⛔ B off 越界(0x%llx / size %zu)", offB, isz);
-    if (offScope && offScope + 16 <= isz) mfDumpHex(@"scope(String)", self + offScope, 16, offScope);
-
-    uint8_t ab = (offA && offA < isz) ? *(uint8_t *)(self + offA) : 0xFF;
-    mfLog(@"[stobs]   → A 首字节=%d ⇒ 选择器%@", ab, ab == 1 ? @"用 A 分支" : @"用 B 分支");
-
-    struct { const char *nm; uint64_t fo; } bf[] = {
-        {"flagA", 0x4727428}, {"flagB", 0x47274a0},
-        {"flagC", 0x47274b0}, {"flagD", 0x47274d0},
-    };
-    NSMutableString *bs = [NSMutableString string];
-    for (int i = 0; i < 4; i++) {
-        uint64_t o = mfIvarOff(base, bf[i].fo);
-        if (o && o < isz) [bs appendFormat:@"%s=%d ", bf[i].nm, *(uint8_t *)(self + o)];
-        else [bs appendFormat:@"%s=off?(0x%llx) ", bf[i].nm, o];
+    uint64_t offA = mfIvarOff(base, 0x4727510);   // 主状态 ivar(选择器首选: 首字节==1 时选它)
+    uint64_t offB = mfIvarOff(base, 0x4727508);   // 次状态 ivar(选择器 fallback + 部分直读者)
+    if (!offA || offA + 80 > isz) {                // 越界守卫: 非目标进程/漂移则不动
+        if (cnt < 2) { cnt++; mfLog(@"[stobs] offA=0x%llx / size %zu 越界或未填, 跳过", offA, isz); }
+        return;
     }
-    mfLog(@"[stobs]   flags: %@", bs);
+    // before 快照(限量) — 验证注入前是否 none
+    if (cnt < 4) {
+        cnt++;
+        mfDumpHex(@"before(offA)", self + offA, 80, offA);
+    }
+    // 注入 active 模板到主/次状态 ivar(不限次, 覆盖 app 可能的 sync 回写):
+    //   主状态首字节=1 → 选择器走该分支; 次状态同注 → 覆盖直读 serverProState 的消费点
+    mfBuildActiveTemplate((uint8_t *)(self + offA), base);
+    if (offB && offB + 80 <= isz) mfBuildActiveTemplate((uint8_t *)(self + offB), base);
+    if (cnt <= 4) mfLog(@"[stobs] ✍️ 已注入 active 模板 @ offA=+0x%llx offB=+0x%llx (disc=1, plan=pro_monthly_2026)", offA, offB);
 }
 
 // asm trampoline: 入口 x30=caller lr。保 x0-x8+lr → logger(x20) → 复原 →
