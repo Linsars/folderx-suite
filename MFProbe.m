@@ -80,45 +80,107 @@ static void mfDumpHex(NSString *tag, uintptr_t addr, int n, uint64_t off) {
     mfLog(@"[stobs]   %@ [+0x%llx, %dB]:\n[stobs]          %@", tag, off, n, s);
 }
 
-// —— active 状态模板(源自目标函数内已存在的构造序列, 非凭空伪造) ——
-//   80 字节结构字段: +0x00 disc · +0x08 周期(small) · +0x18 名称(large immortal)
-//   +0x28 来源(small) · +0x38 double 有效期(毫秒 since 1970) · +0x40 状态(small)
-//   plan 用 lifetime(永久, 无续期/过期): 名称指向常量前缀 "pro_lifetime"(count=12)
-static void mfBuildActiveTemplate(uint8_t *p, uintptr_t base) {
-    memset(p, 0, 80);
-    p[0x00] = 0x01;                                            // disc = active
-    memcpy(p + 0x08, "lifetime", 8); p[0x17] = 0xE8;          // 周期 small string(count8)
-    *(uint64_t *)(p + 0x18) = 0xD00000000000000CULL;          // 名称 countAndFlags(count12 immortal large)
-    *(uint64_t *)(p + 0x20) = ((uint64_t)(base + 0x3bb2800)) | 0x8000000000000000ULL; // 名称 ptr → "pro_lifetime"(常量前 12 字节, base+off 运行时定位)
-    memcpy(p + 0x28, "storekit", 8); p[0x37] = 0xE8;          // 来源 small string(count8)
-    double exp = 4102444800000.0;    memcpy(p + 0x38, &exp, 8); // 有效期(毫秒 since 1970 → 2100年, 防过期)
-    memcpy(p + 0x40, "active", 6);   p[0x4f] = 0xE6;          // 状态 small string(count6)
+// ===================== hook_inject 通用注入执行器(数据驱动) =====================
+//   配方 = 纯数据: hook 目标 + 序言校验 + ivar 偏移全局 + 结构字段填充表。
+//   执行器 mfApplyRecipe 只认数据、零 app 专有逻辑 → 换靶子只换一条 recipe 数据。
+//   (下一步: recipe 来源从内置常量改为持久层 / 侦查引擎产出的 JSON。)
+typedef enum {
+    MF_FLD_U8 = 0,     // 单字节
+    MF_FLD_BYTES,      // 内联字节串(small string payload)
+    MF_FLD_U64,        // 8 字节小端立即数
+    MF_FLD_F64,        // double
+    MF_FLD_IMMSTR,     // immortal String storage 指针 = (base + arg) | 0x8000000000000000
+} MFFieldType;
+
+typedef struct {
+    uint32_t off;         // 结构内字节偏移
+    MFFieldType type;
+    uint64_t arg;         // U8/U64 值 或 IMMSTR 的常量 file_off
+    double f64;           // F64 值
+    const char *bytes;    // BYTES 数据
+    uint32_t blen;        // BYTES 长度
+} MFField;
+
+typedef struct {
+    const char *name;
+    uint64_t sel_off;           // hook 目标(选择器)file_off
+    const uint8_t *prologue;    // 16 字节序言校验(NULL=不校验)
+    uint64_t ivar_globals[4];   // 存 ivar 偏移的全局 file_off(0 结尾)
+    uint32_t struct_size;       // 注入结构大小
+    const MFField *fields;
+    int n_fields;
+} MFInjectRecipe;
+
+// 通用执行器: 按配方 fields 填充 struct buffer(base 供 IMMSTR 运行时定位)
+static void mfApplyRecipe(uint8_t *p, const MFInjectRecipe *r, uintptr_t base) {
+    memset(p, 0, r->struct_size);
+    for (int i = 0; i < r->n_fields; i++) {
+        const MFField *f = &r->fields[i];
+        switch (f->type) {
+            case MF_FLD_U8:     p[f->off] = (uint8_t)f->arg; break;
+            case MF_FLD_BYTES:  memcpy(p + f->off, f->bytes, f->blen); break;
+            case MF_FLD_U64:    *(uint64_t *)(p + f->off) = f->arg; break;
+            case MF_FLD_F64:    memcpy(p + f->off, &f->f64, 8); break;
+            case MF_FLD_IMMSTR: *(uint64_t *)(p + f->off) = ((uint64_t)(base + f->arg)) | 0x8000000000000000ULL; break;
+        }
+    }
 }
 
-// self = x20(状态管理实例) → 入口注入 active 模板, 令随后的选择器本体读到 active
+// —— 内置配方(源自宿主 active 构造序列, 逐字段抄; 下一步由侦查引擎自动产出) ——
+static const uint8_t kR0Prologue[16] = {
+    0xff,0xc3,0x04,0xd1, 0xe9,0x23,0x0c,0x6d, 0xfc,0x6f,0x0d,0xa9, 0xfa,0x67,0x0e,0xa9 };
+static const MFField kR0Fields[] = {
+    {0x00, MF_FLD_U8,     .arg=0x01},                    // disc = active
+    {0x08, MF_FLD_BYTES,  .bytes="lifetime", .blen=8},   // 周期 small string
+    {0x17, MF_FLD_U8,     .arg=0xE8},                    //   small tag(count8)
+    {0x18, MF_FLD_U64,    .arg=0xD00000000000000CULL},   // 名称 countAndFlags(count12 immortal)
+    {0x20, MF_FLD_IMMSTR, .arg=0x3bb2800},               // 名称 ptr → 计划名常量前 12 字节
+    {0x28, MF_FLD_BYTES,  .bytes="storekit", .blen=8},   // 来源 small string
+    {0x37, MF_FLD_U8,     .arg=0xE8},
+    {0x38, MF_FLD_F64,    .f64=4102444800000.0},         // 有效期(毫秒 since 1970 → 2100年)
+    {0x40, MF_FLD_BYTES,  .bytes="active", .blen=6},     // 状态 small string
+    {0x4f, MF_FLD_U8,     .arg=0xE6},
+};
+static const MFInjectRecipe kR0 = {
+    .name = "r0",
+    .sel_off = 0x27ccc70,
+    .prologue = kR0Prologue,
+    .ivar_globals = {0x4727510, 0x4727508, 0, 0},
+    .struct_size = 80,
+    .fields = kR0Fields,
+    .n_fields = 10,
+};
+
+// 选中的活动配方(当前内置 kR0; 下一步可由持久层/侦查产出切换)
+static const MFInjectRecipe *g_mfRecipe = &kR0;
+
+// self = x20(状态管理实例) → 入口按配方注入, 令随后的选择器本体读到目标状态
 void mf_stObsLog(void *selfPtr) {
     static uint32_t cnt = 0;
     uintptr_t self = (uintptr_t)selfPtr;
     uintptr_t base = mfProbeMainBase();
     if (!self || !base) return;
+    const MFInjectRecipe *r = g_mfRecipe;
+    if (!r) return;
 
     size_t isz = malloc_size((void *)self);
-    uint64_t offA = mfIvarOff(base, 0x4727510);   // 主状态 ivar(选择器首选: 首字节==1 时选它)
-    uint64_t offB = mfIvarOff(base, 0x4727508);   // 次状态 ivar(选择器 fallback + 部分直读者)
-    if (!offA || offA + 80 > isz) {                // 越界守卫: 非目标进程/漂移则不动
-        if (cnt < 2) { cnt++; mfLog(@"[stobs] offA=0x%llx / size %zu 越界或未填, 跳过", offA, isz); }
-        return;
+    // 遍历配方的 ivar 偏移全局, 逐个注入(越界守卫)
+    int injected = 0, ntarget = 0;
+    uint64_t offs[4] = {0};
+    for (int i = 0; i < 4 && r->ivar_globals[i]; i++) {
+        ntarget++;
+        uint64_t off = mfIvarOff(base, r->ivar_globals[i]);
+        offs[i] = off;
+        if (!off || off + r->struct_size > isz) continue;   // 越界/未填 → 跳过该 ivar
+        if (cnt < 4 && injected == 0) mfDumpHex(@"before", self + off, r->struct_size, off);
+        mfApplyRecipe((uint8_t *)(self + off), r, base);
+        injected++;
     }
-    // before 快照(限量) — 验证注入前是否 none
     if (cnt < 4) {
         cnt++;
-        mfDumpHex(@"before(offA)", self + offA, 80, offA);
+        mfLog(@"[stobs] ✍️ 配方 '%s' 注入 %d/%d ivar (off0=0x%llx off1=0x%llx size=%u)",
+              r->name, injected, ntarget, offs[0], offs[1], r->struct_size);
     }
-    // 注入 active 模板到主/次状态 ivar(不限次, 覆盖 app 可能的 sync 回写):
-    //   主状态首字节=1 → 选择器走该分支; 次状态同注 → 覆盖直读 serverProState 的消费点
-    mfBuildActiveTemplate((uint8_t *)(self + offA), base);
-    if (offB && offB + 80 <= isz) mfBuildActiveTemplate((uint8_t *)(self + offB), base);
-    if (cnt <= 4) mfLog(@"[stobs] ✍️ 已注入 active 模板 @ offA=+0x%llx offB=+0x%llx (disc=1, plan=pro_monthly_2026)", offA, offB);
 }
 
 // asm trampoline: 入口 x30=caller lr。保 x0-x8+lr → logger(x20) → 复原 →
@@ -169,19 +231,19 @@ static BOOL mfProbePatch16(uintptr_t target, const uint8_t *newBytes, NSString *
     return YES;
 }
 
-// 安装: 开关开时, 目标地址序言字节匹配才 inline hook(双门控, 无 bundleID 明文)
+// 安装: 开关开时, 按活动配方 hook 其选择器(序言字节匹配才装, 双门控, 无 bundleID 明文)
 void mfProbeInstall(void) {
     static BOOL done = NO;
     if (done) return;
     if (!mfStateObsIsOn()) return;                 // 开关门控(默认关): 静默跳过
+    const MFInjectRecipe *r = g_mfRecipe;
+    if (!r || !r->sel_off) return;
     uintptr_t base = mfProbeMainBase();
     if (!base) return;
-    uintptr_t target = base + 0x27ccc70;
+    uintptr_t target = base + r->sel_off;
 
-    // 序言字节校验(前 4 条): 不匹配 = 非目标进程/地址漂移 → 拒绝 hook(唯一目标门控)
-    static const uint8_t want[16] = {
-        0xff,0xc3,0x04,0xd1, 0xe9,0x23,0x0c,0x6d, 0xfc,0x6f,0x0d,0xa9, 0xfa,0x67,0x0e,0xa9 };
-    if (memcmp((void *)target, want, 16) != 0) return;   // 静默跳过, 不 log(避免非目标进程刷日志)
+    // 序言字节校验(配方提供): 不匹配 = 非目标进程/地址漂移 → 拒绝 hook
+    if (r->prologue && memcmp((void *)target, r->prologue, 16) != 0) return;  // 静默跳过
 
     g_mfStObsCont = (void *)(target + 0x10);
 
@@ -193,8 +255,8 @@ void mfProbeInstall(void) {
     NSString *err = nil;
     if (mfProbePatch16(target, stub, &err)) {
         done = YES;
-        mfLog(@"[stobs] ✅ inline hook 状态选择器 @ %p → tramp %p — 触发功能区看 [stobs] dump", (void *)target, (void *)tramp);
+        mfLog(@"[stobs] ✅ hook_inject 配方 '%s' 装载 @ %p → tramp %p", r->name, (void *)target, (void *)tramp);
     } else {
-        mfLog(@"[stobs] ⛔ inline hook 失败: %@", err);
+        mfLog(@"[stobs] ⛔ hook 失败: %@", err);
     }
 }
