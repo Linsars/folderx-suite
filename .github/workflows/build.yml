@@ -1,0 +1,72 @@
+name: build
+on:
+  push:
+    branches: [ suite ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      THEOS: /opt/theos
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Theos
+        run: |
+          sudo mkdir -p "$THEOS"
+          sudo chown $(id -u):$(id -g) "$THEOS"
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+      - name: Install SDK
+        run: |
+          curl -L -o /tmp/sdk.tar.xz https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+          mkdir -p "$THEOS/sdks"
+          tar xJf /tmp/sdk.tar.xz -C "$THEOS/sdks/"
+          mv "$THEOS/sdks/iPhoneOS16.5.sdk" "$THEOS/sdks/iPhoneOS14.5.sdk"
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Build minisfixd daemon (privileged charge writer)
+        run: |
+          mkdir -p layout-rootless/usr/bin
+          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e \
+            -isysroot "$THEOS/sdks/iPhoneOS14.5.sdk" \
+            -miphoneos-version-min=14.5 \
+            -framework CoreFoundation -O2 -Wall \
+            -o layout-rootless/usr/bin/minisfixd minisfixd.c
+          ldid -Sminisfixd.entitlements layout-rootless/usr/bin/minisfixd
+          ls -la layout-rootless/usr/bin/
+          echo "=== minisfixd built and entitled ==="
+
+      - name: Build package (capture errors)
+        id: buildpkg
+        run: |
+          set -o pipefail
+          make package 2>&1 | tee /tmp/build_output.log
+          echo "=== make exit code: ${PIPESTATUS[0]} ==="
+          if grep -qE "^[^ ]*\berror:" /tmp/build_output.log; then
+            echo "::error::编译错误(见日志) — 不产出 deb"
+            echo "build_failed=1" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          echo "build_failed=0" >> "$GITHUB_OUTPUT"
+
+      # v2.58.88: 之前 job 永远 success(exit 0 + if-no-files-found: ignore),
+      #   编译失败也报绿 → 误判"CI 绿"。现在编译失败即红, 且无 deb 时也报错。
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-packages
+          path: packages/*.deb
+          if-no-files-found: error
+
+      # 始终上传 make 编译日志(成功失败都传), 供诊断
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build_output.log
+          if-no-files-found: ignore
+        if: always()
