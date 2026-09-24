@@ -1690,6 +1690,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 if ((w & 0xFFC00000) == 0x39000000) {
                     int rt=w&0x1F,rn=(w>>5)&0x1F; uint32_t imm=(w>>10)&0xFFF;
                     if (reg[rn].kind==4) {
+                        // dbg_142 崩因修复: 校验器连续构造 active + free 两个块, 二者写同一 ivar 的相邻实例。
+                        //   只提第一个 active 块 —— 已建立 disc 后再遇 off0 的 structbase STRB = 第二块起点 → 停。
+                        //   (否则 free 块的 input 字段污染 active, name countAndFlags 错位 → String 解引用垃圾崩)
+                        if (imm==0 && haveDisc) { break; }
                         sbIvar = reg[rn].val;
                         uint64_t v = (reg[rt].kind==1)?(reg[rt].val&0xFF):1;
                         if (imm==0 && v==1) { haveDisc=YES; discOff=0; }
@@ -1768,8 +1772,9 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     BOOL isP=NO; for(int t=0;t<7;t++) if(strstr(lower,PERIODW[t])){isP=YES;break;}
                     NSString *sval = isP ? [NSString stringWithUTF8String:tierName] : [NSString stringWithUTF8String:a8];
                     [jf addObject:@{@"off":@(oo), @"type":@"bytes", @"s":sval}];
-                    // small-string tag 字节(0xE0|count) 在 +7
-                    [jf addObject:@{@"off":@(oo+7), @"type":@"u8", @"v":@(0xE0 | (int)sval.length)}];
+                    // Swift small-string tag 在 16 字节槽的第 15 字节(0xE0|count), 不是 +7!
+                    //   (dbg_142 崩因: tag 误写 +7 → 覆盖 payload + 真 tag 位留 0 → String 被当大字符串解引用垃圾指针崩)
+                    [jf addObject:@{@"off":@(oo+15), @"type":@"u8", @"v":@(0xE0 | (int)sval.length)}];
                 } else if (ty==2) {
                     // u64: 跳过 small-string tag 型(0xE7 等已被 bytes tag 覆盖); 其余原样
                     uint8_t hi=(v>>56)&0xFF;

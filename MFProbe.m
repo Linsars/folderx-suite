@@ -144,6 +144,7 @@ static void mfApplyRecipe(uint8_t *p, const MFInjectRecipe *r, uintptr_t base) {
 //             / structSize(num) / on(bool) / fields:[{off, type, v/s/f}]
 //     type: "u8"(v=num) "bytes"(s=ascii) "u64"(v=hexstr) "f64"(f=double) "immstr"(v=num/hex)
 static NSString * const kMFRecipesKey = @"mfInjectRecipes";
+#define MF_RECIPE_SV 2   // 配方 schema 版本(布局/字段语义变更时 +1, 旧版配方自动清除防崩)
 
 static uint64_t mfParseU64(id v) {
     if ([v isKindOfClass:[NSNumber class]]) return [v unsignedLongLongValue];
@@ -228,6 +229,14 @@ static const MFInjectRecipe *mfInjectLoadActive(void) {
     if (loaded) return cached;
     loaded = YES;
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    // schema 版本闸: 旧版配方(dbg_142 崩因: tag 偏移错/双块污染)整批作废, 防加载坏配方崩溃
+    NSInteger sv = [ud integerForKey:@"mfInjectRecipesSV"];
+    if (sv != MF_RECIPE_SV) {
+        [ud removeObjectForKey:kMFRecipesKey];
+        [ud setInteger:MF_RECIPE_SV forKey:@"mfInjectRecipesSV"];
+        [ud synchronize];
+        mfLog(@"[stobs] 配方 schema 版本 %ld→%d, 清除旧配方(防坏配方崩溃), 待侦查重新产出", (long)sv, MF_RECIPE_SV);
+    }
     NSArray *arr = [ud arrayForKey:kMFRecipesKey];
     if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) {
         arr = @[ mfSeedRecipe() ];                         // 首次: 写入种子 → 之后即可管理数据
