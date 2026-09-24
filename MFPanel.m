@@ -1613,13 +1613,9 @@ void mfShowLabPage(void) {
         @selector(mfReceiptForgeSwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 收据验证型 — appStoreReceiptURL/transactionReceipt · 命中 %ld", mfReceiptForgeHits()]);
 
-    // v2.58.150: 运行时状态观测(仅目标序言匹配时生效, 默认关)——
-    //   hook 状态选择器, dump 选择器实际选中的 80 字节状态结构。纯读零改写(越界守卫)。
-    //   开关关则完全不 hook。开关开→重启目标 app→触发功能区看 [stobs] dump。
-    extern BOOL mfStateObsIsOn(void);
-    mfSubSwitchRow(sv, 264, @"运行时状态观测（只读 dump）", mfStateObsIsOn(),
-        @selector(mfStateObsSwitchChanged:),
-        @"默认关 · 序言匹配才 hook · dump 80B 状态结构(纯读不改) · 开后重启目标看 [stobs] 日志");
+    // v2.58.157: 「运行时状态观测」独立开关已删除 —— 状态注入并入 patch 引擎判定点体系。
+    //   侦查(sk2recipe)扫出配方 → 注册为 hookinj@ 判定点 → 用户在「🎯 判定点」列表 ⚡ 执行。
+    //   与 sk2vfy/manual 等其他判定点同一交互, 不再是单独开关。
 
     // v2.56.3: 删除"mach 许可服务器应答器（demux 重绑）"开关 —— 三连失败已证伪
     //   (fishhook rebind 0×3, 样本 dlsym 动态解析 mach_msg_server; demux 是样本自身代码,
@@ -1628,7 +1624,7 @@ void mfShowLabPage(void) {
     // v2.56: patch 引擎(规则驱动: method swizzle / text vm_protect / keychain 授权豁免)
     //   ——学习自样本判定链的落地容器。规则格式: mfAppPatchRules JSON
     //   [{"bid":"com.scripting.ios","ver":"","patches":[{"kind":"keychain"}]}]
-    CGFloat apY = 324;   // v2.58.150: 状态观测开关(264, 高52)插入后下移 60px
+    CGFloat apY = 264;   // v2.58.157: 状态观测独立开关删除, 收回 60px(判定点体系接管)
     extern void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio);
     mfAppPatchSectionInLabPage(sv, &apY);
 
@@ -1736,10 +1732,8 @@ void mfShowLabPage(void) {
 - (void)mfReceiptForgeSwitchChanged:(UISwitch *)sw { mfReceiptForgeSwitchChanged(sw); }
 - (void)mfL0SwitchChanged:(UISwitch *)sw { mfL0SetOn(sw.on); }
 - (void)mfStateObsSwitchChanged:(UISwitch *)sw {
-    extern void mfStateObsSetOn(BOOL);
-    mfStateObsSetOn(sw.on);
-    if (sw.on) mfToast(@"运行时状态观测已开 — 重启目标 app 触发功能区看 [stobs] 日志");
-    else       mfToast(@"运行时状态观测已关 — 重启目标 app 生效");
+    // v2.58.157: 状态观测开关已废除, 保留空方法防旧引用崩溃(实际不再挂 UI)
+    (void)sw;
 }
 - (void)mfExcSwitchChanged:(UISwitch *)sw { mfExcSetOn(sw.on); }   // v2.54.0: EXCPROBE 应答器开关
 - (void)mfObjCHookToggle:(UISwitch *)sw { mfObjCHookToggle(sw); }
@@ -2608,8 +2602,8 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
             mfAppPatchEntDumpDelete(@"manual@0x1027c75bc");
             mfAppPatchEntDumpDelete(@"manual@0x1027cb5bc");
         }
-        // v2.58.150: 运行时状态观测——开关开(默认关)且目标序言字节匹配时冷启动 inline hook。
-        //   开关关则 mfProbeInstall 内部直接 return, 序言不匹配也静默跳过, 均不碰宿主。
+        // v2.58.157: 清理 155/156 遗留的独立配方存储(状态注入已并入 patch 引擎判定点)。
+        //   实际 hook 装载由判定点引擎 apEntDumpsApply 的 hookinj@ 分支驱动(用户 ⚡ 后 on=YES 冷启动重打)。
         {
             extern void mfProbeInstall(void);
             mfProbeInstall();

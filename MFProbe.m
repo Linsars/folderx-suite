@@ -22,13 +22,20 @@
 
 extern void mfLog(NSString *fmt, ...);
 
-// —— 开关持久化(NSUserDefaults, 默认 NO = 不默认生效) ——
-BOOL mfStateObsIsOn(void) {
-    return [[NSUserDefaults standardUserDefaults] boolForKey:@"mfStateObsEnabled"];
-}
-void mfStateObsSetOn(BOOL on) {
-    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"mfStateObsEnabled"];
-    [[NSUserDefaults standardUserDefaults] synchronize];
+// v2.58.157: 「运行时状态观测」独立开关已废除 —— 状态注入并入 patch 引擎判定点体系。
+//   侦查(sk2recipe)扫出配方 → 注册为 hookinj@ 判定点(默认 off) → 用户在判定点列表 ⚡ 执行
+//   → apEntDumpsApply/mfAPEntPatchNow 调 mfProbeInstallRecipe 装 hook。与其他判定点同一交互。
+//   一次性清理 155 遗留的 mfInjectRecipes prefs 存储(旧独立存储已废)。
+static void mfProbePurgeLegacyStore(void) {
+    static BOOL done = NO; if (done) return; done = YES;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    if ([ud objectForKey:@"mfInjectRecipes"]) {
+        [ud removeObjectForKey:@"mfInjectRecipes"];
+        [ud removeObjectForKey:@"mfInjectRecipesSV"];
+        [ud removeObjectForKey:@"mfStateObsEnabled"];
+        [ud synchronize];
+        mfLog(@"[stobs] 清理旧独立存储 mfInjectRecipes(状态注入已并入判定点引擎)");
+    }
 }
 
 // 主程序(MH_EXECUTE)运行时基址
@@ -140,39 +147,13 @@ static void mfApplyRecipe(uint8_t *p, const MFInjectRecipe *r, uintptr_t base) {
 //   热路径注入用缓存的 C 结构(不在每次选择器调用里做字典解析)。
 //   配方来源: ① 内置种子(首次运行写入 prefs, 之后即数据可改/可删)
 //             ② 侦查引擎产出(下一步) ③ 人工录入(mfInjectRecipeManualAdd)。
-//   JSON 字段: name / bundleMatch / selOff(num) / prologue(hex16B) / ivarGlobals([num])
-//             / structSize(num) / on(bool) / fields:[{off, type, v/s/f}]
-//     type: "u8"(v=num) "bytes"(s=ascii) "u64"(v=hexstr) "f64"(f=double) "immstr"(v=num/hex)
-static NSString * const kMFRecipesKey = @"mfInjectRecipes";
-#define MF_RECIPE_SV 2   // 配方 schema 版本(布局/字段语义变更时 +1, 旧版配方自动清除防崩)
+// 内置种子/独立存储已废除(v2.58.157): 配方改由侦查 sk2recipe 注册为 hookinj@ 判定点,
+//   内嵌在 mfEntDumps 点位里, 用户 ⚡ 执行。此处只保留 dict→C 结构解析器。
 
 static uint64_t mfParseU64(id v) {
     if ([v isKindOfClass:[NSNumber class]]) return [v unsignedLongLongValue];
     if ([v isKindOfClass:[NSString class]]) return strtoull([v UTF8String], NULL, 0);
     return 0;
-}
-
-// 内置种子配方(源自宿主 active 构造序列, 逐字段抄) — 首次运行写入 prefs 后即为可管理数据
-static NSDictionary *mfSeedRecipe(void) {
-    return @{
-        @"name": @"r0", @"bundleMatch": @"", @"on": @YES,
-        @"selOff": @(0x27ccc70),
-        @"prologue": @"ffc304d1e9230c6dfc6f0da9fa670ea9",
-        @"ivarGlobals": @[@(0x4727510), @(0x4727508)],
-        @"structSize": @(80),
-        @"fields": @[
-            @{@"off": @(0x00), @"type": @"u8",     @"v": @(0x01)},
-            @{@"off": @(0x08), @"type": @"bytes",  @"s": @"lifetime"},
-            @{@"off": @(0x17), @"type": @"u8",     @"v": @(0xE8)},
-            @{@"off": @(0x18), @"type": @"u64",    @"v": @"0xD00000000000000C"},
-            @{@"off": @(0x20), @"type": @"immstr", @"v": @(0x3bb2800)},
-            @{@"off": @(0x28), @"type": @"bytes",  @"s": @"storekit"},
-            @{@"off": @(0x37), @"type": @"u8",     @"v": @(0xE8)},
-            @{@"off": @(0x38), @"type": @"now_plus", @"years": @(100)},   // 有效期 = now+100年(运行时算)
-            @{@"off": @(0x40), @"type": @"bytes",  @"s": @"active"},
-            @{@"off": @(0x4f), @"type": @"u8",     @"v": @(0xE6)},
-        ],
-    };
 }
 
 // 解析配方字典 → malloc 的 C 结构(进程生命期常驻, 不释放)。失败返 NULL。
@@ -222,72 +203,51 @@ static const MFInjectRecipe *mfParseRecipe(NSDictionary *d) {
     return r;
 }
 
-// 加载活动配方: 读 prefs 数组(空则写入种子); 取首个 on=YES 且 bundleMatch 命中者; 解析缓存。
-static const MFInjectRecipe *mfInjectLoadActive(void) {
-    static const MFInjectRecipe *cached = NULL;
-    static BOOL loaded = NO;
-    if (loaded) return cached;
-    loaded = YES;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    // schema 版本闸: 旧版配方(dbg_142 崩因: tag 偏移错/双块污染)整批作废, 防加载坏配方崩溃
-    NSInteger sv = [ud integerForKey:@"mfInjectRecipesSV"];
-    if (sv != MF_RECIPE_SV) {
-        [ud removeObjectForKey:kMFRecipesKey];
-        [ud setInteger:MF_RECIPE_SV forKey:@"mfInjectRecipesSV"];
-        [ud synchronize];
-        mfLog(@"[stobs] 配方 schema 版本 %ld→%d, 清除旧配方(防坏配方崩溃), 待侦查重新产出", (long)sv, MF_RECIPE_SV);
+// —— 活动配方: 由 patch 引擎在执行 hookinj@ 判定点时注入(不再从独立 prefs 读) ——
+static const MFInjectRecipe *g_mfActiveRecipe = NULL;
+static BOOL mfProbePatch16(uintptr_t target, const uint8_t *newBytes, NSString **err);  // fwd
+
+// patch 引擎回调: 传入 hookinj 配方字典 → 解析并装 inline hook(判定点 ⚡ 执行路径调用)。
+//   返回 YES=hook 装上。序言字节校验防漂移/误注入。与其他判定点 patch 同一交互层。
+BOOL mfProbeInstallRecipe(NSDictionary *recipeDict) {
+    mfProbePurgeLegacyStore();
+    const MFInjectRecipe *r = mfParseRecipe(recipeDict);
+    if (!r || !r->sel_off) { mfLog(@"[stobs] ⛔ 配方解析失败或缺 selOff"); return NO; }
+    uintptr_t base = mfProbeMainBase();
+    if (!base) return NO;
+    uintptr_t target = base + r->sel_off;
+    if (r->prologue && memcmp((void *)target, r->prologue, 16) != 0) {
+        mfLog(@"[stobs] ⛔ 序言不匹配(地址漂移/非目标), 拒绝 hook @ %#llx", (unsigned long long)r->sel_off);
+        return NO;
     }
-    NSArray *arr = [ud arrayForKey:kMFRecipesKey];
-    if (![arr isKindOfClass:[NSArray class]] || arr.count == 0) {
-        arr = @[ mfSeedRecipe() ];                         // 首次: 写入种子 → 之后即可管理数据
-        [ud setObject:arr forKey:kMFRecipesKey];
-        [ud synchronize];
-        mfLog(@"[stobs] 配方库为空 → 写入内置种子 r0(可在持久层改/删)");
+    static BOOL hooked = NO;
+    g_mfActiveRecipe = r;                       // 先设活动配方(logger 用)
+    if (hooked) { mfLog(@"[stobs] 配方已切换为 '%s'(hook 已在, 复用)", r->name); return YES; }
+    g_mfStObsCont = (void *)(target + 0x10);
+    uint8_t stub[16];
+    uint32_t ldr = 0x58000050, br = 0xd61f0200;
+    uint64_t tramp = (uint64_t)(uintptr_t)mf_stObsTramp;
+    memcpy(stub, &ldr, 4); memcpy(stub + 4, &br, 4); memcpy(stub + 8, &tramp, 8);
+    NSString *err = nil;
+    if (mfProbePatch16(target, stub, &err)) {
+        hooked = YES;
+        mfLog(@"[stobs] ✅ hookinj 判定点装载 '%s' @ %p → tramp %p", r->name, (void *)target, (void *)tramp);
+        return YES;
     }
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    // 优先选侦查自动产出配方(name 前缀 auto_), 种子/手工只作兜底 —— 保证全自动链路被验证
-    for (int pass = 0; pass < 2 && !cached; pass++) {
-        for (NSDictionary *d in arr) {
-            if (![d[@"on"] boolValue]) continue;
-            NSString *nm = d[@"name"] ?: @"";
-            BOOL isAuto = [nm hasPrefix:@"auto_"];
-            if (pass == 0 && !isAuto) continue;      // 第一轮只认 auto_
-            NSString *bm = d[@"bundleMatch"];
-            if ([bm isKindOfClass:[NSString class]] && bm.length && ![bid containsString:bm]) continue;
-            const MFInjectRecipe *c = mfParseRecipe(d);
-            if (c) { cached = c; mfLog(@"[stobs] 加载配方 '%s'(%@, selOff=%#llx fields=%d)", c->name, isAuto ? @"侦查自动" : @"种子/手工", c->sel_off, c->n_fields); break; }
-        }
-    }
-    return cached;
+    mfLog(@"[stobs] ⛔ hook 失败: %@", err);
+    return NO;
 }
 
-// 人工录入配方(逆向定位成果进持久层, 不硬编码): 传入完整配方字典, 合并进 prefs 数组。
-BOOL mfInjectRecipeManualAdd(NSDictionary *recipe) {
-    if (![recipe isKindOfClass:[NSDictionary class]] || !recipe[@"fields"]) return NO;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSMutableArray *arr = [([ud arrayForKey:kMFRecipesKey] ?: @[]) mutableCopy];
-    NSString *nm = recipe[@"name"] ?: @"?";
-    [arr filterUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(id o, NSDictionary *b) {
-        return ![[o objectForKey:@"name"] isEqual:nm];      // 同名覆盖
-    }]];
-    [arr addObject:recipe];
-    [ud setObject:arr forKey:kMFRecipesKey];
-    [ud synchronize];
-    mfLog(@"[stobs] ✍️ 录入配方 '%@'(重启目标 app 生效)", nm);
-    return YES;
-}
-
-// self = x20(状态管理实例) → 入口按配方注入, 令随后的选择器本体读到目标状态
+// self = x20(状态管理实例) → 入口按活动配方注入(注入不限次, 覆盖 app sync 回写)
 void mf_stObsLog(void *selfPtr) {
     static uint32_t cnt = 0;
     uintptr_t self = (uintptr_t)selfPtr;
     uintptr_t base = mfProbeMainBase();
     if (!self || !base) return;
-    const MFInjectRecipe *r = mfInjectLoadActive();
+    const MFInjectRecipe *r = g_mfActiveRecipe;
     if (!r) return;
 
     size_t isz = malloc_size((void *)self);
-    // 遍历配方的 ivar 偏移全局, 逐个注入(越界守卫)
     int injected = 0, ntarget = 0;
     uint64_t offs[4] = {0};
     for (int i = 0; i < 4 && r->ivar_globals[i]; i++) {
@@ -354,32 +314,8 @@ static BOOL mfProbePatch16(uintptr_t target, const uint8_t *newBytes, NSString *
     return YES;
 }
 
-// 安装: 开关开时, 按活动配方 hook 其选择器(序言字节匹配才装, 双门控, 无 bundleID 明文)
+// 安装入口(v2.58.157): 状态注入已并入 patch 引擎, 由 mfProbeInstallRecipe(判定点 ⚡)驱动。
+//   保留空 mfProbeInstall 供 ctor 旧调用点安全空转 + 清理旧独立存储。
 void mfProbeInstall(void) {
-    static BOOL done = NO;
-    if (done) return;
-    if (!mfStateObsIsOn()) return;                 // 开关门控(默认关): 静默跳过
-    const MFInjectRecipe *r = mfInjectLoadActive();
-    if (!r || !r->sel_off) return;
-    uintptr_t base = mfProbeMainBase();
-    if (!base) return;
-    uintptr_t target = base + r->sel_off;
-
-    // 序言字节校验(配方提供): 不匹配 = 非目标进程/地址漂移 → 拒绝 hook
-    if (r->prologue && memcmp((void *)target, r->prologue, 16) != 0) return;  // 静默跳过
-
-    g_mfStObsCont = (void *)(target + 0x10);
-
-    uint8_t stub[16];
-    uint32_t ldr = 0x58000050, br = 0xd61f0200;
-    uint64_t tramp = (uint64_t)(uintptr_t)mf_stObsTramp;
-    memcpy(stub, &ldr, 4); memcpy(stub + 4, &br, 4); memcpy(stub + 8, &tramp, 8);
-
-    NSString *err = nil;
-    if (mfProbePatch16(target, stub, &err)) {
-        done = YES;
-        mfLog(@"[stobs] ✅ hook_inject 配方 '%s' 装载 @ %p → tramp %p", r->name, (void *)target, (void *)tramp);
-    } else {
-        mfLog(@"[stobs] ⛔ hook 失败: %@", err);
-    }
+    mfProbePurgeLegacyStore();   // 清 155 遗留的 mfInjectRecipes/mfStateObsEnabled
 }

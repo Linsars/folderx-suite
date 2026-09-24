@@ -858,6 +858,16 @@ void apEntDumpsApply(void) {
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else { apLog(@"[entdump] ⛔ %@ manual 点缺 new 字节, 跳过", d[@"sym"]); continue; }
+        } else if ([d[@"sym"] hasPrefix:@"hookinj@"]) {
+            // v2.58.157: 状态注入点 — 非字节 patch, 而是 hook 选择器入口 + 按配方构造 active 结构。
+            //   配方 JSON 内嵌点位 d[@"recipe"], 交给 MFProbe 执行器装 inline hook(冷启动重打路径)。
+            extern BOOL mfProbeInstallRecipe(NSDictionary *);
+            NSDictionary *rc = d[@"recipe"];
+            if ([rc isKindOfClass:[NSDictionary class]] && mfProbeInstallRecipe(rc))
+                apLog(@"[entdump] ✅ %@ 状态注入 hook 已装(冷启动重打)", d[@"sym"]);
+            else
+                apLog(@"[entdump] ⛔ %@ 状态注入配方无效/hook 失败", d[@"sym"]);
+            continue;   // 非字节 patch, 跳过后续 vm_protect 字节写入逻辑
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         // v2.58.84 (dbg_86 定谳): 序言形态拦截。
         //   F8v2 语义锚定候选点位上入库的是"函数序言"(sub sp,sp,#N / stp X,X,[sp,#-N]! / pacibsp),
@@ -1240,6 +1250,9 @@ static UITextView *g_apEditor = nil;
     if ([shape isEqualToString:@"ptr"]) {
         st.text = @"🔻ptr 禁patch — 指针返回会崩";
         st.textColor = [UIColor systemRedColor];
+    } else if ([shape isEqualToString:@"hookinj"]) {
+        st.text = on ? @"💉✓ 状态注入 — 冷启动自动重打" : @"💉 状态注入(hook+构造active) — 左划⚡";
+        st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemPurpleColor];
     } else if ([shape isEqualToString:@"bool"]) {
         st.text = on ? @"💾✓ Bool判定 — 冷启动自动重打" : @"✓ Bool判定 — 左划⚡(即持久)";
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemTealColor];
@@ -1370,6 +1383,14 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
         NSString *sym = d[@"sym"] ?: @"";
         if (!sym.length) continue;
         if ([d[@"shape"] isEqualToString:@"ptr"]) { skip++; continue; }   // 指针返回型 patch 必崩
+        if ([sym hasPrefix:@"hookinj@"]) {
+            // v2.58.157: 状态注入点 — 非字节 patch, 走 hook 装载路径
+            extern BOOL mfProbeInstallRecipe(NSDictionary *);
+            NSDictionary *rc = d[@"recipe"];
+            if ([rc isKindOfClass:[NSDictionary class]] && mfProbeInstallRecipe(rc)) { mfAppPatchEntDumpSetOn(sym, YES); ok++; }
+            else { fail++; apLog(@"[entdump] 批量 状态注入失败 %@", sym); }
+            continue;
+        }
         NSData *nb = apEntNewBytesFor(d, nil);
         // 序言形态拦截(与单点 ⚡ 同判据 — 4 字节无法安全表达, 毁栈)
         NSString *old = d[@"old"];
@@ -1640,6 +1661,18 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else { mfToast(@"⛔ manual 点缺 new 字节"); apLog(@"[entdump] ⛔ %@ manual 缺 new, 拒打", sym); return; }
+        } else if ([sym hasPrefix:@"hookinj@"]) {
+            // v2.58.157: 状态注入点 — hook 选择器入口 + 按配方构造 active 结构(非字节 patch)。
+            extern BOOL mfProbeInstallRecipe(NSDictionary *);
+            NSDictionary *rc = d[@"recipe"];
+            if ([rc isKindOfClass:[NSDictionary class]] && mfProbeInstallRecipe(rc)) {
+                mfAppPatchEntDumpSetOn(sym, YES);   // ⚡即持久化, 冷启动重打
+                apLog(@"[entdump] ⚡ %@ 状态注入 hook 已装 + 持久化", sym);
+                mfToast(@"⚡ 状态注入已生效 · 冷启动自动重打");
+            } else {
+                mfToast(@"⛔ 状态注入配方无效或 hook 失败");
+            }
+            return;   // 非字节 patch
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }

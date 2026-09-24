@@ -1613,7 +1613,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
     //   注入由 MFProbe hook_inject 执行器落地(hook 选择器入口按配方填结构)。
     // =====================================================================
     {
-        extern BOOL mfInjectRecipeManualAdd(NSDictionary *);
+        extern void mfAppPatchEntDumpsMerge(NSArray *);   // hookinj 判定点入库(并入 patch 引擎)
         const char *PERIODW[] = {"lifetime","perpetual","forever","yearly","annual","monthly","weekly"};
         const int  PERIODP[]  = {0,1,2,3,4,5,6};   // 档位优先级(小=更持久)
         const char *STATUSW[] = {"active","valid","subscribed","purchased","entitled"};
@@ -1827,8 +1827,6 @@ static NSDictionary *mfReconF8v2Scan(void) {
             uint32_t ssz = ((structMax+15)/16)*16;
 
             NSMutableDictionary *recipe = [@{
-                @"name": [NSString stringWithFormat:@"auto_%llx", (unsigned long long)(fh-textVM)],
-                @"bundleMatch": @"", @"on": @(passed==6),
                 @"selOff": @(selOff),
                 @"prologue": prologueHex,
                 // ivar 全局 file_off = VA - 0x100000000(项目统一口径, 见 MFProbe 偏移表)
@@ -1842,7 +1840,21 @@ static NSDictionary *mfReconF8v2Scan(void) {
                   (unsigned long long)selOff, (unsigned long long)(sbIvar?sbIvar-0x100000000ULL:0), ssz, tierName, planPrio, planCount);
 
             if (passed==6) {
-                if (mfInjectRecipeManualAdd(recipe)) { nRecipe++; mfLog(@"[f8v2]   ✅ 配方自动录入(重启目标 app 生效)"); }
+                // v2.58.157: 注册为 hookinj@ 判定点(并入 patch 引擎, 不再独立 prefs)。
+                //   sym=hookinj@<fn off>; recipe 配方 JSON 内嵌; shape=hookinj; 用户在判定点列表 ⚡ 执行。
+                NSString *sym = [NSString stringWithFormat:@"hookinj@%#llx", (unsigned long long)(fh-textVM)];
+                NSDictionary *pt = @{
+                    @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                    @"sym": sym, @"shape": @"hookinj", @"kind": @"sk2recipe",
+                    @"vmaddr": @(selOff + 0x100000000ULL), @"slide": @((long)slide),
+                    @"score": @(97), @"calls": @(0), @"fn": @(fh),
+                    @"note": [NSString stringWithFormat:@"状态注入(hook 选择器+构造 active): plan=%s size=%u", tierName, ssz],
+                    @"recipe": recipe,        // 配方 JSON 内嵌点位 — patch 引擎执行时传给 mfProbeInstallRecipe
+                };
+                extern void mfAppPatchEntDumpsMerge(NSArray *);
+                mfAppPatchEntDumpsMerge(@[pt]);
+                nRecipe++;
+                mfLog(@"[f8v2]   ✅ 注册 hookinj 判定点 %@(默认 off, 判定点列表 ⚡ 执行)", sym);
             } else {
                 mfLog(@"[f8v2]   ⚠️ 自检未满(%d/6), 仅记录不入库(防盲注入崩溃)", passed);
             }
