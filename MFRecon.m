@@ -1731,8 +1731,11 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         if (imm==0) {   // 新块起点(off0 写 disc) — 多块收集, 不再 break
                             if (nBlk+1 < MFRB_MAXBLK) nBlk++;
                             blk[nBlk].sbIvar = reg[rn].val;
-                            // 方案B: disc 值若来自近处 "and wRt,#1"(≤6条) → 记强制点(patch and→movz #1)
-                            if (recentAnd[rt].va && (a - recentAnd[rt].va) <= 6*4) {
+                            // 方案B: disc 值来自近处 "and wRt,#1"(该 rt 最近一次, 函数窗口内) → 记强制点。
+                            //   窗口放宽到 0x800(dbg_148: active 块 disc 距 and 源 240B, 因两处 disc 经 mov 中转
+                            //   共用同一 and 源, 窄窗口漏掉 best 块)。old 字节校验兜底防误 patch(recentAnd 只被
+                            //   and wRt,#1 更新, mov 不动它 → disc 的 rt 查到的即真源 and; 记错则运行时 old 不符拒打)。
+                            if (recentAnd[rt].va && (a - recentAnd[rt].va) <= 0x800) {
                                 blk[nBlk].forceVA  = recentAnd[rt].va;
                                 blk[nBlk].forceOld = recentAnd[rt].word;
                                 blk[nBlk].forceNew = 0x52800000u | (1u<<5) | rt;   // movz wRt,#1
