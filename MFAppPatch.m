@@ -615,17 +615,21 @@ static void apEntDumpsLoad(void) {
         //   (dbg_100/101/105: 点位 patch 字节全落地, UI 三轮零变化;
         //    读侧点在结构体拷贝函数里, 写侧点不在 HMVipProManager 方法族 /
         //    实际权益源是 SK2 currentEntitlements, 与本地点位无关)。
+        // v2.58.163: sk2dat(通用判空噪声, bplayer 35点全不亮)+ sk2dict(强制found挂死,
+        //   dbg_123)整体删除 — 一并列入自愈, 清掉设备上遗留条目。
         NSMutableArray *clean = [NSMutableArray array];
         for (NSDictionary *d in g_entDumps) {
             NSString *sym = d[@"sym"] ?: @"";
             if ([sym hasPrefix:@"sk2ver@"]) continue;
             if ([sym hasPrefix:@"ivargate@"]) continue;
             if ([sym hasPrefix:@"ivargate+@"]) continue;
+            if ([sym hasPrefix:@"sk2dat@"]) continue;
+            if ([sym hasPrefix:@"sk2dict@"]) continue;
             [clean addObject:d];
         }
         if (clean.count != g_entDumps.count) {
             g_entDumps = clean;
-            apLog(@"[entdump] 自愈: 剔除死代码点位(sk2ver/ivargate/ivargate+) 剩余 %lu 条",
+            apLog(@"[entdump] 自愈: 剔除死代码点位(sk2ver/ivargate/ivargate+/sk2dat/sk2dict) 剩余 %lu 条",
                   (unsigned long)g_entDumps.count);
             NSData *dd = [NSJSONSerialization dataWithJSONObject:g_entDumps options:0 error:nil];
             if (dd) mfWritePrefObj([NSString stringWithFormat:@"mfEntDumps_%@", apCurBundleID()],
@@ -771,35 +775,9 @@ void mfAppPatchEntDumpDelete(NSString *sym) {
     apTombstoneAdd(sym);   // v2.58.70: 无论库中是否有, 都记墓碑(防 merge 复活)
     apEntDumpsSave();
 }
-// v2.58.132 (dbg_123 定谳): sk2dict 停打 + 冷启动自动回滚。
-//   根因: sk2dict「强制 found 路径」patch 是**结构性错误** — 字典门的 found 路径
-//   对值对象做间接调用(br x8, bl 0x1000bacb0); key 不在字典里时值槽零化,
-//   强制 found → br x8 跳到 0/垃圾地址 → 主线程挂死(卡主页点不了)。
-//   比预判("不崩但不亮")更糟: 间接调用让空槽直接变挂死。
-//   且 target-app 是服务器授权票据型 — 权益值来自服务器 sync, 本地强制门无效。
-//   → 冷启动重打前: 快照枚举, 回滚已落地的 sk2dict 门(写回 old 字节) + 从库移除。
-static void apSk2dictRollbackPurge(void) {
-    if (!g_entDumps.count) return;
-    NSArray *snap = [g_entDumps copy];
-    NSUInteger nPurge = 0;
-    for (NSDictionary *d in snap) {
-        if (![d[@"sym"] hasPrefix:@"sk2dict@"]) continue;
-        NSString *rberr = nil;
-        NSData *rbOld = ([d[@"old"] isKindOfClass:[NSString class]] && [d[@"old"] length]) ? apHexToBytes(d[@"old"]) : nil;
-        if (rbOld.length >= 4) apSwiftTextPatchDump(d, nil, rbOld, &rberr);
-        [g_entDumps removeObject:d];
-        apTombstoneAdd(d[@"sym"]);   // 精确符号立墓碑, 防侦查 merge 复活
-        nPurge++;
-    }
-    if (nPurge) {
-        apEntDumpsSave();
-        apLog(@"[entdump] ⛔ sk2dict 停打: 回滚并移除 %lu 个(强制 found 路径挂死, dbg_123)", (unsigned long)nPurge);
-    }
-}
 // 冷启动/热触发: 重打所有 on=YES 点位(持久化执行核心)
 void apEntDumpsApply(void) {
     apEntDumpsLoad();
-    apSk2dictRollbackPurge();   // v2.58.132: 先清掉危险的 sk2dict 门
     if (!g_entDumps.count) return;
     for (NSDictionary *d in g_entDumps) {
         if (![d[@"on"] boolValue]) continue;
@@ -825,9 +803,8 @@ void apEntDumpsApply(void) {
             if (rt > 30) rt = 9;    // 容错: 解析失败回落 x9(实测寄存器)
             uint32_t movx = 0xd2800000u | (1u << 5) | rt;
             newBytes = [NSData dataWithBytes:&movx length:4];
-        } else if ([d[@"sym"] hasPrefix:@"sk2pro@"] || [d[@"sym"] hasPrefix:@"sk2dat@"]) {
-            // v2.58.52→58: SK2 数据源装载点 — ldr → movz xT,#1(记录恒存在, 恒解锁)
-            // v2.58.71: sk2dat(B 路)同语义 — sym 格式 sk2dat@0x<off>.<Rt>, 优先用库内 new
+        } else if ([d[@"sym"] hasPrefix:@"sk2pro@"]) {
+            // v2.58.52→58: sk2pro isPro 写点 — movz wRt,#0→#1(恒解锁), 用库内 new
             unsigned rt7 = 0;
             NSRange dot7 = [d[@"sym"] rangeOfString:@"." options:NSBackwardsSearch];
             if (dot7.location != NSNotFound) rt7 = (unsigned)[[d[@"sym"] substringFromIndex:dot7.location + 1] intValue];
@@ -1341,7 +1318,7 @@ static NSData *apEntNewBytesFor(NSDictionary *d, NSString **err) {
         uint32_t movx = 0xd2800000u | (1u << 5) | rt;   // mov x<rt>,#1
         return [NSData dataWithBytes:&movx length:4];
     }
-    if ([sym hasPrefix:@"sk2pro@"] || [sym hasPrefix:@"sk2dat@"]) {
+    if ([sym hasPrefix:@"sk2pro@"]) {
         unsigned rt = 0;
         NSRange dot = [sym rangeOfString:@"." options:NSBackwardsSearch];
         if (dot.location != NSNotFound) rt = (unsigned)[[sym substringFromIndex:dot.location + 1] intValue];
@@ -1349,7 +1326,7 @@ static NSData *apEntNewBytesFor(NSDictionary *d, NSString **err) {
         if (rt <= 30) return mfLeHex(0xD2800000u | (1u << 5) | rt);
         return apHexToBytes(@"370080d2");
     }
-    if ([sym hasPrefix:@"sk2get@"] || [sym hasPrefix:@"sk2vfy@"] || [sym hasPrefix:@"sk2br@"] || [sym hasPrefix:@"sk2dict@"]) {
+    if ([sym hasPrefix:@"sk2get@"] || [sym hasPrefix:@"sk2vfy@"] || [sym hasPrefix:@"sk2br@"]) {
         if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length]) return apHexToBytes(d[@"new"]);
         if ([sym hasPrefix:@"sk2get@"]) return apHexToBytes(@"20008052");   // mov w0,#1
         return apHexToBytes(@"1f2003d5");                                   // nop
@@ -1643,9 +1620,8 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
             if (rt > 30) rt = 9;
             uint32_t movx = 0xd2800000u | (1u << 5) | rt;
             newBytes = [NSData dataWithBytes:&movx length:4];
-        } else if ([sym hasPrefix:@"sk2pro@"] || [sym hasPrefix:@"sk2dat@"]) {
-            // v2.58.52→58: SK2 数据源装载点 — ldr → movz xT,#1(记录恒存在, 恒解锁)
-            // v2.58.71: sk2dat(B 路)同语义 — sym 格式 sk2dat@0x<off>.<Rt>, 优先用库内 new
+        } else if ([sym hasPrefix:@"sk2pro@"]) {
+            // v2.58.52→58: sk2pro isPro 写点 — movz wRt,#0→#1(恒解锁), 用库内 new
             unsigned rt8 = 0;
             NSRange dot8 = [sym rangeOfString:@"." options:NSBackwardsSearch];
             if (dot8.location != NSNotFound) rt8 = (unsigned)[[sym substringFromIndex:dot8.location + 1] intValue];
@@ -1804,7 +1780,7 @@ void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio) {
         for (NSDictionary *dd in all) {
             NSString *sh = dd[@"shape"] ?: @"";
             BOOL sem = [sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2get"]
-                    || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"sk2br"]
+                    || [sh isEqualToString:@"sk2br"]
                     || [sh isEqualToString:@"sk2vfy"]
                     || [sh isEqualToString:@"deepslot"]
                     || [sh isEqualToString:@"ivarRead"] || [sh isEqualToString:@"ivarGetter"]

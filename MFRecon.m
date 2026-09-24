@@ -782,55 +782,6 @@ static NSDictionary *mfReconF8v2Scan(void) {
             }
         }
 
-    // =====================================================================
-    // sk2dat (v2.58.71): B 路 — 无锚数据源判定点扫描。
-    //   动机: sk2pro 门 = 状态播报串(bplayer 类 app 不打 oslog → 门死),
-    //   引擎四路全空但 app 明明是 SK2 流消费者(SK stub=33 实测)。
-    //   B 路零字符串依赖: 全 __TEXT 扫数据源装载形态 ldr xT,[xK,#imm]
-    //   + cmp xT,#0 + cset wS,ne(存在→真方向)。本地实证(hostlog):
-    //   形态A 全 TEXT 仅 4 处, ne 门后剩 1 = 已知真点 0x1000a2f68, 0 误报
-    //   (3 处误报全为 cset eq 反向语义)。patch = movz xT,#1(与 sk2pro 同语义)。
-    // =====================================================================
-    {
-        int nDat = 0;
-        for (uint64_t off = 0; off + 12 <= textSize; off += 4) {
-            uint32_t w1 = *(const uint32_t *)(bd + textFileOff + off);
-            if ((w1 & 0xFFC00000) != 0xF9400000) continue;      // ldr xT,[xK,#imm12]
-            uint32_t T1 = w1 & 0x1F;
-            if (T1 == 31) continue;
-            uint32_t w2 = *(const uint32_t *)(bd + textFileOff + off + 4);
-            if ((w2 & 0xFFFFFC1F) != 0xF100001F) continue;      // cmp xT,#0
-            if (((w2 >> 5) & 0x1F) != T1) continue;
-            uint32_t w3 = *(const uint32_t *)(bd + textFileOff + off + 8);
-            // cset wS,ne 精确判定: 0x1A9F07E0。
-            // v2.58.72 修: 旧掩码 0xFFFF0FFF/0x1A9F07E1 恒假(cset cond 在位15-12,
-            //   被掩掉后低半字节又与 0xE1 比) → 设备上 sk2dat 恒 0 命中(dbg_74)。
-            //   注: CSET 的 cond 字段 = invert(实际cond), 故 ne→字段0(0x1A9F07E0),
-            //   eq→字段1(0x1A9F17E0)。掩码 0xFFFFFFE0 已钉死字段=0, 无需二次判断。
-            if ((w3 & 0xFFFFFFE0) != 0x1A9F07E0) continue;      // cset w*,#ne 精确
-            uint64_t a6 = textVM + off;
-            BOOL dup6 = NO;
-            for (NSDictionary *sp in sk2pts)
-                if ([sp[@"vmaddr"] unsignedLongLongValue] == a6) { dup6 = YES; break; }
-            if (dup6) continue;
-            uint32_t movNew = 0xD2800000u | (1u << 5) | T1;     // movz xT,#1
-            nDat++;
-            [sk2pts addObject:@{
-                @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
-                @"sym": [NSString stringWithFormat:@"sk2dat@%#llx.%u", (unsigned long long)off, T1],
-                @"vmaddr": @(a6),
-                @"slide": @((long)slide),
-                @"score": @(95),
-                @"calls": @(0),
-                @"shape": @"sk2dat",
-                @"kind": @"sk2dat",
-                @"old": mfLeHex(w1),
-                @"new": mfLeHex(movNew),
-            }];
-            mfLog(@"[f8v2] ★sk2dat @%#llx (ldr x%u→movz x%u,#1, cset ne — B 路无锚)", (unsigned long long)a6, T1, T1);
-        }
-        mfLog(@"[f8v2] sk2dat: B 路无锚数据源点=%d 个(cset ne 门, 零字符串依赖)", nDat);
-    }
 
     // =====================================================================
     // sk2br (v2.58.78): 分支粒度判定点 — 打"Pro 门"的分支决策, 不砍函数头。
@@ -1351,124 +1302,6 @@ static NSDictionary *mfReconF8v2Scan(void) {
         }
     }
 
-    // =====================================================================
-    // sk2dict (v2.58.131): ★字典查找门★ — UI 状态真实读取点(dbg_122 定谳)。
-    //   动机(用户定谳"点位还是不对, 不亮"): target-app 的 UI 状态(@Published 初始化,
-    //   Combine.Published.enclosingInstance 实测)经**字典下标 thunk**
-    //   (bl 0x1021ec5d8 型: 5 指令尾部 b 跳转)读权益 key:
-    //     premium_unlocked / permanent_entitlements_authoritative / entitlement_scope
-    //     pro_expires_at_ms / supporter_perks_unlocked / donation_honor_unlocked
-    //     legacy_upgrade_byok/ssh/widget_unlocked / test_entitlements_active
-    //     last_successful_lease_at / byok_unlock_permanent / widget_unlock_permanent
-    //     ssh_server_unlock / verifiedStoreKitProSnapshot.production — 28 个实测。
-    //   旧引擎全漏: ① tbz 段只收 w0(这些是 w1) ② 只在 vfyFn 窗口内扫(这些函数不调 SK)。
-    //   判据(通用, 零 app 硬编码):
-    //     ① 全 __text 扫 tbz/tbnz w0/w1,#0 前向门
-    //     ② 门前 14 条内有**权益 key 串**的 adrp+add(小写关键词: unlock/entitle/
-    //        snapshot/lease/expires/scope/permanent/premium/honor/synced)
-    //   patch 方向(与 Bool 判定门不同 — 字典门 found 语义):
-    //     tbz wN,#0,tgt(未找到→跳回退): NOP = 恒走 found 路径
-    //     tbnz wN,#0,tgt(找到→跳使用): 改无条件 b tgt = 恒走 found 路径
-    //   ⚠ 若 key 不在字典里, found 路径读的是零化槽(Bool=false) — 不崩但不亮;
-    //   此时正确解是**数据侧**(F9 写 key)或 patch 值写入点, 不是门。
-    // =====================================================================
-    {
-        int nDict = 0;
-        // ① 权益 key 串引用点预扫(小写关键词, 静态缓存)
-        static uint64_t *keyRefs = NULL; static int nKeyRefs = 0;
-        if (!keyRefs) {
-            keyRefs = (uint64_t *)malloc(sizeof(uint64_t) * 16384);
-            for (uint64_t q = textVM; q + 8 <= textVM + textSize && nKeyRefs < 16384; q += 4) {
-                uint32_t a1 = *(const uint32_t *)((uintptr_t)q + (uintptr_t)slide);
-                if ((a1 & 0x9F000000) != 0x90000000) continue;
-                uint32_t a2 = *(const uint32_t *)((uintptr_t)(q + 4) + (uintptr_t)slide);
-                if ((a2 & 0xFF800000) != 0x91000000) continue;
-                if (((a2 >> 0) & 0x1F) != ((a2 >> 5) & 0x1F)) continue;
-                int64_t im2 = (int64_t)((((a1 >> 5) & 0x7FFFF) << 2) | ((a1 >> 29) & 3));
-                if (im2 & (1 << 20)) im2 -= (int64_t)(1 << 21);
-                uint64_t tgtStatic = (q & ~0xFFFULL) + ((uint64_t)im2 << 12) + ((a2 >> 10) & 0xFFF);
-                if (tgtStatic < baseVM || tgtStatic >= baseVM + 128ull * 1024 * 1024) continue;
-                const char *str = (const char *)(tgtStatic + (uint64_t)slide);
-                if (strchr(str, '/') || strstr(str, ".swift")) continue;
-                if (strstr(str, "unlock") || strstr(str, "entitle") ||
-                    strstr(str, "snapshot") || strstr(str, "lease") ||
-                    strstr(str, "expires") || strstr(str, "scope") ||
-                    strstr(str, "permanent") || strstr(str, "premium") ||
-                    strstr(str, "honor") || strstr(str, "synced")) {
-                    keyRefs[nKeyRefs++] = q;
-                }
-            }
-            mfLog(@"[f8v2] 字典 key 串引用点预扫: %d 个", nKeyRefs);
-        }
-        // ② 全 __text 扫门
-        for (uint64_t p = textVM; p + 4 <= textVM + textSize; p += 4) {
-            uint32_t w = *(const uint32_t *)((uintptr_t)p + (uintptr_t)slide);
-            if ((w & 0x7E000000) != 0x36000000) continue;   // tbz/tbnz
-            uint32_t rt = w & 0x1F;
-            if (rt != 0 && rt != 1) continue;               // 只收 w0/w1
-            uint32_t bit = ((w >> 19) & 0x1F) | ((w >> 26) & 0x20);
-            if (bit != 0) continue;                         // 只收 bit0 (Bool)
-            int32_t i14 = (int32_t)((w >> 5) & 0x3FFF);
-            if (i14 & (1 << 13)) i14 -= (1 << 14);
-            uint64_t tTgt = p + ((uint64_t)i14 << 2);
-            if (tTgt <= p) continue;                        // 前向
-            // 门前 8 条内找 bl, 且 bl 目标必须是**字典 thunk**(短函数尾部 b/br, 无
-            //   序言/无内部 bl)。排除 BillingForcePermanentVerifyFailure 这类完整函数
-            //   (其 tbz 语义是"未设 flag → 正常路径", NOP 会反向强制失败)。
-            uint64_t blAt = 0;
-            for (int k = 1; k <= 8; k++) {
-                if (p < textVM + (uint64_t)k * 4) break;
-                uint32_t bw = *(const uint32_t *)((uintptr_t)(p - k * 4) + (uintptr_t)slide);
-                if ((bw & 0xFC000000) != 0x94000000) continue;
-                int64_t bim = (int64_t)(bw & 0x3FFFFFF);
-                if (bim & (1 << 25)) bim -= (int64_t)(1 << 26);
-                uint64_t bt = p - (uint64_t)k * 4 + ((uint64_t)bim << 2);
-                if (bt < textVM || bt >= textVM + textSize) continue;
-                BOOL isThunk = NO;
-                for (int ti = 0; ti < 6; ti++) {
-                    uint32_t tw = *(const uint32_t *)((uintptr_t)(bt + (uint64_t)ti * 4) + (uintptr_t)slide);
-                    if ((tw & 0xFC000000) == 0x94000000) break;                    // 内部 bl → 否
-                    if (tw == 0xD65F03C0) break;                                    // ret → 否
-                    if ((tw & 0x7FC00000) == 0x29800000 && ((tw >> 5) & 0x1F) == 31) break;  // stp [sp] → 否
-                    if ((tw & 0xFF8003FF) == 0xD10003FF && ((tw >> 10) & 0xFFF)) break;  // sub sp → 否
-                    if ((tw & 0xFC000000) == 0x14000000) { isThunk = YES; break; }  // 尾部 b → 是
-                    if ((tw & 0xFFFFFC1F) == 0xD61F0000) { isThunk = YES; break; }  // 尾部 br → 是
-                }
-                if (isThunk) { blAt = bt; break; }
-            }
-            if (!blAt) continue;
-            // 门前 14 条内 key 引用点(keyRefs 升序, 二分找 [kLo, p-8] 区间内任一)
-            uint64_t kLo = (p > textVM + 14ull * 4) ? p - 14ull * 4 : textVM;
-            uint64_t kHi = p - 8;
-            int lo = 0, hi = nKeyRefs;
-            while (lo < hi) {                       // lower_bound(kLo)
-                int mid = (lo + hi) >> 1;
-                if (keyRefs[mid] < kLo) lo = mid + 1; else hi = mid;
-            }
-            if (lo >= nKeyRefs || keyRefs[lo] > kHi) continue;
-            // 去重
-            // 去重
-            BOOL dup = NO;
-            for (NSDictionary *e in sk2pts)
-                if ([e[@"vmaddr"] unsignedLongLongValue] == p) { dup = YES; break; }
-            if (dup) continue;
-            BOOL isTbz = ((w >> 24) & 1) == 0;
-            uint32_t newW = 0xD503201Fu;    // tbz → NOP(恒 found 路径)
-            if (!isTbz) {
-                int64_t disp = (int64_t)(tTgt - p) >> 2;    // tbnz → 无条件 b(恒跳 found 路径)
-                newW = 0x14000000u | ((uint32_t)disp & 0x03FFFFFFu);
-            }
-            nDict++;
-            // v2.58.132 (dbg_123 定谳): sk2dict 门**只记录不入库**。
-            //   「强制 found 路径」patch 会挂死(空值槽间接调用 br x8 → 跳 0/垃圾),
-            //   且 target-app 是服务器授权票据型, 本地强制门无效。此处仅作侦查记录,
-            //   不再加入 sk2pts(不进判定点列表/不可 patch)。
-            mfLog(@"[f8v2] ★sk2dict @%#llx (%@, 仅记录不入库 — 强制 found 会挂死)",
-                  (unsigned long long)(p - textVM),
-                  ((w >> 24) & 1) == 0 ? @"tbz" : @"tbnz");
-        }
-        mfLog(@"[f8v2] sk2dict: 字典查找门=%d 个(仅记录, 不入库)", nDict);
-    }
 
     // v2.58.160: pro 校验器 fn 列表 — 函数级作用域, sk2plan 段填充, sk2recipe 段遍历。
     //   (真机 dbg_146: sk2recipe 原遍历 sk2pts 比较门 fn, 漏掉有 active 构造块但无比较门的校验器)
@@ -2929,7 +2762,7 @@ NSDictionary *mfReconFingerprint(void) {
     BOOL sk2LocalType = NO;
     {
         NSUInteger nS = 0;
-        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"] || [f[@"shape"] isEqualToString:@"sk2vfy"]
+        for (NSDictionary *f in sk2pts) if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"] || [f[@"shape"] isEqualToString:@"sk2br"] || [f[@"shape"] isEqualToString:@"sk2vfy"]
                 ) nS++;
         if (!cloudBrands.count && !mach && nS >= 1 &&
             (mfRecFind(p, n, "verification failed") || mfRecFind(p, n, "could not be verified") || mfRecFind(p, n, "snapshot verification")))
@@ -2939,7 +2772,7 @@ NSDictionary *mfReconFingerprint(void) {
     //   /iap/transactions 等) → 权益状态由**自家后端**下发, 本地只有 Codable 解码后的镜像字段
     //   (无代码引用=纯反射串) + 容器 Preferences 为空 → 指令级 patch 到不了判定链。
     //   判据: ①自研 /iap/* 端点 ≥1 条 ②有 VIP/权益类 Codable 字段(纯反射) ③无云 SDK 品牌
-    //   → 判决「服务端权威」并抑制 sk2dat 噪声点(通用判空, 撒出去=让用户白试)。
+    //   → 判决「服务端权威」并跳过入库(服务端权威 app 本地判定点无意义, 判型总闸拦下)。
     //   注: 提前到此计算 — merge 抑制(下方)与 verdict(末尾)都要用, 单一事实来源。
     //   v2.58.76 修正(用户定案): 旧判据用 vip_info/vip_type/vipStatus 当"权益 Codable 字段"
     //   是错的 — 那些是**百度/115 网盘** API 字段(邻居 baidu_name/netdisk_name/rt_space_info),
@@ -2962,7 +2795,7 @@ NSDictionary *mfReconFingerprint(void) {
         for (NSDictionary *f in sk2pts) {
             NSString *sh = f[@"shape"] ?: @"";
             if ([sh isEqualToString:@"sk2pro"] || [sh isEqualToString:@"sk2get"]
-                || [sh isEqualToString:@"sk2dat"] || [sh isEqualToString:@"deepslot"]) nLocalPts++;
+                || [sh isEqualToString:@"deepslot"]) nLocalPts++;
         }
         // v2.58.116: 加 sk2vfy 也计入本地链(它是 SK2 验证判定门, 属本地判定)
         NSUInteger nVfyPts = 0;
@@ -3054,9 +2887,13 @@ NSDictionary *mfReconFingerprint(void) {
             if (!nsyms || !symoff) continue;
             const struct nlist_64 *syms = (const struct nlist_64 *)((const uint8_t *)h + symoff + lDelta);
             const char *strtab = (const char *)((const uint8_t *)h + stroff + lDelta);
+            // v2.58.163: 去过拟合 — 原 kEntPats 写死 pyide 专属类名(ProAccessGuard/
+            //   hasValidD5Token 等), 换 app 命中≈0。改用通用权益语义词根(跨 app 稳定):
+            //   结构门(Swift mangled + Sb Bool 返回 + tF/vg 结尾)已是主过滤, 词根只作语义收窄。
             static NSArray *kEntPats; static dispatch_once_t o;
-            dispatch_once(&o, ^{ kEntPats = @[@"ProAccessGuard", @"EntitlementOracle", @"hasValidD5Token",
-                                              @"03hascD03now", @"hasProAccess"]; });
+            dispatch_once(&o, ^{ kEntPats = @[@"Pro", @"pro", @"Premium", @"premium", @"VIP", @"vip",
+                                              @"Entitle", @"entitle", @"Unlock", @"unlock",
+                                              @"Subscri", @"subscri", @"Purchas", @"purchas", @"Member", @"member"]; });
             // v2.58.121: strtab 预筛 — dbg_114 定谳: ScriptingKit nsyms=120 万,
             //   逐符号 strlen+strcmp 要数秒~数十秒(卡死真凶)。改为先在 strtab 里
             //   一次 memmem 找关键字(120 万符号的 strtab 42MB, memmem 毫秒级);
@@ -3181,36 +3018,7 @@ NSDictionary *mfReconFingerprint(void) {
             RECON_P("merge-enter");
             NSArray *sk2ptsRef = sk2pts;
             extern void mfAppPatchEntDumpsMerge(NSArray *);
-            // v2.58.75: 服务端权威型抑制代码点入库 — 形态门(sk2dat)在自研服务端权益 app 上
-            //   全是通用判空, 入库=让用户白试(bplayer 35 点全试不亮, dbg_77 实证)。
-            //   sk2pro/sk2get(有字符串锚的写点/读侧)不受影响, 仅滤 sk2dat。
-            // v2.58.76: sk2dat(纯指令形态门)降级为兜底 — 只要存在更强证据(语义锚定点或
-            //   其他 shape), 就不再把通用判空形态点塞给用户。dbg_77 实证: bplayer
-            //   35 个 sk2dat 全 ⚡ 不亮(它们是 ldr+cmp#0+cset ne 的通用判空, 与内购无关)。
             NSArray *mergePts = sk2ptsRef;
-            {
-                BOOL haveBetter = NO;
-                for (NSDictionary *f in sk2ptsRef) {
-                    NSString *sh = f[@"shape"] ?: @"";
-                    // v2.58.78: sk2br(SKU 锚 + 分支粒度)= 强证据; 只有它才压 sk2dat
-                    if ([sh isEqualToString:@"sk2br"] || [sh isEqualToString:@"sk2vfy"]) { haveBetter = YES; break; }
-                    if (![sh isEqualToString:@"sk2dat"] && sh.length) { haveBetter = YES; break; }
-                }
-                if (!haveBetter && [candsRef isKindOfClass:[NSArray class]]) {
-                    for (NSDictionary *f in candsRef) {
-                        if ([f[@"score"] intValue] >= 3) { haveBetter = YES; break; }
-                        if ([f[@"shape"] length]) { haveBetter = YES; break; }
-                    }
-                }
-                if (haveBetter) {
-                    mergePts = [sk2ptsRef filteredArrayUsingPredicate:
-                                [NSPredicate predicateWithFormat:@"shape != 'sk2dat'"]];
-                    if (mergePts.count != sk2ptsRef.count)
-                        [lines addObject:[NSString stringWithFormat:
-                            @"形态门兜底: 已抑制 %lu 个无锚 sk2dat(通用判空形态, 有更强锚定证据时不上场)",
-                            (unsigned long)(sk2ptsRef.count - mergePts.count)]];
-                }
-            }
             RECON_P("merge-predone");
             if ([mergePts isKindOfClass:[NSArray class]] && mergePts.count) {
                 mfAppPatchEntDumpsMerge(mergePts);
@@ -3315,7 +3123,7 @@ NSDictionary *mfReconFingerprint(void) {
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
-            || [f[@"shape"] isEqualToString:@"sk2dat"] || [f[@"shape"] isEqualToString:@"sk2br"] || [f[@"shape"] isEqualToString:@"sk2vfy"]
+            || [f[@"shape"] isEqualToString:@"sk2br"] || [f[@"shape"] isEqualToString:@"sk2vfy"]
             ) nCodePts++;
     // v2.58.117: 真门计数 — 只算 score>=99 的 sk2vfy(真门形态: Optional tag 解包+retain)。
     //   dbg_108 用户反馈: "代码判定型 65 点"里绝大多数是通用噪声, 数字虚高误导。
