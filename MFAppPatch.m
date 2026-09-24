@@ -660,10 +660,12 @@ void mfAppPatchEntDumpsEndRound(void) {
     for (NSDictionary *m in g_entDumps) {
         BOOL seen = [m[@"seen"] boolValue];
         BOOL on = [m[@"on"] boolValue];
-        // v2.58.140: manual 点豁免陈旧剔除 — ctor 录入的逆向成果不是侦查扫出的(seen 恒 NO),
-        //   但它是人工确权的固定点, 不该被侦查轮次当陈旧清掉(131 bug: 录入即被剔除, patch 从没执行)。
-        BOOL isManual = [m[@"shape"] isEqualToString:@"manual"] || [m[@"sym"] hasPrefix:@"manual@"];
-        if (!seen && !on && !isManual) {
+        // v2.58.140/157: 特殊固定点豁免陈旧剔除 — manual(ctor 逆向录入) 与 hookinj(sk2recipe 状态注入配方)
+        //   都不是 F8v2 主流程每轮 merge 的常规点(seen 语义不覆盖它们), 但是人工确权/侦查专段产出的
+        //   有效点, 不该被侦查轮次当陈旧清掉。dbg_131 manual 踩过一次, dbg_144 hookinj 同款复现。
+        BOOL isFixed = [m[@"shape"] isEqualToString:@"manual"] || [m[@"sym"] hasPrefix:@"manual@"]
+                     || [m[@"shape"] isEqualToString:@"hookinj"] || [m[@"sym"] hasPrefix:@"hookinj@"];
+        if (!seen && !on && !isFixed) {
             apLog(@"[entdump] ⚰ 陈旧点剔除 %@ (本轮未扫出且未持久化)", m[@"sym"]);
             continue;
         }
