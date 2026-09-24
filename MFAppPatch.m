@@ -664,7 +664,8 @@ void mfAppPatchEntDumpsEndRound(void) {
         //   都不是 F8v2 主流程每轮 merge 的常规点(seen 语义不覆盖它们), 但是人工确权/侦查专段产出的
         //   有效点, 不该被侦查轮次当陈旧清掉。dbg_131 manual 踩过一次, dbg_144 hookinj 同款复现。
         BOOL isFixed = [m[@"shape"] isEqualToString:@"manual"] || [m[@"sym"] hasPrefix:@"manual@"]
-                     || [m[@"shape"] isEqualToString:@"hookinj"] || [m[@"sym"] hasPrefix:@"hookinj@"];
+                     || [m[@"shape"] isEqualToString:@"hookinj"] || [m[@"sym"] hasPrefix:@"hookinj@"]
+                     || [m[@"shape"] isEqualToString:@"discforce"] || [m[@"sym"] hasPrefix:@"discforce@"];   // v2.58.161: 方案B点同豁免
         if (!seen && !on && !isFixed) {
             apLog(@"[entdump] ⚰ 陈旧点剔除 %@ (本轮未扫出且未持久化)", m[@"sym"]);
             continue;
@@ -870,6 +871,11 @@ void apEntDumpsApply(void) {
             else
                 apLog(@"[entdump] ⛔ %@ 状态注入配方无效/hook 失败", d[@"sym"]);
             continue;   // 非字节 patch, 跳过后续 vm_protect 字节写入逻辑
+        } else if ([d[@"sym"] hasPrefix:@"discforce@"]) {
+            // v2.58.161 方案B: disc 授权 bool 强制 — and wRt,#1 → movz wRt,#1(4字节), 走标准 vm_protect 字节 patch。
+            //   令 resilient codegen 宿主用自己的运行时偏移构造 active(disc 恒 1)。old/new 自带, 走下方校验+patch。
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length]) newBytes = apHexToBytes(d[@"new"]);
+            else { apLog(@"[entdump] ⛔ %@ discforce 缺 new 字节, 跳过", d[@"sym"]); continue; }
         } else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         // v2.58.84 (dbg_86 定谳): 序言形态拦截。
         //   F8v2 语义锚定候选点位上入库的是"函数序言"(sub sp,sp,#N / stp X,X,[sp,#-N]! / pacibsp),
@@ -1255,6 +1261,9 @@ static UITextView *g_apEditor = nil;
     } else if ([shape isEqualToString:@"hookinj"]) {
         st.text = on ? @"💉✓ 状态注入 — 冷启动自动重打" : @"💉 状态注入(hook+构造active) — 左划⚡";
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemPurpleColor];
+    } else if ([shape isEqualToString:@"discforce"]) {
+        st.text = on ? @"💉✓ 状态注入·B — 冷启动自动重打" : @"💉 状态注入·B(disc强制active) — 左划⚡";
+        st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemPurpleColor];
     } else if ([shape isEqualToString:@"bool"]) {
         st.text = on ? @"💾✓ Bool判定 — 冷启动自动重打" : @"✓ Bool判定 — 左划⚡(即持久)";
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemTealColor];
@@ -1344,6 +1353,10 @@ static NSData *apEntNewBytesFor(NSDictionary *d, NSString **err) {
         if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length]) return apHexToBytes(d[@"new"]);
         if ([sym hasPrefix:@"sk2get@"]) return apHexToBytes(@"20008052");   // mov w0,#1
         return apHexToBytes(@"1f2003d5");                                   // nop
+    }
+    if ([sym hasPrefix:@"manual@"] || [sym hasPrefix:@"discforce@"]) {   // v2.58.161: 精确字节点(自带 new), 无兜底
+        if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length]) return apHexToBytes(d[@"new"]);
+        if (err) *err = @"缺 new 字节"; return nil;
     }
     return apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
 }
@@ -1675,6 +1688,10 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
                 mfToast(@"⛔ 状态注入配方无效或 hook 失败");
             }
             return;   // 非字节 patch
+        } else if ([sym hasPrefix:@"discforce@"]) {
+            // v2.58.161 方案B: disc 授权 bool 强制 and→movz#1(4字节), 走下方标准 vm_protect + old 校验路径。
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length]) newBytes = apHexToBytes(d[@"new"]);
+            else { mfToast(@"⛔ discforce 缺 new 字节"); return; }
         } else {
             newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret
         }

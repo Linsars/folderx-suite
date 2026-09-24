@@ -1680,9 +1680,14 @@ static NSDictionary *mfReconF8v2Scan(void) {
             //   字段最多 且 含 period+status 串 = 真 active 块。这是"照抄布局"不依赖块顺序的关键。
             #define MFRB_MAXBLK 8
             struct { uint64_t sbIvar; uint64_t fOff[32]; int fTy[32]; uint64_t fVal[32]; int nF;
-                     uint32_t structMax; int nPeriod, nStatus, nInput; } blk[MFRB_MAXBLK];
+                     uint32_t structMax; int nPeriod, nStatus, nInput;
+                     uint64_t forceVA; uint32_t forceOld, forceNew; } blk[MFRB_MAXBLK];   // v2.58.161 方案B: disc 授权 bool 强制点
             memset(blk, 0, sizeof(blk));
             int nBlk = -1;   // 当前块索引(-1=还没遇到 disc)
+            // v2.58.161 方案B: 追踪最近的 "and wRd,wS,#1"(取授权 bool 低位) — disc 值来源。
+            //   patch 成 movz wRd,#1 → 宿主用它自己的运行时偏移构造 active(绕过"我算运行时偏移")。
+            struct { uint64_t va; uint32_t word; } recentAnd[32];
+            memset(recentAnd, 0, sizeof(recentAnd));
 
             uint64_t qEnd = fh + 0x800; if (qEnd > textVM + textSize) qEnd = textVM + textSize;
             for (uint64_t a = fh; a + 4 <= qEnd; a += 4) {
@@ -1716,6 +1721,9 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 }
                 if ((w & 0xFFC00000) == 0xB9800000) { reg[w&0x1F].kind=3; reg[w&0x1F].val=0; continue; }   // LDRSW xt,[xn,#imm]
                 if ((w & 0xFFE00C00) == 0xF8400000) { reg[w&0x1F].kind=3; reg[w&0x1F].val=0; continue; }   // LDUR xt,[xn,#simm]
+                // v2.58.161 方案B: AND wRd,wRn,#1(取 bool 低位) → 记为该寄存器最近的授权-bool 定义点。
+                //   编码: 32-bit AND(imm) N=0 immr=0 imms=0 → 0x12000000 | (Rn<<5) | Rd
+                if ((w & 0xFFFFFC00) == 0x12000000) { int rd=w&0x1F; recentAnd[rd].va=a; recentAnd[rd].word=w; }
                 // STRB imm: strb wt,[xn,#imm]
                 if ((w & 0xFFC00000) == 0x39000000) {
                     int rt=w&0x1F,rn=(w>>5)&0x1F; uint32_t imm=(w>>10)&0xFFF;
@@ -1723,6 +1731,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         if (imm==0) {   // 新块起点(off0 写 disc) — 多块收集, 不再 break
                             if (nBlk+1 < MFRB_MAXBLK) nBlk++;
                             blk[nBlk].sbIvar = reg[rn].val;
+                            // 方案B: disc 值若来自近处 "and wRt,#1"(≤6条) → 记强制点(patch and→movz #1)
+                            if (recentAnd[rt].va && (a - recentAnd[rt].va) <= 6*4) {
+                                blk[nBlk].forceVA  = recentAnd[rt].va;
+                                blk[nBlk].forceOld = recentAnd[rt].word;
+                                blk[nBlk].forceNew = 0x52800000u | (1u<<5) | rt;   // movz wRt,#1
+                            }
                         }
                         if (nBlk < 0) continue;   // off!=0 但还没起块 — 忽略
                         uint64_t v = (reg[rt].kind==1)?(reg[rt].val&0xFF):1;
@@ -1795,6 +1809,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
             BOOL haveValidity = NO;
             for (int i=0;i<nF;i++) if (fieldsTy[i]==5) { haveValidity=YES; break; }
             int nPeriod = blk[best].nPeriod, nStatus = blk[best].nStatus;
+            uint64_t forceVA = blk[best].forceVA; uint32_t forceOld = blk[best].forceOld, forceNew = blk[best].forceNew;   // 方案B 强制点(择优块的)
             if (!planVA) { mfLog(@"[f8v2] sk2recipe fn=%#llx: 无 plan 常量, 跳过", (unsigned long long)(fh-textVM)); continue; }
 
             // 组装 recipe JSON fields(语义化): period→按档位覆盖成选中计划的 tier 词
@@ -1869,6 +1884,31 @@ static NSDictionary *mfReconF8v2Scan(void) {
             BOOL ck_pro = NO;
             if (selPro) { ck_pro=YES; for(int e=0;e<4;e++){ uint32_t iw=*(const uint32_t*)(selPro+e*4); BOOL safe=((iw&0xFF8003FF)==0xD10003FF)||((iw&0xFFC003E0)==0xA90003E0)||((iw&0xFFC003E0)==0xA98003E0)||((iw&0xFFC003E0)==0x6D0003E0)||((iw&0xFFC003E0)==0x6D8003E0)||((iw&0xFFC003E0)==0xF90003E0)||((iw&0x7F800000)==0x52800000)||((iw&0xFF800000)==0xD2800000)||iw==0xD503201F; if(!safe){ck_pro=NO;break;} } }
             int passed = ck_disc+ck_name+ck_valid+ck_sel+ck_struct+ck_pro;
+
+            // ═══ 方案B(v2.58.161): disc 授权 bool 强制 patch ═══
+            //   适用 resilient codegen(新版): ivar 偏移运行时才知 → hookinj 的静态注入落点失效(sel=0/ivar=0)。
+            //   方案B 不注入结构, 只把 disc 值来源的 "and wRt,#1" patch 成 "movz wRt,#1" →
+            //   宿主用它自己的运行时偏移构造 active(disc 恒=1), 绕过"我算运行时偏移"这个死结。
+            //   门槛比 hookinj 低且独立: 只需 disc 块 + period/status(证明是权益构造) + 强制点定位到。
+            //   old 字节自带(运行时 patch 前校验), 防漂移/误 patch。是 vm_protect 字节 patch, 走判定点标准路径。
+            BOOL bReady = (forceVA != 0) && ck_disc && (nPeriod>=1) && (nStatus>=1);
+            if (passed != 6 && bReady) {
+                NSString *sym = [NSString stringWithFormat:@"discforce@%#llx", (unsigned long long)(forceVA - 0x100000000ULL)];
+                NSDictionary *pt = @{
+                    @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                    @"sym": sym, @"shape": @"discforce", @"kind": @"sk2recipe",
+                    @"vmaddr": @(forceVA), @"slide": @((long)slide),
+                    @"old": mfLeHex(forceOld), @"new": mfLeHex(forceNew),
+                    @"score": @(96), @"calls": @(0), @"fn": @(fh),
+                    @"note": [NSString stringWithFormat:@"状态注入·方案B(disc授权bool强制): 校验器 %#llx 内 and→movz#1, 令宿主构造 active(适配运行时偏移)", (unsigned long long)(fh-textVM)],
+                };
+                extern void mfAppPatchEntDumpsMerge(NSArray *);
+                mfAppPatchEntDumpsMerge(@[pt]);
+                nRecipe++;
+                mfLog(@"[f8v2] ★sk2recipe fn=%#llx: 自检 %d/6 不足但 ★方案B就绪(disc强制点 %#llx: %08x→%08x) → 注册 %@",
+                      (unsigned long long)(fh-textVM), passed, (unsigned long long)(forceVA-0x100000000ULL), forceOld, forceNew, sym);
+                continue;
+            }
 
             NSString *prologueHex = @"";
             if (selPro) { NSMutableString *ph=[NSMutableString string]; for(int e=0;e<16;e++)[ph appendFormat:@"%02x",selPro[e]]; prologueHex=ph; }
