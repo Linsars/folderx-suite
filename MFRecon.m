@@ -1470,6 +1470,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
         mfLog(@"[f8v2] sk2dict: 字典查找门=%d 个(仅记录, 不入库)", nDict);
     }
 
+    // v2.58.160: pro 校验器 fn 列表 — 函数级作用域, sk2plan 段填充, sk2recipe 段遍历。
+    //   (真机 dbg_146: sk2recipe 原遍历 sk2pts 比较门 fn, 漏掉有 active 构造块但无比较门的校验器)
+    NSMutableArray *g_sk2ProValidatorFns = [NSMutableArray array];
+
     // =====================================================================
     // sk2plan: 名称比对门 — 服务器票据/内存状态型 app 的通用判定指纹。
     //   动机: 目标判定非单一 bool 门, 而是枚举状态 ⇄ 名称比对,
@@ -1565,6 +1569,9 @@ static NSDictionary *mfReconF8v2Scan(void) {
                   (unsigned long long)fh, (unsigned long)arr.count, names,
                   isProValidator ? @" ★真 pro 校验器" : @"");
             if (!isProValidator) continue;   // 只入库真 pro 校验器(含 pro_year/_2026), 泛计划名簇不动
+            [g_sk2ProValidatorFns addObject:@(fh)];   // v2.58.160: 收集 pro 校验器 fn → sk2recipe 遍历源
+                                                       //   (真机 dbg_146 定谳: sk2recipe 遍历 sk2pts 比较门 fn 漏掉
+                                                       //    有 active 构造块但无比较门的校验器, 如新版 0x102a5049c)
             // 该函数内定位计划名比较门: bl + 紧跟 tbz w0,#0 前向, 且门前 28 条有 small-string 计划名
             uint64_t qEnd = fh + 0x8000; if (qEnd > textVM + textSize) qEnd = textVM + textSize;
             for (uint64_t g = fh; g + 4 <= qEnd; g += 4) {
@@ -1659,9 +1666,11 @@ static NSDictionary *mfReconF8v2Scan(void) {
         // ② 遍历 sk2plan 已入库的 pro 校验器函数(sk2pts 里 kind=sk2plan 的 fn), 提取 active 构造块
         NSMutableSet *doneFns = [NSMutableSet set];
         int nRecipe = 0;
-        for (NSDictionary *pt in [sk2pts copy]) {
-            if (![pt[@"kind"] isEqualToString:@"sk2plan"]) continue;
-            uint64_t fh = [pt[@"fn"] unsignedLongLongValue];
+        // v2.58.160: 遍历源 = sk2plan 识别的全部 pro 校验器 fn(独立于比较门), 而非 sk2pts。
+        //   真机 dbg_146 定谳: 有 active 构造块的校验器(如新版 0x102a5049c)不一定有计划名比较门,
+        //   遍历 sk2pts(比较门 fn)会漏掉它 → 0 配方。改遍历 g_sk2ProValidatorFns 全集。
+        for (NSNumber *fnNum in g_sk2ProValidatorFns) {
+            uint64_t fh = [fnNum unsignedLongLongValue];
             if (!fh || [doneFns containsObject:@(fh)]) continue;
             [doneFns addObject:@(fh)];
 
