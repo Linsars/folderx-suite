@@ -1616,7 +1616,11 @@ static NSDictionary *mfReconF8v2Scan(void) {
         extern void mfAppPatchEntDumpsMerge(NSArray *);   // hookinj 判定点入库(并入 patch 引擎)
         const char *PERIODW[] = {"lifetime","perpetual","forever","yearly","annual","monthly","weekly"};
         const int  PERIODP[]  = {0,1,2,3,4,5,6};   // 档位优先级(小=更持久)
-        const char *STATUSW[] = {"active","valid","subscribed","purchased","entitled"};
+        // 状态语义槽词表: 订阅生命周期词(正向+负向都算"状态槽")。宿主可能条件构造 active/expired,
+        //   我要构造授权态 → 不管它那条分支写哪个, 只要这个槽装的是生命周期词, 组装时强制填 "active"。
+        const char *STATUSW[] = {"active","valid","subscribed","purchased","entitled",
+                                 "expired","inactive","cancelled","canceled","revoked","none","trial","grace","lapsed"};
+        const int STATUSW_N = 14;
 
         // —— 局部数据流状态: 每寄存器一个 (kind,val) ——
         //   kind: 0=unknown 1=imm 2=addr 3=ivaroff(=某ivar全局VA) 4=structbase(=ivar全局VA)
@@ -1662,14 +1666,16 @@ static NSDictionary *mfReconF8v2Scan(void) {
             [doneFns addObject:@(fh)];
 
             RegV reg[32]; memset(reg, 0, sizeof(reg));
-            uint64_t sbIvar = 0;          // 当前 structbase 对应的 ivar 全局 VA
-            uint64_t fieldsOff[32]; int fieldsTy[32]; uint64_t fieldsVal[32]; int nF = 0;
-            uint64_t discOff = 0; BOOL haveDisc = NO; uint32_t structMax = 0;
-            uint64_t nameCntOff = 0, namePtrOff = 0; int nInput = 0;
-            uint64_t validityOff = 0; BOOL haveValidity = NO;
-            int nPeriod = 0, nStatus = 0;
+            // v2.58.159: 多块收集 — 校验器可能构造多个状态块(前导小块/active/free), 顺序因 codegen 而异。
+            //   不再假设"第一块=active"(dbg_142 旧规则在新版切错块)。收集所有 disc 块, 最后择优:
+            //   字段最多 且 含 period+status 串 = 真 active 块。这是"照抄布局"不依赖块顺序的关键。
+            #define MFRB_MAXBLK 8
+            struct { uint64_t sbIvar; uint64_t fOff[32]; int fTy[32]; uint64_t fVal[32]; int nF;
+                     uint32_t structMax; int nPeriod, nStatus, nInput; } blk[MFRB_MAXBLK];
+            memset(blk, 0, sizeof(blk));
+            int nBlk = -1;   // 当前块索引(-1=还没遇到 disc)
 
-            uint64_t qEnd = fh + 0x600; if (qEnd > textVM + textSize) qEnd = textVM + textSize;
+            uint64_t qEnd = fh + 0x800; if (qEnd > textVM + textSize) qEnd = textVM + textSize;
             for (uint64_t a = fh; a + 4 <= qEnd; a += 4) {
                 uint32_t w = *(const uint32_t *)((uintptr_t)a + (uintptr_t)slide);
                 // MOVZ
@@ -1682,76 +1688,105 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 if ((w & 0x9F000000) == 0x90000000) { int rd=w&0x1F; int64_t immlo=(w>>29)&3,immhi=(w>>5)&0x7FFFF; int64_t imm=(immhi<<2)|immlo; if(imm&(1<<20))imm-=(1<<21); reg[rd].kind=2; reg[rd].val=(a&~0xFFFULL)+(imm<<12); continue; }
                 // ADD imm (64)
                 if ((w & 0xFFC00000) == 0x91000000) { int rd=w&0x1F,rn=(w>>5)&0x1F; uint64_t imm=((w>>10)&0xFFF)<<(((w>>22)&1)?12:0); if(reg[rn].kind==2){reg[rd].kind=2;reg[rd].val=reg[rn].val+imm;}else reg[rd].kind=0; continue; }
-                // ADD shifted reg: addr xBase, xSelf, xB
-                if ((w & 0xFF200000) == 0x8B000000) { int rd=w&0x1F,rm=(w>>16)&0x1F; if(reg[rm].kind==3){reg[rd].kind=4;reg[rd].val=reg[rm].val;}else reg[rd].kind=0; continue; }
-                // LDR imm (64): xt = [xn,#imm]
-                if ((w & 0xFFC00000) == 0xF9400000) { int rt=w&0x1F,rn=(w>>5)&0x1F; uint64_t imm=((w>>10)&0xFFF)*8; if(reg[rn].kind==2){reg[rt].kind=3;reg[rt].val=reg[rn].val+imm;}else reg[rt].kind=0; continue; }
+                // ADD xd, xn, xm(reg): 任一操作数是 kind3(loaded 偏移) → structbase(照抄, 覆盖两种 codegen)
+                //   旧式: add self, <ldr 常量ivar偏移>(kind3.val=全局VA静态可知)
+                //   新式: add self, <ldrsw 元数据偏移>(kind3.val=0, Swift resilient, 偏移运行时才知)
+                if ((w & 0xFF200000) == 0x8B000000) {
+                    int rd=w&0x1F, rn=(w>>5)&0x1F, rm=(w>>16)&0x1F;
+                    if (reg[rm].kind==3) { reg[rd].kind=4; reg[rd].val=reg[rm].val; }
+                    else if (reg[rn].kind==3) { reg[rd].kind=4; reg[rd].val=reg[rn].val; }
+                    else reg[rd].kind=0;
+                    continue;
+                }
+                // LDR/LDRSW/LDUR → kind3(loaded 偏移)。静态(base=adrp 常量 ivar-off 页)→ val=全局VA;
+                //   运行时(base 来自 bl 返回的类型元数据描述符, 新版)→ val=0。两种都标 kind3, 使后续 add
+                //   识别为 structbase — "照抄布局"不依赖偏移是否静态可知(这是新版 codegen-agnostic 的关键)。
+                if ((w & 0xFFC00000) == 0xF9400000) {   // LDR xt,[xn,#imm]
+                    int rt=w&0x1F,rn=(w>>5)&0x1F; uint64_t imm=((w>>10)&0xFFF)*8;
+                    reg[rt].kind=3; reg[rt].val=(reg[rn].kind==2)?(reg[rn].val+imm):0; continue;
+                }
+                if ((w & 0xFFC00000) == 0xB9800000) { reg[w&0x1F].kind=3; reg[w&0x1F].val=0; continue; }   // LDRSW xt,[xn,#imm]
+                if ((w & 0xFFE00C00) == 0xF8400000) { reg[w&0x1F].kind=3; reg[w&0x1F].val=0; continue; }   // LDUR xt,[xn,#simm]
                 // STRB imm: strb wt,[xn,#imm]
                 if ((w & 0xFFC00000) == 0x39000000) {
                     int rt=w&0x1F,rn=(w>>5)&0x1F; uint32_t imm=(w>>10)&0xFFF;
                     if (reg[rn].kind==4) {
-                        // dbg_142 崩因修复: 校验器连续构造 active + free 两个块, 二者写同一 ivar 的相邻实例。
-                        //   只提第一个 active 块 —— 已建立 disc 后再遇 off0 的 structbase STRB = 第二块起点 → 停。
-                        //   (否则 free 块的 input 字段污染 active, name countAndFlags 错位 → String 解引用垃圾崩)
-                        if (imm==0 && haveDisc) { break; }
-                        sbIvar = reg[rn].val;
+                        if (imm==0) {   // 新块起点(off0 写 disc) — 多块收集, 不再 break
+                            if (nBlk+1 < MFRB_MAXBLK) nBlk++;
+                            blk[nBlk].sbIvar = reg[rn].val;
+                        }
+                        if (nBlk < 0) continue;   // off!=0 但还没起块 — 忽略
                         uint64_t v = (reg[rt].kind==1)?(reg[rt].val&0xFF):1;
-                        if (imm==0 && v==1) { haveDisc=YES; discOff=0; }
-                        if (imm+1>structMax) structMax=imm+1;
+                        if (blk[nBlk].nF < 32) { blk[nBlk].fOff[blk[nBlk].nF]=imm; blk[nBlk].fTy[blk[nBlk].nF]=0/*u8*/; blk[nBlk].fVal[blk[nBlk].nF]=v; blk[nBlk].nF++; }
+                        if (imm+1>blk[nBlk].structMax) blk[nBlk].structMax=imm+1;
                     }
                     continue;
                 }
                 // STR/STP/STRD [xn,#imm] where xn=structbase
                 if ((w & 0xFFC00000) == 0xF9000000 || (w & 0xFFC00000) == 0xA9000000 || (w & 0xFFC00000) == 0xFD000000) {
                     int rn=(w>>5)&0x1F;
-                    if (reg[rn].kind!=4) continue;
+                    if (reg[rn].kind!=4 || nBlk<0) continue;
                     BOOL isStp = ((w & 0xFFC00000)==0xA9000000);
                     BOOL isStrd = ((w & 0xFFC00000)==0xFD000000);
                     int rt=w&0x1F, rt2=(w>>10)&0x1F;
                     int32_t imm; uint64_t o0,o1=0; int cnt=1;
                     if (isStp) { imm=(w>>15)&0x7F; if(imm&0x40)imm-=0x80; o0=imm*8; o1=o0+8; cnt=2; }
                     else { o0=((w>>10)&0xFFF)*8; }
-                    // 处理 o0
                     int rts[2]={rt,rt2}; uint64_t offs[2]={o0,o1};
                     for (int e=0;e<cnt;e++) {
-                        if (nF >= 30) break;   // 字段数组越界守卫(structMax 仍继续累计)
+                        if (blk[nBlk].nF >= 32) break;
                         uint64_t oo=offs[e]; int rr=rts[e];
-                        if (oo+8>structMax) structMax=(uint32_t)(oo+8);
+                        if (oo+8>blk[nBlk].structMax) blk[nBlk].structMax=(uint32_t)(oo+8);
+                        int fi = blk[nBlk].nF;
                         if (isStrd) {
-                            // 有效期 double 字段(源自入参 d 寄存器) → now_plus
-                            fieldsOff[nF]=oo; fieldsTy[nF]=5; fieldsVal[nF]=100; nF++;   // ty5=now_plus
-                            validityOff=oo; haveValidity=YES;
+                            blk[nBlk].fOff[fi]=oo; blk[nBlk].fTy[fi]=5/*now_plus*/; blk[nBlk].fVal[fi]=100; blk[nBlk].nF++;
                             continue;
                         }
                         RegV sv = reg[rr];
                         if (sv.kind==1) {
-                            // 立即数: 可能 small-string ASCII 或 countAndFlags/tag
                             char a8[8]; for(int t=0;t<8;t++)a8[t]=(sv.val>>(t*8))&0xFF;
                             int pr=0; for(int t=0;t<8;t++){uint8_t c=a8[t]; if(c>=0x20&&c<0x7F)pr++; else if(c)pr=-99;}
                             if (pr>=3) {
                                 char lower[9]; int L=0; for(int t=0;t<8&&a8[t];t++){lower[t]=a8[t]|0x20;L++;} lower[L]=0;
-                                BOOL isP=NO,isS=NO;
-                                for(int t=0;t<7;t++) if(strstr(lower,PERIODW[t])){isP=YES;break;}
-                                for(int t=0;t<5;t++) if(strstr(lower,STATUSW[t])){isS=YES;break;}
-                                fieldsOff[nF]=oo; fieldsTy[nF]=1; fieldsVal[nF]=sv.val; nF++;  // ty1=bytes(临时存原始8字节)
-                                if(isP)nPeriod++; if(isS)nStatus++;
+                                for(int t=0;t<7;t++) if(strstr(lower,PERIODW[t])){blk[nBlk].nPeriod++;break;}
+                                for(int t=0;t<STATUSW_N;t++) if(strstr(lower,STATUSW[t])){blk[nBlk].nStatus++;break;}
+                                blk[nBlk].fOff[fi]=oo; blk[nBlk].fTy[fi]=1/*bytes*/; blk[nBlk].fVal[fi]=sv.val; blk[nBlk].nF++;
                             } else {
-                                fieldsOff[nF]=oo; fieldsTy[nF]=2; fieldsVal[nF]=sv.val; nF++;  // ty2=u64
+                                blk[nBlk].fOff[fi]=oo; blk[nBlk].fTy[fi]=2/*u64*/; blk[nBlk].fVal[fi]=sv.val; blk[nBlk].nF++;
                             }
                         } else if (sv.kind==2) {
-                            fieldsOff[nF]=oo; fieldsTy[nF]=3; fieldsVal[nF]=sv.val; nF++;      // ty3=addr(name ptr)
+                            blk[nBlk].fOff[fi]=oo; blk[nBlk].fTy[fi]=3/*addr*/; blk[nBlk].fVal[fi]=sv.val; blk[nBlk].nF++;
                         } else {
-                            // 入参(name countAndFlags / ptr) — 标记待 plan 填
-                            fieldsOff[nF]=oo; fieldsTy[nF]=4; fieldsVal[nF]=0; nF++;           // ty4=input
-                            nInput++;
+                            blk[nBlk].fOff[fi]=oo; blk[nBlk].fTy[fi]=4/*input*/; blk[nBlk].fVal[fi]=0; blk[nBlk].nF++;
+                            blk[nBlk].nInput++;
                         }
                     }
                 }
             }
 
-            // 需要: disc=1 + period + status + 至少一个 input 或 addr(name)
-            if (!(haveDisc && nPeriod>=1 && nStatus>=1)) continue;
-            if (!planVA) continue;
+            // 择优: 所有块里选 含period且含status 的、字段最多者 = 真 active 块。不依赖块顺序。
+            int best=-1;
+            for (int bi=0; bi<=nBlk; bi++) {
+                if (blk[bi].nPeriod<1 || blk[bi].nStatus<1) continue;
+                if (best<0 || blk[bi].nF>blk[best].nF) best=bi;
+            }
+            if (best<0) {
+                mfLog(@"[f8v2] sk2recipe fn=%#llx: 无合格 active 块(块数=%d), 跳过", (unsigned long long)(fh-textVM), nBlk+1);
+                continue;
+            }
+            // 摊平选中块到 fieldsXXX(后续组装/自检复用原变量名)
+            uint64_t sbIvar = blk[best].sbIvar;
+            uint64_t fieldsOff[32]; int fieldsTy[32]; uint64_t fieldsVal[32]; int nF = blk[best].nF;
+            memcpy(fieldsOff, blk[best].fOff, sizeof(fieldsOff));
+            memcpy(fieldsTy,  blk[best].fTy,  sizeof(fieldsTy));
+            memcpy(fieldsVal, blk[best].fVal, sizeof(fieldsVal));
+            BOOL haveDisc = YES;   // best 块必含 off0 disc(块起点条件)
+            uint32_t structMax = blk[best].structMax;
+            int nInput = blk[best].nInput;
+            BOOL haveValidity = NO;
+            for (int i=0;i<nF;i++) if (fieldsTy[i]==5) { haveValidity=YES; break; }
+            int nPeriod = blk[best].nPeriod, nStatus = blk[best].nStatus;
+            if (!planVA) { mfLog(@"[f8v2] sk2recipe fn=%#llx: 无 plan 常量, 跳过", (unsigned long long)(fh-textVM)); continue; }
 
             // 组装 recipe JSON fields(语义化): period→按档位覆盖成选中计划的 tier 词
             NSMutableArray *jf = [NSMutableArray array];
@@ -1766,11 +1801,15 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 if (oo==0) continue;   // disc 已加
                 int ty=fieldsTy[i]; uint64_t v=fieldsVal[i];
                 if (ty==1) {
-                    // bytes: 判断是否 period 词 → 用选中 tier 覆盖; 否则原样
+                    // small-string 语义槽: period 槽→填选中档位(tier); status 槽→强制填 "active"(不管宿主写的 active/expired);
+                    //   都不是→常量, 原样照抄。三类分流, 覆盖"条件构造状态"(宿主可能写 expired 分支)。
                     char a8[9]; int L=0; for(int t=0;t<8;t++){uint8_t c=(v>>(t*8))&0xFF; if(c){a8[L++]=c;}} a8[L]=0;
                     char lower[9]; for(int t=0;t<L;t++)lower[t]=a8[t]|0x20; lower[L]=0;
-                    BOOL isP=NO; for(int t=0;t<7;t++) if(strstr(lower,PERIODW[t])){isP=YES;break;}
-                    NSString *sval = isP ? [NSString stringWithUTF8String:tierName] : [NSString stringWithUTF8String:a8];
+                    BOOL isP=NO,isS=NO;
+                    for(int t=0;t<7;t++) if(strstr(lower,PERIODW[t])){isP=YES;break;}
+                    if(!isP) for(int t=0;t<STATUSW_N;t++) if(strstr(lower,STATUSW[t])){isS=YES;break;}
+                    NSString *sval = isP ? [NSString stringWithUTF8String:tierName]
+                                   : (isS ? @"active" : [NSString stringWithUTF8String:a8]);
                     [jf addObject:@{@"off":@(oo), @"type":@"bytes", @"s":sval}];
                     // Swift small-string tag 在 16 字节槽的第 15 字节(0xE0|count), 不是 +7!
                     //   (dbg_142 崩因: tag 误写 +7 → 覆盖 payload + 真 tag 位留 0 → String 被当大字符串解引用垃圾指针崩)
