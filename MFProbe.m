@@ -206,6 +206,8 @@ static const MFInjectRecipe *mfParseRecipe(NSDictionary *d) {
 // —— 活动配方: 由 patch 引擎在执行 hookinj@ 判定点时注入(不再从独立 prefs 读) ——
 static const MFInjectRecipe *g_mfActiveRecipe = NULL;
 static BOOL mfProbePatch16(uintptr_t target, const uint8_t *newBytes, NSString **err);  // fwd
+extern void mf_stObsTramp(void);       // asm trampoline(定义在下方)
+extern void *g_mfStObsCont;            // = target+0x10(定义在下方)
 
 // patch 引擎回调: 传入 hookinj 配方字典 → 解析并装 inline hook(判定点 ⚡ 执行路径调用)。
 //   返回 YES=hook 装上。序言字节校验防漂移/误注入。与其他判定点 patch 同一交互层。
