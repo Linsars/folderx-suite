@@ -1109,6 +1109,7 @@ void mfShowCDFilePage(NSString *zipPath, NSString *entryName) {
 static NSLock *g_obsLock;
 static NSMutableDictionary<NSString *, NSString *> *g_obsLastVal;   // "Cls.sel" → 上次值(去重)
 static NSUInteger g_obsCount;
+static NSUInteger g_obsCandCount;   // v2.58.165: 诊断候选计数(前置声明, dump 用)
 static BOOL g_obsOn = NO;   // v2.58.164: 记录开关(swizzle 一旦挂上不卸, 靠 flag 控记录 — 同 L0 范式)
 
 // 值记录: 首见 或 值变化 才打日志(高频 getter 稳定返回同值时不刷屏; 购买后 NO→YES 立刻现形)
@@ -1128,13 +1129,15 @@ static void mfObsRecord(NSString *cls, NSString *sel, NSString *val) {
 }
 
 // 权益语义词根(小写子串匹配) —— 通用, 零 app 硬编码
+// v2.58.165: 移除 "isactive"(真机 151 实锤: 只引广告 SDK OMID/InMobi/Vungle 的
+//   appIsActive/isActive 噪声, 零权益价值)。
 static BOOL mfObsIsEntSel(const char *s) {
     static const char *KW[] = {
         "ispro","haspro","ispremium","haspremium","isvip","hasvip","isplus",
-        "issubscri","subscribed","issubscribed","hasactivesub",
+        "issubscri","subscribed","issubscribed","hasactivesub","activesubscription",
         "isentitle","hasentitle","entitled","entitlement",
         "isunlock","unlocked","ispaid","ismember","ismembership",
-        "isactive","canaccess","isupgrad","ispurchas","purchased",
+        "canaccess","isupgrad","ispurchas","purchased","haspurchas",
         "islifetime","isforever","isperpetual","isvalidpro","haslicense","islicensed",
         NULL
     };
@@ -1143,6 +1146,41 @@ static BOOL mfObsIsEntSel(const char *s) {
     buf[i] = 0;
     for (int k = 0; KW[k]; k++) if (strstr(buf, KW[k])) return YES;
     return NO;
+}
+
+// v2.58.165: 权益类名强 token(比方法词根更宽的诊断锚)—— 用于「候选 dump」:
+//   命中此类 → 全量 dump 它的所有方法签名(不限参数/返回), 让真机吐出该 app
+//   到底有哪些权益方法(151 实锤: 光靠零参+BOOL 词根滤太窄, 漏了带参 isPurchased:/
+//   返回对象 activeSubscriptions)。用强 token 避 "pro"→protobuf/"vip" 的子串误伤。
+static BOOL mfObsIsEntClass(const char *s) {
+    static const char *CK[] = {
+        "iapmanager","iaphelper","swiftystorekit","revenuecat","purchases",
+        "purchase","subscription","subscri","billing","entitlement","entitle",
+        "premium","membership","receipt","storekitmanager","promanager",
+        "vipmanager","paymentmanager","unlockmanager","storemanager","upgrademanager",
+        NULL
+    };
+    char buf[200]; int i = 0;
+    for (; s[i] && i < 199; i++) buf[i] = (char)tolower((unsigned char)s[i]);
+    buf[i] = 0;
+    for (int k = 0; CK[k]; k++) if (strstr(buf, CK[k])) return YES;
+    return NO;
+}
+
+// v2.58.165 诊断: 全量 dump 一个方法的签名到 [obs候选](只记录不 hook)。
+//   让真机吐出权益类/权益方法的真实签名(名+返回类型+参数数), 据此校准挂载条件。
+static void mfObsDumpCand(Method m, const char *clsName, BOOL isMeta, const char *why) {
+    if (g_obsCandCount >= 400) return;   // 防刷屏
+    SEL sel = method_getName(m);
+    const char *sn = sel_getName(sel);
+    if (!sn) return;
+    char *rt = method_copyReturnType(m);
+    char r = rt ? rt[0] : '?';
+    if (rt) free(rt);
+    unsigned na = method_getNumberOfArguments(m);   // 含 self/_cmd, 减 2 = 真实参数
+    int realArgs = na >= 2 ? (int)(na - 2) : 0;
+    g_obsCandCount++;
+    mfLog(@"[obs候选] %c%s.%s → ret=%c args=%d (%s)", isMeta ? '+' : '-', clsName, sn, r, realArgs, why);
 }
 
 // 单个方法: 权益语义 + 零参 + 返回 BOOL/_Bool → swizzle 记录 wrapper
@@ -1177,6 +1215,7 @@ void mfEntObserveInstall(void) {
         g_obsLock = [NSLock new];
         g_obsLastVal = [NSMutableDictionary dictionary];
         g_obsCount = 0;
+        g_obsCandCount = 0;
         // 逐镜像原子快照(objc_copyImageNames + strdup 自持 —— 防 dlclose 悬挂, Real Crash #2)
         unsigned ic = 0;
         const char **imgs = objc_copyImageNames(&ic);
@@ -1196,12 +1235,18 @@ void mfEntObserveInstall(void) {
                 Class c = objc_getClass(names[j]);
                 if (!c) continue;
                 nCls++;
+                BOOL entClass = mfObsIsEntClass(names[j]);   // v2.58.165: 权益类 → 全量 dump 诊断
                 for (int meta = 0; meta < 2; meta++) {
                     Class cc = meta ? object_getClass(c) : c;
                     unsigned mc = 0;
                     Method *ms = class_copyMethodList(cc, &mc);
-                    for (unsigned k = 0; k < mc; k++)
+                    for (unsigned k = 0; k < mc; k++) {
+                        // 挂载: 权益语义 + 零参 + BOOL(可 patch 的真判定读侧)
                         mfObsTryHook(cc, ms[k], names[j], meta);
+                        // 诊断: 权益类的所有方法, 或方法名命中权益词根的(不限参数/返回)全量 dump
+                        if (entClass || mfObsIsEntSel(sel_getName(method_getName(ms[k]))))
+                            mfObsDumpCand(ms[k], names[j], meta, entClass ? "权益类" : "权益词根");
+                    }
                     free(ms);
                 }
             }
@@ -1209,8 +1254,8 @@ void mfEntObserveInstall(void) {
         }
         for (unsigned i = 0; i < ic; i++) free(safe[i]);
         free(safe);
-        mfLog(@"[obs] 权益观测装载: 扫 %lu 类 → 挂 %lu 个权益 getter(实时日志现形; app 读 Pro 即录)",
-              (unsigned long)nCls, (unsigned long)g_obsCount);
+        mfLog(@"[obs] 权益观测装载: 扫 %lu 类 → 挂 %lu 个权益 getter · 诊断候选 %lu 条(实时日志现形; app 读 Pro 即录)",
+              (unsigned long)nCls, (unsigned long)g_obsCount, (unsigned long)g_obsCandCount);
     });
 }
 
