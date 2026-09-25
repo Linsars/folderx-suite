@@ -3130,6 +3130,12 @@ NSDictionary *mfReconFingerprint(void) {
     NSUInteger nRealGate = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2vfy"] && [f[@"score"] intValue] >= 99) nRealGate++;
+    // v2.58.168 B: 观测喂判型 — 运行时观测(实时日志开关下)结果, 提到 verdict 链之前取值
+    //   (extern/取值不能插在 else-if 链中间, 否则断链)。
+    extern BOOL mfObsReceiptVerifierSeen(void);
+    extern NSUInteger mfObsFlowClassCount(void);
+    BOOL obsReceipt = mfObsReceiptVerifierSeen();
+    NSUInteger obsFlow = mfObsFlowClassCount();
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
@@ -3156,6 +3162,10 @@ NSDictionary *mfReconFingerprint(void) {
                                        (unsigned long)nRealGate, (unsigned long)(nCodePts > nRealGate ? nCodePts - nRealGate : 0)];
     else if (nCodePts > 0)  verdict = [NSString stringWithFormat:@"代码判定型(指令级 patch %lu 点: isPro 写点/读侧 getter) — 实验模拟页⚡即解锁", (unsigned long)nCodePts];
     else if (stateType)     verdict = @"状态型(UserDefaults 实存语义key) — 🧪实验模拟→F9 状态解锁 直写";
+    // v2.58.168 B: 观测确证的收据验证型 — 运行时铁证优先于静态兜底(解决"判定点未发现")。
+    //   条件: 观测命中收据验证类 或 观测挂到 SK1 购买流消费者(paymentQueue:updatedTransactions:)。
+    else if (obsReceipt || obsFlow > 0) verdict = [NSString stringWithFormat:@"收据验证型(运行时观测确证: %@购买流消费者 %lu 个) — 解锁路线: 🧪实验模拟页 L1 收据伪造开关(判定读收据, 非代码门)",
+                                       obsReceipt ? @"收据验证类命中 · " : @"", (unsigned long)obsFlow];
     // v2.58.7: 纯 StoreKit 本地校验型分支(2.58.6 缺失 — SK2 明明已判定却显示"未发现订阅验证 SDK"兜底文案)
     else if (skLocal)       verdict = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@ · %@) — 判定点已入库, 实验模拟页左划 patch", skType, validator];
     else                    verdict = @"未发现订阅验证 SDK";

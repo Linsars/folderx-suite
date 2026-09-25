@@ -1190,6 +1190,7 @@ static void mfObsDumpCand(Method m, const char *clsName, BOOL isMeta, const char
 //   哪个 product、状态 purchased/failed/restored。记录不改(不同于 L0 伪造)。
 //   多类共用回调: 按 self 的类查各自 orig IMP(单全局会被后挂覆盖→调错 orig 崩)。
 static NSMutableDictionary<NSString *, NSValue *> *g_obsFlowOrig;   // clsName → orig IMP
+static BOOL g_obsReceiptSeen = NO;   // v2.58.168 B: 枚举时见到收据验证类(InAppReceipt/ASN1/PKCS7/Verificator)
 static NSString *mfObsTxState(long long st) {
     switch (st) { case 0: return @"purchasing"; case 1: return @"purchased✓";
         case 2: return @"failed"; case 3: return @"restored✓"; case 4: return @"deferred"; }
@@ -1270,6 +1271,15 @@ void mfEntObserveInstall(void) {
                 if (!c) continue;
                 nCls++;
                 BOOL entClass = mfObsIsEntClass(names[j]);   // v2.58.165: 权益类 → 全量 dump 诊断
+                // v2.58.168 B: 收据验证型指纹 — 类名命中收据验证库 → 标记(喂 verdict 判型)。
+                //   SwiftyStoreKit.InAppReceiptVerificator / InAppReceipt* / ASN1* / PKCS7* =
+                //   本地收据验证型 app 的铁证(154 实锤 mailnow 走 SwiftyStoreKit 收据验证)。
+                {
+                    const char *cn0 = names[j];
+                    if (strstr(cn0, "InAppReceipt") || strstr(cn0, "ReceiptVerificat") ||
+                        strstr(cn0, "ASN1") || strstr(cn0, "PKCS7"))
+                        g_obsReceiptSeen = YES;
+                }
                 // v2.58.166/167: 流观测 —— 类**自己**实现 paymentQueue:updatedTransactions: 才挂
                 //   (SK1 购买结果回调, 纯 Swift 判定型 app 唯一可观测信号)。
                 // v2.58.167 崩溃修复(dbg 153): 只查 class_copyMethodList(自身方法表), 绝不用
@@ -1316,3 +1326,9 @@ void mfEntObserveInstall(void) {
 
 // v2.58.164: 记录开关 — 实时日志开关关闭时一并停记录(swizzle 不卸, 靠 flag)。
 void mfEntObserveSetOn(BOOL on) { g_obsOn = on; }
+
+// v2.58.168 B: 观测结果查询 — 供 MFRecon verdict 判型消费(观测喂判型)。
+//   观测在 ctor 早期跑, 侦查(mfReconFingerprint)在长按面板后跑, 时序上观测结果已就绪。
+BOOL mfObsReceiptVerifierSeen(void) { return g_obsReceiptSeen; }
+// 观测到的购买流类数(挂了几条 paymentQueue:updatedTransactions:)= SK1 队列消费者存在证据
+NSUInteger mfObsFlowClassCount(void) { return g_obsFlowOrig ? g_obsFlowOrig.count : 0; }
