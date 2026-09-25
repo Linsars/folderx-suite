@@ -1678,10 +1678,15 @@ void mfShowLabPage(void) {
 // v2.6.21 电池详情
 - (void)mfShowBatteryPage { mfShowBatteryPage(); }
 - (void)mfHostLogSwitchChanged:(UISwitch *)sw {
-    mfSetBoolPref(@"mfHostLogEnabled", sw.on);
+    mfSetBoolPref(@"mfHostLogEnabled", sw.on);   // 实时日志: 全局(看任意 app 日志用)
+    // v2.58.166: 权益观测 per-app —— 不再继承实时日志的全局性(用户纠偏: 观测不该对每个
+    //   app 都撒)。在哪个 app 里开的开关, 就只观测哪个 app(与网络捕获 per-app 同范式)。
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    NSString *obsKey = [NSString stringWithFormat:@"mfObsEnabled_%@", bid];
+    mfSetBoolPref(obsKey, sw.on);
     extern void mfEntObserveInstall(void);
     extern void mfEntObserveSetOn(BOOL on);
-    if (sw.on) { mfHostLogStart(); mfEntObserveInstall(); }   // v2.58.164: 观测随实时日志开
+    if (sw.on) { mfHostLogStart(); mfEntObserveInstall(); }   // 观测随开(仅本 app)
     else { mfHostLogStop(); mfEntObserveSetOn(NO); }          // 关: 停记录(swizzle 已挂不卸)
     // 状态栏即时刷新(不等 0.5s timer)
     UIView *page = objc_getAssociatedObject(sw, "hlPage");
@@ -2610,13 +2615,18 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
             extern void mfProbeInstall(void);
             mfProbeInstall();
         }
-        // v2.6.17: 宿主日志(pipe+dup2)——开关默认 OFF,开过则冷启动即接管 fd
+        // v2.6.17: 宿主日志(pipe+dup2)——开关默认 OFF,开过则冷启动即接管 fd(全局)
         if (mfPrefBool(@"mfHostLogEnabled", NO)) {
             mfHostLogStart();
-            // v2.58.164: 运行时权益观测搭车实时日志开关 —— 同一 if, ctor 早期装载,
-            //   赶在 app 读 Pro getter 之前 swizzle 上, 一读即被实时日志捕获显示。
-            extern void mfEntObserveInstall(void);
-            mfEntObserveInstall();
+        }
+        // v2.58.166: 权益观测 per-app 冷启动恢复 —— 只在"曾在本 app 开过观测"时装载,
+        //   与实时日志(全局)解耦。key = mfObsEnabled_<bid>(网络捕获同范式)。
+        {
+            NSString *obsKey = [NSString stringWithFormat:@"mfObsEnabled_%@", [[NSBundle mainBundle] bundleIdentifier] ?: @""];
+            if (mfPrefBool(obsKey, NO)) {
+                extern void mfEntObserveInstall(void);
+                mfEntObserveInstall();
+            }
         }
         // v2.6.85: CloudKit once 预热——有 iCloud entitlement 的 app 启动时后台预热 CK
         // （点按钮时才首调 CK = once 运行中途触发 = SIGTRAP @ CK+0x9e89c，三次复现实锤）

@@ -1104,6 +1104,7 @@ void mfShowCDFilePage(NSString *zipPath, NSString *entryName) {
 //   不依赖二进制明文串、不本地推断 —— 它在运行时自证, 天然对不上不了(治本地失真的病)。
 
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <ctype.h>
 
 static NSLock *g_obsLock;
@@ -1183,6 +1184,38 @@ static void mfObsDumpCand(Method m, const char *clsName, BOOL isMeta, const char
     mfLog(@"[obs候选] %c%s.%s → ret=%c args=%d (%s)", isMeta ? '+' : '-', clsName, sn, r, realArgs, why);
 }
 
+// v2.58.166 流观测: paymentQueue:updatedTransactions: 是 SK1 通用购买结果回调,
+//   签名固定 (id queue, NSArray *txs) → 安全 swizzle。纯 Swift 判定型 app(如 mailnow,
+//   152 实锤 OC 层只有支付流程无判定 getter)唯一能观测到的信号 = 真实交易结果:
+//   哪个 product、状态 purchased/failed/restored。记录不改(不同于 L0 伪造)。
+//   多类共用回调: 按 self 的类查各自 orig IMP(单全局会被后挂覆盖→调错 orig 崩)。
+static NSMutableDictionary<NSString *, NSValue *> *g_obsFlowOrig;   // clsName → orig IMP
+static NSString *mfObsTxState(long long st) {
+    switch (st) { case 0: return @"purchasing"; case 1: return @"purchased✓";
+        case 2: return @"failed"; case 3: return @"restored✓"; case 4: return @"deferred"; }
+    return [NSString stringWithFormat:@"?%lld", st];
+}
+static void mfObsFlowCb(id self, SEL _cmd, id queue, NSArray *txs) {
+    if (g_obsOn && [txs isKindOfClass:[NSArray class]]) {
+        for (id tx in txs) {
+            @try {
+                long long st = ((long long(*)(id,SEL))objc_msgSend)(tx, NSSelectorFromString(@"transactionState"));
+                id pay = ((id(*)(id,SEL))objc_msgSend)(tx, NSSelectorFromString(@"payment"));
+                NSString *pid = nil;
+                if (pay && [pay respondsToSelector:NSSelectorFromString(@"productIdentifier")])
+                    pid = ((id(*)(id,SEL))objc_msgSend)(pay, NSSelectorFromString(@"productIdentifier"));
+                mfLog(@"[obs流] %@ 交易: %@ state=%@", NSStringFromClass([self class]), pid ?: @"?", mfObsTxState(st));
+            } @catch (...) {}
+        }
+    }
+    // 按 self 的类链查 orig(self 可能是子类实例, 逐级向上找已记录的 orig)
+    void (*orig)(id, SEL, id, NSArray *) = NULL;
+    for (Class k = object_getClass(self); k && !orig; k = class_getSuperclass(k)) {
+        NSValue *v = g_obsFlowOrig[NSStringFromClass(k)];
+        if (v) orig = (void(*)(id,SEL,id,NSArray*))[v pointerValue];
+    }
+    if (orig) orig(self, _cmd, queue, txs);   // 原样放行, 不改
+}
 // 单个方法: 权益语义 + 零参 + 返回 BOOL/_Bool → swizzle 记录 wrapper
 static void mfObsTryHook(Class cc, Method m, const char *clsName, BOOL isMeta) {
     if (g_obsCount >= 800) return;
@@ -1214,6 +1247,7 @@ void mfEntObserveInstall(void) {
     dispatch_once(&once, ^{
         g_obsLock = [NSLock new];
         g_obsLastVal = [NSMutableDictionary dictionary];
+        g_obsFlowOrig = [NSMutableDictionary dictionary];
         g_obsCount = 0;
         g_obsCandCount = 0;
         // 逐镜像原子快照(objc_copyImageNames + strdup 自持 —— 防 dlclose 悬挂, Real Crash #2)
@@ -1236,6 +1270,24 @@ void mfEntObserveInstall(void) {
                 if (!c) continue;
                 nCls++;
                 BOOL entClass = mfObsIsEntClass(names[j]);   // v2.58.165: 权益类 → 全量 dump 诊断
+                // v2.58.166: 流观测 —— 该类实现 paymentQueue:updatedTransactions: 就挂(SK1 购买
+                //   结果回调, 纯 Swift 判定型 app 唯一能观测的信号)。签名固定, 安全。
+                {
+                    SEL flowSel = NSSelectorFromString(@"paymentQueue:updatedTransactions:");
+                    Method fm = class_getInstanceMethod(c, flowSel);
+                    if (fm && class_getMethodImplementation(c, flowSel) != (IMP)mfObsFlowCb) {
+                        // 只在该类自己实现了(非继承)时挂, 避免重复
+                        unsigned own = 0; Method *oml = class_copyMethodList(c, &own); BOOL self_impl = NO;
+                        for (unsigned z = 0; z < own; z++) if (method_getName(oml[z]) == flowSel) { self_impl = YES; break; }
+                        free(oml);
+                        if (self_impl) {
+                            IMP o = method_getImplementation(fm);
+                            g_obsFlowOrig[[NSString stringWithUTF8String:names[j]]] = [NSValue valueWithPointer:o];
+                            method_setImplementation(fm, (IMP)mfObsFlowCb);
+                            mfLog(@"[obs] 挂流观测 -%s.paymentQueue:updatedTransactions:", names[j]);
+                        }
+                    }
+                }
                 for (int meta = 0; meta < 2; meta++) {
                     Class cc = meta ? object_getClass(c) : c;
                     unsigned mc = 0;
