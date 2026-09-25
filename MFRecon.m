@@ -2539,7 +2539,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         NSMutableArray *pool = [NSMutableArray array];
                         for (NSUInteger i = 0; i < mo.count; i++) {
                             NSDictionary *it = mo[i];
-                            if (i < f8v2Seg && [it[@"score"] intValue] >= 3) [keep addObject:it];
+                            // v2.58.174 根因修复(dbg_161/162 "判定点腿飞了"): deepslot(F10 深槽判定点腿)
+                            //   无条件保位。deepslot 在 f8v2Seg 之后加入, 旧逻辑归 pool; 当语义锚定候选≥4
+                            //   时 room=0 → pool 一个不填 → F10 判定点腿(reflix 0x14211bc/0x11d5398)被
+                            //   当噪声截断丢弃。deepslot 是 F10 专属强判定点(score93, 云型双因子的本地腿),
+                            //   与 f8v3 共享 getter 噪声不同类, 绝不能进 pool 参与截断。
+                            if ([it[@"shape"] isEqualToString:@"deepslot"] || (i < f8v2Seg && [it[@"score"] intValue] >= 3)) [keep addObject:it];
                             else [pool addObject:it];
                         }
                         [pool sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
@@ -2562,8 +2567,10 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         [mo removeAllObjects];
                         [mo addObjectsFromArray:keep];
                         [mo addObjectsFromArray:[pool subarrayWithRange:NSMakeRange(0, fill)]];
-                        mfLog(@"[f8v3] 截断: 语义锚定保位=%lu 槽, getter 填充=%lu (池 %lu)",
-                              (unsigned long)keep.count, (unsigned long)fill, (unsigned long)pool.count);
+                        NSUInteger nDeepKept = 0;
+                        for (NSDictionary *it in keep) if ([it[@"shape"] isEqualToString:@"deepslot"]) nDeepKept++;
+                        mfLog(@"[f8v3] 截断: 语义锚定保位=%lu 槽(含 F10 深槽 %lu), getter 填充=%lu (池 %lu)",
+                              (unsigned long)keep.count, (unsigned long)nDeepKept, (unsigned long)fill, (unsigned long)pool.count);
                     }
                 }
             }
