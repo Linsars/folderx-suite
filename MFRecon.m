@@ -99,6 +99,50 @@ static BOOL mfRecIsSPMURL(const uint8_t *base, const uint8_t *hit) {
 //   → __TEXT bl/b 扫描(上限 1024) → prologue 归属(pacibsp/stp/sub-sp +
 //      自家 patch 头识别, patch 后重扫点位稳定) → 评分 → top6 @0x 点位
 // ====================================================================
+// ====================================================================
+// v2.58.171 识别层重构: 框架 Swift 权益门 = 模块归属过滤 + 语义打分(替代单一 strstr 白名单)
+//   病(dbg_158): kEntPats strstr 白名单 → 改名/混淆即 miss(找不着), 通用词根撞名即误判
+//   (NIOPosix.add/Tokenizers.postProcess 恰好返 Bool 被当真门)。与 sk2plan 计划名字面量同病。
+//   治: ① 模块归属 — Swift mangled _$s<len><module>, module 必须 == 框架 leaf 名
+//       → 结构性杀掉 vendored 第三方库(Tokenizers/NIOPosix/GRDB, 模块名≠框架名)噪声, 零词表。
+//       ② 语义打分 — 强锚(战役验证真门)/权益词/判定语义分层, score>0 才收, 降序 top N。
+//       裸 pro/vip 太短易撞(Provider→pro)用长 token, score 0 自动淘汰无语义 getter。
+
+// mangled _$s<len><module>... → 提取 module 名(小写)。失败返回 NO。
+static BOOL mfMangledModule(const char *nm, char *out, size_t outsz) {
+    if (!nm || nm[0] != '_' || nm[1] != '$' || nm[2] != 's') return NO;
+    const char *p = nm + 3;
+    int len = 0;
+    while (*p >= '0' && *p <= '9') { len = len * 10 + (*p - '0'); p++; }
+    if (len <= 0 || len > 60 || (size_t)len >= outsz) return NO;
+    for (int i = 0; i < len; i++) {
+        if (!p[i]) return NO;
+        out[i] = (char)tolower((unsigned char)p[i]);
+    }
+    out[len] = 0;
+    return YES;
+}
+
+// 框架权益门语义打分(小写 mangled 全名) — score>0 才是候选, 越高越像真门。
+static int mfEntSemScore(const char *lower) {
+    int s = 0;
+    // 强锚: scripting 战役验证过的真门族 + 通用权益守卫命名(具体, 不易撞)
+    const char *strong[] = {"proaccessguard","accessguard","entitlementoracle","entitlement",
+                            "hasvalidtoken","hasvalidd5token","hasproaccess","hascd0",
+                            "requirecapab","requirec0","provalidated","isprovalid",NULL};
+    for (int i=0; strong[i]; i++) if (strstr(lower, strong[i])) { s += 10; break; }
+    // 权益词(长 token, 不撞): premium/unlock/subscri/purchas/lifetime/upgrade/license
+    const char *ent[] = {"premium","unlocked","unlockpro","issubscri","subscribed","purchased",
+                         "haspurchas","islifetime","isforever","isperpetual","upgraded","licensed",
+                         "ispaiduser","ispremiumuser",NULL};
+    for (int i=0; ent[i]; i++) if (strstr(lower, ent[i])) { s += 5; break; }
+    // 判定语义: auth/manage/vip/member/paid(覆盖 canManageModels/isClaudeAuthActive/isGPTAuthActive)
+    const char *sem[] = {"authactive","isauth","canmanage","manages","ismember","membership",
+                         "isvip","ispaid","canaccess","iseligible","isactivated",NULL};
+    for (int i=0; sem[i]; i++) if (strstr(lower, sem[i])) { s += 3; break; }
+    return s;
+}
+
 static NSDictionary *mfReconF8v2Scan(void) {
     @autoreleasepool {
     // ---- 锚点1: 主二进制 header/slide ----
@@ -2902,13 +2946,15 @@ NSDictionary *mfReconFingerprint(void) {
             if (!nsyms || !symoff) continue;
             const struct nlist_64 *syms = (const struct nlist_64 *)((const uint8_t *)h + symoff + lDelta);
             const char *strtab = (const char *)((const uint8_t *)h + stroff + lDelta);
-            // v2.58.163: 去过拟合 — 原 kEntPats 写死 pyide 专属类名(ProAccessGuard/
-            //   hasValidD5Token 等), 换 app 命中≈0。改用通用权益语义词根(跨 app 稳定):
-            //   结构门(Swift mangled + Sb Bool 返回 + tF/vg 结尾)已是主过滤, 词根只作语义收窄。
+            // v2.58.171: strtab 预筛词表对齐语义打分强锚/权益词(框架级快速门 —
+            //   strtab 不含任一权益语义词 → 整框架跳过, 不做符号循环)。与 mfEntSemScore 同源,
+            //   避免"预筛放行但符号循环全被语义分淘汰"的空转, 或"预筛太窄漏掉真门框架"。
             static NSArray *kEntPats; static dispatch_once_t o;
-            dispatch_once(&o, ^{ kEntPats = @[@"Pro", @"pro", @"Premium", @"premium", @"VIP", @"vip",
-                                              @"Entitle", @"entitle", @"Unlock", @"unlock",
-                                              @"Subscri", @"subscri", @"Purchas", @"purchas", @"Member", @"member"]; });
+            dispatch_once(&o, ^{ kEntPats = @[@"AccessGuard", @"Entitlement", @"entitle",
+                                              @"hasValid", @"hasPro", @"Premium", @"premium",
+                                              @"Unlock", @"unlock", @"Subscri", @"subscri",
+                                              @"Purchas", @"purchas", @"AuthActive", @"canManage",
+                                              @"isVip", @"isVIP", @"Membership", @"isPaid", @"Lifetime"]; });
             // v2.58.121: strtab 预筛 — dbg_114 定谳: ScriptingKit nsyms=120 万,
             //   逐符号 strlen+strcmp 要数秒~数十秒(卡死真凶)。改为先在 strtab 里
             //   一次 memmem 找关键字(120 万符号的 strtab 42MB, memmem 毫秒级);
@@ -2940,38 +2986,56 @@ NSDictionary *mfReconFingerprint(void) {
                 const char *nm = strtab + syms[k].n_un.n_strx;
                 if (!nm || !(nm[0] == '_' && nm[1] == '$')) continue;   // Swift mangled only
                 // v2.57.1 正向过滤(只收真判定函数): Sb(Bool)返回 + tF(函数)/vg(getter)结尾。
-                //   首版 8 个配额被 refreshStoreD0 闭包 thunk(yyYacfU_TATQ0_)占满, hasValidToken 没进表。
                 size_t nl = strlen(nm);
                 if (nl < 8) continue;
                 BOOL endF = !strcmp(nm + nl - 2, "tF");
                 BOOL endG = !strcmp(nm + nl - 2, "vg");
                 if (!endF && !endG) continue;          // thunk(TQ0_/TA/yyYacfU)/async(tYaF)/metadata 全排除
                 if (!strstr(nm, "Sb")) continue;        // 非 Bool 返回不打
-                // v2.57.1: 返回类型是 y(void)开头的多参函数不打 — "ySb_S2b"(refreshFromPurchaseState)
-                //   含 "Sb" 字样但是参数不是返回值, 打恒真会破坏正常购买流程
-                if (endF && strstr(nm, "ySb")) continue;
-                for (NSString *pat in kEntPats) {
-                    if (strstr(nm, pat.UTF8String)) {
-                        // v2.58.6: 同名符号 local/global 双 nlist 条目去重(否则计数翻倍, 与 merge 端 img+sym 去重口径不一致)
+                if (endF && strstr(nm, "ySb")) continue;   // v2.57.1: void 返回多参函数含"Sb"字样但非返回值
+                // ═══ v2.58.171 识别层: 模块归属过滤 + 语义打分(替代 kEntPats strstr 白名单) ═══
+                // ① 模块归属: mangled module 必须 == 框架 leaf 名 → 结构性杀 vendored 第三方库噪声
+                //    (Tokenizers/NIOPosix/GRDB 模块名≠框架名, dbg_158 那 5 个垃圾在此被挡, 零词表)。
+                char mod[64];
+                if (!mfMangledModule(nm, mod, sizeof(mod))) continue;
+                char fwLeaf[128];
+                {
+                    NSString *leaf = full.lastPathComponent ?: @"";   // 如 "ScriptingKit"
+                    const char *lc = leaf.UTF8String ?: "";
+                    size_t z = 0; for (; lc[z] && z < sizeof(fwLeaf)-1; z++) fwLeaf[z] = (char)tolower((unsigned char)lc[z]);
+                    fwLeaf[z] = 0;
+                }
+                if (strcmp(mod, fwLeaf) != 0) continue;   // 只收框架自有模块的符号(非 vendored 库)
+                // ② 语义打分: score>0 才是候选(无语义词的 isSelected/isReady/passwordValid → 0 淘汰)
+                char low[256];
+                { size_t z = 0; for (; nm[z] && z < sizeof(low)-1; z++) low[z] = (char)tolower((unsigned char)nm[z]); low[z] = 0; }
+                int semScore = mfEntSemScore(low);
+                if (semScore <= 0) continue;
+                {
+                        // 同名符号 local/global 双 nlist 去重
                         BOOL dupSym = NO;
                         for (NSDictionary *e in entFuncs)
                             if ([e[@"img"] isEqualToString:full.lastPathComponent] && [e[@"sym"] isEqualToString:[NSString stringWithUTF8String:nm]]) { dupSym = YES; break; }
-                        if (dupSym) break;
+                        if (dupSym) continue;
                         [entFuncs addObject:@{
                             @"img": full.lastPathComponent,
                             @"sym": [NSString stringWithUTF8String:nm],
                             @"vmaddr": @((unsigned long)syms[k].n_value),
                             @"slide": @((long)slide),
+                            @"score": @(semScore),   // v2.58.171: 语义分, 详情页/入库按此降序
                         }];
                         imgHits++;
-                        break;
-                    }
+                        mfLog(@"[f8v2] ★框架门 %s score=%d (mod=%s)", nm, semScore, mod);
                 }
             }
         }
         // v2.58 接线: 侦查→实验模拟页数据通道 — 扫到的点位直接合并进 mfEntDumps_<bid>
-        // 持久存储, 实验模拟页判定点卡片从这读(不再依赖规则表/橙色生成按钮)
-        // v2.58.55: 抑制判据已提到块外(sk2LocalType, 单一事实来源)
+        // v2.58.171: 框架门按语义分降序 — 真门(score 10+, ProAccessGuard 族)靠前, 判定语义(3)垫后。
+        if (entFuncs.count > 1)
+            [entFuncs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                int sa = [a[@"score"] intValue], sb = [b[@"score"] intValue];
+                return sa > sb ? NSOrderedAscending : (sa < sb ? NSOrderedDescending : NSOrderedSame);
+            }];
         // v2.58.169: 判型总闸 — 本地代码点闸门关闭时(服务端型/收据验证型)不入库框架符号点
         if (entFuncs.count && !gBlockCodePts) {
             extern void mfAppPatchEntDumpsMerge(NSArray *);
