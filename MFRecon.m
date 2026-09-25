@@ -2598,12 +2598,30 @@ NSDictionary *mfReconFingerprint(void) {
     #define RECON_P(seg) mfLog(@"[reconP] %s", seg)
     RECON_P("enter");
 
-    NSMutableArray *lines = [NSMutableArray array];
+    // v2.58.177: 详情页证据体已改为末尾按 type 派生的 ev(唯一事实源), detector 不再写 lines。
     NSMutableSet *cloudBrands = [NSMutableSet set];
     BOOL mach = NO;
     BOOL gRcptVerify = NO;   // v2.58.176: 收据验证型信号(verifyReceipt 网络 / 本地收据文件 / 收据解析库)
     BOOL gRcptNetwork = NO;  // v2.58.176: verifyReceipt 网络验证(收据 mock 端点在场)
     BOOL gRcptLocal = NO;    // v2.58.176: 本地收据文件读取(appStoreReceiptURL — L1 伪造对症)
+    // ══════════ v2.58.177 判型总闸架构重构: 唯一事实源 ══════════
+    // 病(dbg_165): 详情页顶部 route 写"mock", 底部证据写"无云验证", 状态型/mock/L1/patch 四条路
+    //   全推荐 — 因为 route/type 是一套 if-else 结论, lines 证据是各 detector 自己 addObject 的
+    //   散装文案, 两者不同源不联动(170 只收口了顶部, 证据体没收编, 黑名单事后擦擦不净)。
+    // 治: detector 只置"结构化信号"(下列变量), 绝不自己往详情页写路线/判型文案;
+    //   函数末尾按 type 从信号统一派生 证据(evidence) + 唯一 route。三者同源, 物理上不可能打架。
+    // — 网络捕获分类信号(F4 置位) —
+    NSUInteger netTotal = 0, netCloudHits = 0, netVrfyHits = 0, netSelfHits = 0;
+    NSMutableArray *netCloudURLs = [NSMutableArray array];   // 命中的云验证域 URL(证据展示)
+    NSMutableArray *netVrfyURLs  = [NSMutableArray array];   // 命中的收据验证端点 URL
+    // — 非判定型 SDK(付费墙UI/编排, Superwall 等: 只提示不判型) —
+    NSMutableArray *uiSDKs = [NSMutableArray array];
+    // — 状态型信号(F9, stateprobe 置位; 提到函数级供末尾派生) —
+    NSUInteger liveKeyN = 0;
+    // — EXCPORTS 客观描述(mach 类旁证; 保留最多 1 条有意义的) —
+    NSString *excNote = nil;
+    // — 自研 IAP 端点信号(F7/srvSelfIap 派生用) —
+    int gEpHits = 0;
     NSString *skType = @"未知", *validator = @"无收据验证特征";
 
     // ---- F1 二进制品牌串/域名串 ----
@@ -2611,7 +2629,7 @@ NSDictionary *mfReconFingerprint(void) {
     NSData *d = exe ? [NSData dataWithContentsOfFile:exe options:NSDataReadingMappedIfSafe error:NULL] : nil;
     const uint8_t *p = d.bytes;
     NSUInteger n = d.length;
-    if (n > 320u * 1024 * 1024) { n = 320u * 1024 * 1024; [lines addObject:@"(二进制超 320MB, 指纹只扫前段)"]; }
+    if (n > 320u * 1024 * 1024) { n = 320u * 1024 * 1024; }   // v2.58.177: 超大二进制只扫前段(内部, 不写详情页)
     unsigned binHits = 0;
     for (NSDictionary *b in mfRecCloudBrands()) {
         BOOL brandHit = NO, spmOnly = NO;
@@ -2632,29 +2650,25 @@ NSDictionary *mfReconFingerprint(void) {
             if (brandHit) break;
         }
         if (brandHit) {
-            // v2.58.176: 只有判定型云 SDK(kind=ent)进 cloudBrands 触发 cloud 分支;
-            //   非判定型(kind=ui, Superwall)只作提示 line, 不参与判型主轴。
+            // v2.58.176/177: 判定型云 SDK(kind=ent)进 cloudBrands; 非判定型(kind=ui)只置 uiSDKs 信号。
+            //   detector 不再写 lines — 证据在末尾按 type 派生(唯一事实源)。
             NSString *kind = b[@"kind"] ?: @"ent";
             if ([kind isEqualToString:@"ent"]) {
                 [cloudBrands addObject:b[@"name"]];
                 binHits++;
-                if (binHits <= 6) [lines addObject:[NSString stringWithFormat:@"二进制含订阅验证 SDK 串: %@ → %@(权益判定型云 SDK)", b[@"pats"][0], b[@"name"]]];
             } else {
-                [lines addObject:[NSString stringWithFormat:@"二进制含 %@ 串(付费墙 UI/编排 SDK, 非权益判定源) — 不作云验证判型依据", b[@"name"]]];
+                if (![uiSDKs containsObject:b[@"name"]]) [uiSDKs addObject:b[@"name"]];
             }
-        } else if (spmOnly) {
-            [lines addObject:[NSString stringWithFormat:@"剔除 %@ 串命中: 仅存在于 SPM 依赖清单 URL(github.com/…) — 工具库依赖, 非订阅 SDK", b[@"name"]]];
-        }
+        }   // v2.58.177: spmOnly 剔除是内部过程, 不再写详情页(命中即静默剔除)
     }
-    if (binHits) [lines addObject:@"（二进制串 = 静态指纹, 不受任何开关影响 — 判定以此为准）"];
+    // v2.58.177: F1 证据(静态指纹)在末尾按 type 派生, detector 不写 lines。
 
     // ---- F2 RC 缓存(云响应已到过本机) ----
+    BOOL gRcCache = NO, gRcCacheMock = NO;
     if ([[NSUserDefaults standardUserDefaults] objectForKey:@"com.revenuecat.userdefaults.productEntitlementMapping"]) {
         [cloudBrands addObject:@"RevenueCat"];
-        BOOL inj = [[NSUserDefaults standardUserDefaults] boolForKey:@"mfSubInjectEnabled"];
-        [lines addObject:inj ?
-            @"RC 缓存在场（⚠ 订阅注入开启中, 此缓存可能是 mock 伪造响应写入的 — 弱证据）" :
-            @"RC 缓存 productEntitlementMapping 在场"];
+        gRcCache = YES;
+        gRcCacheMock = [[NSUserDefaults standardUserDefaults] boolForKey:@"mfSubInjectEnabled"];   // 注入开启时缓存可能是 mock 写入
     }
 
     // ---- F1.5 Xray 采集残留(CompatPatcher 观察机若在本 app 采集过标本, 其授权形态可直接引用) ----
@@ -2665,20 +2679,11 @@ NSDictionary *mfReconFingerprint(void) {
         NSString *xp = [home stringByAppendingPathComponent:@"Documents/mfcompat_xray.log"];
         NSString *xd = [NSString stringWithContentsOfFile:xp encoding:NSUTF8StringEncoding error:nil];
         if (xd.length) {
-            BOOL viaRecon = [xd containsString:@"recon session"];
-            // v2.55: 观察模块独立后, "兼容列表会话"文案过时——统一为"标本观察"(可能来自观察列表或兼容列表, 以观察模块为准)
+            // v2.58.177: Xray 标本只置 mach 信号(实测许可服务器上线), 证据由末尾 mach 型派生, 不写散装 lines。
             NSRange sr = [xd rangeOfString:@"SUMMARY cnt:" options:NSBackwardsSearch];
             if (sr.location != NSNotFound) {
                 NSString *summ = [xd substringFromIndex:sr.location];
-                [lines addObject:[NSString stringWithFormat:@"Xray 标本观察在场(%@): %@",
-                    viaRecon ? @"侦查会话" : @"观察模块",
-                    [[summ componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]] firstObject] ?: summ]];
-                if ([summ containsString:@"mach=1"]) {
-                    mach = YES;   // 许可服务器已实测上线——mach 协议型直接实锤(比端口推断强)
-                    [lines addObject:@"Xray 实测: MACH_MSG_SERVER 已上线 → 本地许可服务器(mach 协议型)实锤"];
-                }
-                if ([summ containsString:@"vmprot="] && ![summ containsString:@"vmprot=0"])
-                    [lines addObject:@"Xray 实测: vm_protect 被调用 → 内联补丁动作在场"];
+                if ([summ containsString:@"mach=1"]) mach = YES;   // 许可服务器已实测上线(比端口推断强)
             }
         }
     }
@@ -2690,61 +2695,62 @@ NSDictionary *mfReconFingerprint(void) {
         mach_port_t ports[32]; exception_behavior_t behs[32]; thread_state_flavor_t flvs[32];
         kern_return_t kr = task_get_exception_ports(mach_task_self(), EXC_MASK_ALL, masks, &cnt, ports, behs, flvs);
         if (kr != KERN_SUCCESS) {
-            [lines addObject:[NSString stringWithFormat:@"EXCPORTS 读取失败 kr=%d", kr]];
+            excNote = [NSString stringWithFormat:@"EXCPORTS 读取失败 kr=%d", kr];
         } else {
-            BOOL found = NO;
             for (mach_msg_type_number_t i = 0; i < cnt; i++) {
                 if (ports[i] == MACH_PORT_NULL) continue;
-                found = YES;
+                if (g_mitmMyPort != MACH_PORT_NULL && ports[i] == g_mitmMyPort) continue;   // 自家端口剔除
                 // 目标型强指纹: 独立 BREAKPOINT 条目 + MACH_EXCEPTION_CODES|EXCEPTION_STATE + ARM_THREAD_STATE64
-                if (g_mitmMyPort != MACH_PORT_NULL && ports[i] == g_mitmMyPort) {
-                    [lines addObject:@"EXCPORTS: 自家 EXCPROBE 端口(本插件侦查系统自身), 已剔除"];
-                    continue;
-                }
                 if (masks[i] == EXC_MASK_BREAKPOINT && behs[i] == (MACH_EXCEPTION_CODES | EXCEPTION_STATE) && flvs[i] == 6) {
-                    mach = YES;
-                    [lines addObject:[NSString stringWithFormat:@"EXCPORTS[%u] 独立 BREAKPOINT 条目(MACH|STATE flv=6) → 本地许可服务器注册（mach 协议型内购特征）", (unsigned)i]];
-                } else if (masks[i] & EXC_MASK_BREAKPOINT) {
-                    [lines addObject:[NSString stringWithFormat:@"EXCPORTS[%u] mask=0x%x beh=%#x flv=%d → 系统级注册（crash handler, 每个进程都有, 与内购无关）", (unsigned)i, masks[i], behs[i], flvs[i]]];
-                } else {
-                    [lines addObject:[NSString stringWithFormat:@"EXCPORTS[%u] mask=0x%x beh=%#x flv=%d", (unsigned)i, masks[i], behs[i], flvs[i]]];
+                    mach = YES;   // 本地许可服务器注册(mach 协议型内购特征) — 证据在末尾 mach 型派生
                 }
+                // v2.58.177: crash handler 等系统级注册是噪声, 不写详情页(dbg_165: EXCPORTS crash handler 行无意义)
             }
-            if (!found) [lines addObject:@"EXCPORTS: 全空(无异常端口注册者)"];
         }
-        // v2.58 定位修正(用户判定): EXCPORTS=检测"别家 mach 许可服务器"的观察判据(样本型),
-        //   不是本插件 patch 流程的一环 — 只在 mach 命中时作为旁证输出, 不再当主判定展示。
+        // v2.58 定位修正: EXCPORTS=检测"别家 mach 许可服务器"的观察判据(样本型),
+        //   不是本插件 patch 流程的一环 — 仅置 mach 信号, 证据由末尾按 type 派生。
     }
 
     // ---- F4 网络捕获域命中(自家探针流量剔除 — mfprobe offerings 是我们发的, 算自证) ----
     RECON_P("F4-netcapture");
     {
         NSArray *recs = mfCapturedRecordsSnapshot();
-        unsigned hits = 0, selfHits = 0;
         NSMutableSet *seenUrl = [NSMutableSet set];
         for (MFNetRecord *r in recs) {
             NSString *u = r.url;
             if (!u.length) continue;
-            if ([u containsString:@"mfprobe"]) { selfHits++; continue; }
+            if ([u containsString:@"mfprobe"]) { netSelfHits++; continue; }
             if ([seenUrl containsObject:u]) continue;   // 同 URL 去重
             [seenUrl addObject:u];
+            netTotal++;
             NSString *lu = u.lowercaseString;
+            // ① 判定型云 SDK 品牌域名(RC/Adapty/... — kind=ent)
+            BOOL matched = NO;
             for (NSDictionary *b in mfRecCloudBrands()) {
-                if (![(b[@"kind"] ?: @"ent") isEqualToString:@"ent"]) continue;   // v2.58.176: 非判定型 SDK(Superwall)域名命中不触发 cloud 判型
+                if (![(b[@"kind"] ?: @"ent") isEqualToString:@"ent"]) continue;
                 for (NSString *pat in b[@"pats"]) {
                     if ([lu containsString:pat.lowercaseString]) {
-                        hits++;
+                        netCloudHits++;
                         [cloudBrands addObject:b[@"name"]];
-                        if (hits <= 3) [lines addObject:[NSString stringWithFormat:@"网络捕获命中: %@", u]];
+                        if (netCloudURLs.count < 3) [netCloudURLs addObject:u];
+                        matched = YES; break;
                     }
                 }
+                if (matched) break;
+            }
+            if (matched) continue;
+            // ② v2.58.177 收据验证端点(dbg_165 根因③: 旧分类器只认云品牌, 不认 verifyReceipt
+            //    → 抓到 77 条却报"无云验证域"。收据验证端点是 SK1 收据型的判定本体, 必须认)。
+            if ([lu containsString:@"verifyreceipt"] || [lu containsString:@"buy.itunes.apple.com"]
+                || [lu containsString:@"sandbox.itunes.apple.com"]) {
+                netVrfyHits++;
+                gRcptNetwork = YES;   // 运行时实锤 verifyReceipt 在用(比静态串更强)
+                if (netVrfyURLs.count < 3) [netVrfyURLs addObject:u];
             }
         }
-        if (selfHits) [lines addObject:[NSString stringWithFormat:@"网络捕获含自家探针流量 %u 条(mfprobe uid), 已剔除", selfHits]];
-        if (hits > 3) [lines addObject:[NSString stringWithFormat:@"…网络捕获共 %u 条 App 自身云验证域请求", hits]];
-        if (hits) [lines addObject:@"（网络捕获为辅助证据: 受捕获/注入开关影响, 判定以二进制静态指纹为准）"];
-        if (!hits) [lines addObject:[NSString stringWithFormat:@"网络捕获 %lu 条记录, 无 App 云验证域(未开捕获或纯本地)", (unsigned long)recs.count]];
     }
+    // v2.58.177: 网络证据在末尾按 type 派生(cloud 型报云域命中 / 收据型报 verifyReceipt 命中 /
+    //   都没有则报"抓 N 条无判定域"); detector 不再自己写打架的结论行。
 
     // ---- F6 SK 形态/本地校验策略(纯 SK 型的攻击层推荐依据) ----
     RECON_P("F6-skform-enter");
@@ -2837,11 +2843,12 @@ NSDictionary *mfReconFingerprint(void) {
         if (lrcpt) [vparts addObject:@"本地收据文件(appStoreReceiptURL — 可 L1 伪造)"];
         if (cms && !libHits.count) [vparts addObject:@"自研 CMS/OpenSSL 验签"];
         if (vparts.count) validator = [vparts componentsJoinedByString:@" + "];
-        // v2.58.176: 收据验证信号入 recon(供判型总闸做 SK1 收据型锚 + 详情页路线)
-        gRcptVerify = (vrcpt || lrcpt || libHits.count > 0);
-        gRcptNetwork = vrcpt;
+        // v2.58.176/177: 收据验证信号入 recon(供末尾按 type 派生证据+路线)。
+        //   gRcptNetwork 用 |= — F4 netcapture(运行时抓到 verifyReceipt)可能已置位, 别被静态结果覆盖掉。
+        gRcptVerify = (vrcpt || lrcpt || libHits.count > 0 || gRcptNetwork);
+        gRcptNetwork = gRcptNetwork || vrcpt;
         gRcptLocal = lrcpt;
-        [lines addObject:[NSString stringWithFormat:@"SK 形态: %@ · 本地校验策略: %@", skType, validator]];
+        // v2.58.177: SK 形态证据在末尾派生, detector 不写 lines(此前"无收据验证特征"错报即因此行独立于判型)。
     }
 
     // ---- F8 entitlement 判定点位扫描(v2.57 链B: 扫描→定位, 产出可 patch 数据) ----
@@ -2927,22 +2934,12 @@ NSDictionary *mfReconFingerprint(void) {
         }
         if (!cloudBrands.count && !mach && epHits >= 1 && !skHere) {
             srvSelfIap = YES;
-            [lines addObject:[NSString stringWithFormat:
-                @"自研 IAP 端点 %d 条 + 无本地 SK 权益链 → 权益状态由自家后端下发", epHits]];
         } else if (srvTicket) {
-            // v2.58.124: 服务器授权票据型 — 优先于"本地判定型"播报(结构性结论)
-            [lines addObject:@"服务器授权票据型(entitlements:sync 端点 + JWT 票据字段 iat/exp/kid/grace_seconds"
-                             @" + permanent_entitlements_authoritative) — 权益=服务器签发票据, 本地 patch 结构性无效"];
+            // v2.58.124: 服务器授权票据型(信号已置, 证据/结论由末尾 type 派生)
         } else if (epHits >= 1 && skHere) {
-            // v2.58.116 (抓包实证修正): 用户提供解锁后抓包 — POST /iap/pro-status 响应
-            //   在解锁前后**完全一致**({"active":false}), 而 UI/恢复购买/功能三项全通。
-            //   → 服务端响应不是判定源, 端点只是**遥测/数据同步**。
-            //   旧文案"混合型, 以本地 StoreKit 判定为准"会误导(暗示服务端有话语权);
-            //   实际: 权益 100% 本地判定, 服务端端点与解锁无关。
-            [lines addObject:[NSString stringWithFormat:
-                @"自研 IAP 端点 %d 条 + 本地 SK 权益链在场(%lu 门) → 本地判定型(端点仅遥测, 实测响应不影响 UI)",
-                epHits, (unsigned long)(nLocalPts + nVfyPts)]];
+            // v2.58.116: 自研 IAP 端点 + 本地 SK 链 = 本地判定型(端点仅遥测) — 信号 gEpHits/skHere, 末尾派生
         }
+        gEpHits = epHits;
     }
     // ══════════ v2.58.169 判型总闸(第一刀: 前置入库闸门) ══════════
     // 病(dbg_155): 框架扫描/sk2/cands 的 merge 全在判型之前跑, verdict 最后才算, 管不住入库
@@ -3137,24 +3134,15 @@ NSDictionary *mfReconFingerprint(void) {
             extern void mfAppPatchEntDumpsMerge(NSArray *);
             mfAppPatchEntDumpsMerge(entFuncs);
         } else if (entFuncs.count && (gBlockCodePts || cloudBrands.count)) {
-            [lines addObject:[NSString stringWithFormat:@"框架符号候选 %lu 个: %@ — 不入库", (unsigned long)entFuncs.count,
-                              cloudBrands.count ? @"云验证型(判定在云端回包, 框架门为噪声)" : @"判型总闸拦下(本地 patch 对此型无效)"]];
-            [entFuncs removeAllObjects];   // v2.58.176: 云型/服务端型清空框架门, 防下游 nDeepLib 等误算入
+            [entFuncs removeAllObjects];   // v2.58.176/177: 云型/服务端型清空框架门(内部, 证据由末尾 type 派生, 不写散装 lines)
         }
         }   // v2.58.55: if (!sk2LocalType) 闭合 — SK2 流型时整块框架扫描跳过
         RECON_P("frameworkscan-done");
-        if (entFuncs.count && !gBlockCodePts) {
+        if (entFuncs.count && !gBlockCodePts && !cloudBrands.count) {
             RECON_P("branch-entfuncs");
-            [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(可 patch) — 见实验模拟页", (unsigned long)entFuncs.count]];
-            for (NSDictionary *f in [entFuncs subarrayWithRange:NSMakeRange(0, MIN(4, entFuncs.count))]) {
-                NSString *s = f[@"sym"] ?: @"";
-                NSString *tail = s.length > 46 ? [s substringFromIndex:s.length - 46] : s;
-                [lines addObject:[NSString stringWithFormat:@"  %@:%#lx …%@", f[@"img"], [f[@"vmaddr"] unsignedLongValue], tail]];
-            }
-        } else {
-        // v2.58.21: F9+F8 双路并报 — ServeLog 教训: 旧逻辑"F9 命中即跳过 F8"误判
-        // (文案/URL 词表误命中 → 把纯 SK2 代码判定型 app 掐死在 F8 门外)。现在
-        // 状态型线索与代码扫描并存, recon 只报数据, 用户在 UI 里自己选主路线。
+            // v2.58.177: 框架门入库(已在上方 merge), 不写结论 lines — 证据由末尾按 type 派生。
+        }
+        {
             // v2.58.20: F9 状态型判定 — 判定数据源形态先行, UserDefaults 型直写
             //   v2.58.35: 侦查=唯一采集器(用户架构定案) — key 列表由 recon 采集打包进
             //   recon dict(stateKeys), F9 卡片只读缓存, 不再独立扫(此前 F9 自己又扫一遍
@@ -3165,23 +3153,9 @@ NSDictionary *mfReconFingerprint(void) {
             stateKeys = mfStateProbeKeys();          // 采集(函数级变量, 局部接住教训仍守: 不在参数位内联)
             RECON_P("stateprobe-done");
             mfStateReconCacheSet(stateKeys);                  // F9 卡片吃缓存, 不再独立扫
-            // v2.58.35: 状态型判定升级 — 仅静态命中(全是 __cstring 里的死串)不算状态型:
-            //   76 key 全静态(i18n 文案 key/类名/埋点 key 过词表门), 判"状态型"
-            //   与第一行 RC 云验证自相矛盾。实存 key(app 自己写过/读过的)才是 app 真在
-            //   用的状态位。静态候选只作 F9 的"可试探"展示, 不再撑判定。
-            NSUInteger liveKeys = 0;
-            for (NSDictionary *d in stateKeys) if ([d[@"live"] boolValue]) liveKeys++;
-            if (liveKeys > 0) {
-                [lines addObject:[NSString stringWithFormat:@"判定数据源: 🔓 状态型(UserDefaults 实存 %lu 语义key, 静态候选 %lu) — 🧪实验模拟→F9 状态解锁 直写",
-                    (unsigned long)liveKeys, (unsigned long)stateKeys.count]];
-                for (NSDictionary *d in [stateKeys subarrayWithRange:NSMakeRange(0, MIN(3, stateKeys.count))]) {
-                    [lines addObject:[NSString stringWithFormat:@"  %@%@ %@",
-                        d[@"key"], [d[@"isDate"] boolValue] ? @" 📅" : @"",
-                        [d[@"live"] boolValue] ? @"(实存)" : @"(静态)"]];
-                }
-            } else if (stateKeys.count) {
-                [lines addObject:[NSString stringWithFormat:@"判定数据源: 非状态型(静态候选 %lu 全是二进制死串, 无实存 key) — i18n 文案/类名误命中已排除", (unsigned long)stateKeys.count]];
-            }
+            // v2.58.177: 只置 liveKeyN 信号, 不写 lines。状态型是否成立由末尾 type 派生统一裁定
+            //   (dbg_165 根因: 此处独立写"🔓 状态型...F9 直写", 与顶部 route 打架 — 收编)。
+            for (NSDictionary *dd in stateKeys) if ([dd[@"live"] boolValue]) liveKeyN++;
             RECON_P("stateprobe-branch-done");
             // v2.58.9 F8v2: strip 主二进制兜底 — 符号表无判定函数时走 chained fixups 链
             // (imports→SK 词表→bind→GOT slot→stubs→bl 调用点→prologue 归属), 点位合成 @0x 名
@@ -3201,68 +3175,31 @@ NSDictionary *mfReconFingerprint(void) {
             NSArray *mergePts = sk2ptsRef;
             RECON_P("merge-predone");
             if (gBlockCodePts) {
-                // v2.58.169 判型总闸: 服务端型/收据验证型 → sk2 代码点结构性无效, 一律不入库
-                if (mergePts.count)
-                    [lines addObject:[NSString stringWithFormat:@"代码判定点 %lu 个: 判型总闸拦下(本地 patch 对此型无效) — 不入库", (unsigned long)mergePts.count]];
+                // v2.58.169 判型总闸: 服务端型/收据验证型 → sk2 代码点结构性无效, 一律不入库(内部, 不写 lines)
             } else if (cloudBrands.count) {
-                // v2.58.173 云型 sk2 代码点抑制: reflix 战役定谳 — 云验证型双因子 =
-                //   mock(云端回包) + F10 深槽装载点(判定点腿, reflix 的 0x14211bc)。
-                //   sk2vfy/sk2br/sk2plan 是标准 SK2 API 通用结构(2.58.116 定谳: 任何 SK2
-                //   app 都有, 非特征), 判定本体在云端 → 入库只会用通用噪声淹没真判定点腿。
-                //   → sk2 点不入库(只 mfLog 记录, 不进详情页 lines); F10 深槽由下方专管。
+                // v2.58.173 云型 sk2 代码点抑制(判定本体在云端, sk2 是通用结构噪声); F10 深槽下方专管。
                 if (mergePts.count)
                     mfLog(@"[f8v2] 云验证型 sk2 代码点 %lu 个不入库(通用 SK2 结构非判定腿, 判定点腿=F10 深槽)", (unsigned long)mergePts.count);
             } else if ([mergePts isKindOfClass:[NSArray class]] && mergePts.count) {
                 mfAppPatchEntDumpsMerge(mergePts);
                 RECON_P("merge-done");
-                [entFuncs addObjectsFromArray:mergePts];
-                // v2.58.117: 分真门/候选播报 — 不再用一个虚高总数误导(dbg_108 用户反馈)
-                NSUInteger nRG = 0;
-                for (NSDictionary *f in mergePts)
-                    if ([f[@"shape"] isEqualToString:@"sk2vfy"] && [f[@"score"] intValue] >= 99) nRG++;
-                if (nRG > 0)
-                    [lines addObject:[NSString stringWithFormat:@"代码判定点: %lu 个已入库(★真门 %lu · 其余候选 %lu) — 见实验模拟页",
-                                      (unsigned long)mergePts.count, (unsigned long)nRG,
-                                      (unsigned long)(mergePts.count > nRG ? mergePts.count - nRG : 0)]];
-                else
-                    [lines addObject:[NSString stringWithFormat:@"代码判定点: %lu 个已入库(isPro 写点/读侧 getter, 指令级 mov #1) — 见实验模拟页", (unsigned long)mergePts.count]];
+                [entFuncs addObjectsFromArray:mergePts];   // v2.58.177: 入库, 证据由末尾 type 派生
             }
-            // v2.58.55: SK2 流型(非云)抑制 F8v2 swifttext 点位 — dbg_58 用户拍板:
-            //   "侦查详情页都给出那么详细的判决了, 为什么还要把不相干的点位传到实验
-            //   模拟页?" — 判型已定 SK2 流型时, F8 getter 点位是噪声不入库; 云型 F10
-            //   deepslot 仍保留(双因子实测)。
+            // v2.58.55: SK2 流型(非云)抑制 F8v2 swifttext 点位; 云型 F10 deepslot 直通(双因子本地腿)。
             if (sk2LocalType) {
-                // 抑制 F8 点位: 不 merge 不显示 — lines 只报 SK2 路线
-                [lines addObject:@"F8v2 swifttext 候选: 该 app 已有 isPro 指令级点位, 函数符号候选未入库"];
+                // 抑制 F8 点位: 不 merge(内部, 不写 lines)
             } else if (cloudBrands.count) {
-                // v2.58.174: F10 深槽判定腿(deepPts)直通入库 — 判型钦定的云型双因子本地腿,
-                //   已在 F8v2 隔离(不流经 out/top12 截断), 这里无条件全量 merge, 绝不退化。
-                NSUInteger nDeep = deepPts.count;
-                if (nDeep) {
+                // v2.58.174: F10 深槽判定腿(deepPts)直通入库 — 判型钦定, 已隔离不流经截断, 无条件全量 merge。
+                if (deepPts.count) {
                     extern void mfAppPatchEntDumpsMerge(NSArray *);
                     mfAppPatchEntDumpsMerge(deepPts);
                     [entFuncs addObjectsFromArray:deepPts];
-                    [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个 F10 深槽装载点已入库 — 见实验模拟页 ⚡", (unsigned long)nDeep]];
-                    [lines addObject:@"解锁路线: 云端 mock(订阅注入开关) + ⚡深槽装载点 双因子 — F8v2 swifttext 点位对云验证型高危, 已抑制不入库"];
-                } else {
-                    [lines addObject:@"entitlement 判定点位: F10 未命中(无深槽装载链) — F8v2 swifttext 候选对云验证型高危, 均不入库"];
-                    [lines addObject:@"解锁路线: 云端 mock(订阅注入开关)单因子 — 深槽链不在本 app 判型内"];
                 }
             } else if ([candsRef isKindOfClass:[NSArray class]] && candsRef.count && !gBlockCodePts) {
                 extern void mfAppPatchEntDumpsMerge(NSArray *);
                 mfAppPatchEntDumpsMerge(candsRef);
-                [entFuncs addObjectsFromArray:candsRef];
-                // v2.58.76: 标签按 score 来源分开报 — 旧实现一律写"F8v2 fixups 链", 实际
-                //   库里多半是 f8v3(score 91~93)共享 bool getter, 把排查方向带偏(dbg_78)。
-                NSUInteger nSem = 0, nGetter = 0;
-                for (NSDictionary *f in candsRef)
-                    if ([f[@"score"] intValue] >= 91 || [f[@"shape"] length]) nGetter++; else nSem++;
-                [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(语义锚定 %lu · getter %lu)", (unsigned long)candsRef.count, (unsigned long)nSem, (unsigned long)nGetter]];
-                for (NSDictionary *f in [candsRef subarrayWithRange:NSMakeRange(0, MIN(6, candsRef.count))]) {
-                    NSString *src = ([f[@"score"] intValue] >= 91 || [f[@"shape"] length]) ? @"getter" : @"语义锚定";
-                    [lines addObject:[NSString stringWithFormat:@"  [%@] %@:%@ score=%@", src, f[@"img"], f[@"vmaddr"], f[@"score"] ?: @"?"]];
-                }
-            } else [lines addObject:@"entitlement 判定点位: 未发现(框架无符号判定函数, 主二进制 fixups 链无 SK 消费候选)"];
+                [entFuncs addObjectsFromArray:candsRef];   // v2.58.177: 入库, 证据由末尾 type 派生
+            }
             }
         }   // v2.58.121: else 块闭合 — v2.58.55 重排时吞掉了这个 }!
             //   dbg_115 定谳: 括号深度分析显示 if(entFuncs.count){...}else{ 之后
@@ -3283,9 +3220,12 @@ NSDictionary *mfReconFingerprint(void) {
     {
         // 状态型 = 无云无 mach + 实存语义 key 数量 ≥2(静态死串不算, 76 假案定谳)
         // v2.58.50: SK2 流型在场时状态 key 是镜像 — 降级为线索, 不判状态型
-        if (!cloud && !mach && !sk2stream) {
-            NSUInteger live = 0;
-            for (NSDictionary *d in stateKeys) if ([d isKindOfClass:[NSDictionary class]] && [d[@"live"] boolValue]) live++;
+        // v2.58.177 (dbg_165 定谳): 收据验证型/SK本地链在场时, UserDefaults key 是缓存镜像不是判定源 —
+        //   bazaart 有 verifyReceipt 收据验证 + SK1+SK2, 却因 F9 采集器把 Swift 类名(SuperwallKit.
+        //   Entitlement)/VC 类名(PremiumNewViewController)/尺寸缓存(size.iPad_*)当"语义 key"凑够
+        //   数判成状态型 → 直写一堆垃圾。收据/SK 链在场时状态型让位(判定本体在收据, 不在 UserDefaults)。
+        if (!cloud && !mach && !sk2stream && !gRcptVerify) {
+            NSUInteger live = liveKeyN;
             if (live >= 2) stateType = YES;
         }
     }
@@ -3372,51 +3312,88 @@ NSDictionary *mfReconFingerprint(void) {
                                                      withString:[NSString stringWithFormat:@"%@(疑似多 SDK)", names]];
     }
 
-    // ══════════ v2.58.170 判型总闸第二刀: 单一 type + 单一 route 收口 ══════════
-    // 病(dbg_155/156): 详情页 42 处 addObject 各 detector 自说自话 → 同页出现
-    //   "服务器票据型本地无效" vs "解锁路线云端mock" vs "F10均不入库" 三句打架 + 一堆
-    //   内部过程日志(N个拦下/未命中)。用户: 这是判型总结页, 不是日志垃圾场。
-    // 治: 判型信号已全就绪(上方), 这里一次性定 type(唯一) + route(唯一解锁路线)。
-    //   详情页只显示 verdict(结论) + route(该怎么做), 过程日志降级(见下 mfReconShowDetailPage 过滤)。
+    // ══════════ v2.58.177 判型总闸(唯一事实源): type → evidence + route 全派生 ══════════
+    // 架构(dbg_165 定谳): detector 只置结构化信号(cloud/mach/gRcpt*/nCodePts/liveKeyN/net*...),
+    //   一律不自己往详情页写路线/结论文案。此处一次定 type, 再由 type **派生**证据(evidence)与
+    //   唯一 route — 三者同源, 物理上不可能出现"顶部 mock / 底部无云验证"打架(旧病: route 一套
+    //   if-else, lines 是各 detector 散装 addObject, 两套逻辑各说各话, 170 黑名单擦不净)。
     NSString *mfType, *route;
-    if (cloud && mach)      { mfType = @"云验证+本地许可服务器"; route = nDeepLib > 0
-                                ? [NSString stringWithFormat:@"实验模拟页双因子: ①订阅注入(mock 回包) ②⚡F10 深槽判定点 %lu 个 ③EXCPROBE 应答器", (unsigned long)nDeepLib]
-                                : @"实验模拟页: 订阅注入(mock 回包) + EXCPROBE 应答器"; }
-    else if (cloud)         { mfType = nDeepLib > 0 ? @"云端订阅验证型(双因子: mock + F10 深槽判定点)" : @"云端订阅验证型";
-                              route = nDeepLib > 0
-                                ? [NSString stringWithFormat:@"实验模拟页双因子: ①订阅注入开关(mock 回包) ②判定点列表⚡F10 深槽装载点 %lu 个", (unsigned long)nDeepLib]
-                                : @"实验模拟页: 订阅注入开关(mock 回包)"; }
-    else if (mach)          { mfType = @"本地许可服务器型"; route = @"实验模拟页: 开 EXCPROBE 应答器"; }
-    else if (serverSide)    { mfType = @"服务器权益型"; route = @"⛔ 权益在服务端会话, 本地解锁无效 — 无可用本地路线"; }
-    else if (srvSelfIap)    { mfType = @"自研服务端权益型"; route = @"⛔ 权益由自家后端下发, 本地解锁无效 — 无可用本地路线"; }
-    else if (srvTicket)     { mfType = @"服务器授权票据型"; route = @"⛔ 权益=服务器签发 JWT 票据, 本地 patch 结构性无效 — 无可用本地路线"; }
-    else if (obsReceipt || obsFlow > 0) { mfType = @"收据验证型(运行时观测确证)"; route = @"实验模拟页: L1 收据伪造开关"; }
-    else if (gRcptNetwork)  { mfType = @"收据验证型(verifyReceipt 网络验证)";
-                              route = gRcptLocal
-                                ? @"实验模拟页: 云验证 mock 开关(拦 verifyReceipt 注入收据) 或 L1 收据伪造"
-                                : @"实验模拟页: 云验证 mock 开关(拦 verifyReceipt 注入收据)"; }
-    else if (gRcptLocal)    { mfType = @"收据验证型(本地收据文件)"; route = @"实验模拟页: L1 收据伪造开关"; }
-    else if (nRealGate > 0) { mfType = @"代码判定型(本地 SK2 验证链)"; route = [NSString stringWithFormat:@"实验模拟页判定点列表 ⚡ patch(★真门 %lu 个优先)", (unsigned long)nRealGate]; }
-    else if (nCodePts > 0)  { mfType = @"代码判定型(指令级 patch)"; route = [NSString stringWithFormat:@"实验模拟页判定点列表 ⚡ patch(%lu 点)", (unsigned long)nCodePts]; }
-    else if (stateType)     { mfType = @"状态型(UserDefaults)"; route = @"实验模拟页: F9 状态解锁直写"; }
-    else if (skLocal)       { mfType = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@)", skType]; route = @"实验模拟页判定点列表 ⚡ patch"; }
-    else                    { mfType = @"未识别"; route = @"未发现订阅验证 SDK — 可开实时日志观测 + 逛购买页重扫"; }
+    NSMutableArray *ev = [NSMutableArray array];   // 证据(由 type 决定展示哪几条), 与 route 同源
+    // 通用客观证据(所有 type 都可带, 不含路线推荐)
+    NSString *skLine = [NSString stringWithFormat:@"SK 形态: %@ · 本地校验策略: %@", skType, validator];
+    if (uiSDKs.count) [ev addObject:[NSString stringWithFormat:@"付费墙 UI/编排 SDK: %@(非权益判定源, 不作判型依据)", [uiSDKs componentsJoinedByString:@"/"]]];
+
+    if (cloud && mach) {
+        mfType = @"云验证+本地许可服务器";
+        route = nDeepLib > 0
+            ? [NSString stringWithFormat:@"实验模拟页双因子: ①订阅注入(mock 回包) ②⚡F10 深槽判定点 %lu 个 ③EXCPROBE 应答器", (unsigned long)nDeepLib]
+            : @"实验模拟页: 订阅注入(mock 回包) + EXCPROBE 应答器";
+        [ev addObject:[NSString stringWithFormat:@"云验证 SDK: %@", [[cloudBrands allObjects] componentsJoinedByString:@"/"]]];
+        [ev addObject:@"EXCPORTS: 本地许可服务器(mach 协议)在场"];
+        if (netCloudHits) [ev addObject:[NSString stringWithFormat:@"网络捕获: %lu 条云验证域请求(如 %@)", (unsigned long)netCloudHits, netCloudURLs.firstObject ?: @""]];
+    } else if (cloud) {
+        mfType = nDeepLib > 0 ? @"云端订阅验证型(双因子: mock + F10 深槽判定点)" : @"云端订阅验证型";
+        route = nDeepLib > 0
+            ? [NSString stringWithFormat:@"实验模拟页双因子: ①订阅注入开关(mock 回包) ②判定点列表⚡F10 深槽装载点 %lu 个", (unsigned long)nDeepLib]
+            : @"实验模拟页: 订阅注入开关(mock 回包)";
+        [ev addObject:[NSString stringWithFormat:@"云验证 SDK: %@%@", [[cloudBrands allObjects] componentsJoinedByString:@"/"], gRcCache ? (gRcCacheMock ? @"(RC 缓存在场·可能 mock 写入)" : @"(RC 缓存在场)") : @""]];
+        if (netCloudHits) [ev addObject:[NSString stringWithFormat:@"网络捕获: %lu 条云验证域请求(如 %@)", (unsigned long)netCloudHits, netCloudURLs.firstObject ?: @""]];
+        else [ev addObject:[NSString stringWithFormat:@"网络捕获: %lu 条(未捕获到云验证域, 判定以二进制指纹为准)", (unsigned long)netTotal]];
+    } else if (mach) {
+        mfType = @"本地许可服务器型"; route = @"实验模拟页: 开 EXCPROBE 应答器";
+        [ev addObject:@"EXCPORTS: 本地许可服务器(mach 协议)注册在场"];
+    } else if (serverSide) {
+        mfType = @"服务器权益型"; route = @"⛔ 权益在服务端会话, 本地解锁无效 — 无可用本地路线";
+        [ev addObject:skLine]; [ev addObject:@"WebView 桥权益标志在场(FlexCall/loadSuccess 族)"];
+    } else if (srvSelfIap) {
+        mfType = @"自研服务端权益型"; route = @"⛔ 权益由自家后端下发, 本地解锁无效 — 无可用本地路线";
+        [ev addObject:[NSString stringWithFormat:@"自研 IAP 端点 %d 条 + 无本地 SK 权益链 → 权益由后端下发", gEpHits]];
+    } else if (srvTicket) {
+        mfType = @"服务器授权票据型"; route = @"⛔ 权益=服务器签发 JWT 票据, 本地 patch 结构性无效 — 无可用本地路线";
+        [ev addObject:@"票据字段族在场(iat/exp/kid/grace_seconds + entitlements:sync + permanent_entitlements_authoritative)"];
+    } else if (gRcptNetwork || obsReceipt) {
+        // v2.58.177 收据验证型(verifyReceipt 网络): 静态串 或 运行时捕获 或 观测确证。多信号收敛到一个 type。
+        mfType = @"收据验证型(verifyReceipt 网络验证)";
+        route = gRcptLocal
+            ? @"实验模拟页: 云验证 mock 开关(拦 verifyReceipt 注入收据) 或 L1 收据伪造(本地收据文件)"
+            : @"实验模拟页: 云验证 mock 开关(拦 verifyReceipt 注入收据)";
+        [ev addObject:skLine];
+        if (netVrfyHits) [ev addObject:[NSString stringWithFormat:@"网络捕获实锤: %lu 条 verifyReceipt 验证请求(如 %@)", (unsigned long)netVrfyHits, netVrfyURLs.firstObject ?: @""]];
+        else if (netTotal) [ev addObject:[NSString stringWithFormat:@"网络捕获 %lu 条(verifyReceipt 见二进制静态串)", (unsigned long)netTotal]];
+        if (obsFlow > 0) [ev addObject:[NSString stringWithFormat:@"运行时观测: SK 购买流消费者 %lu 个", (unsigned long)obsFlow]];
+    } else if (gRcptLocal) {
+        mfType = @"收据验证型(本地收据文件)"; route = @"实验模拟页: L1 收据伪造开关";
+        [ev addObject:skLine];
+    } else if (nRealGate > 0) {
+        mfType = @"代码判定型(本地 SK2 验证链)";
+        route = [NSString stringWithFormat:@"实验模拟页判定点列表 ⚡ patch(★真门 %lu 个优先)", (unsigned long)nRealGate];
+        [ev addObject:skLine];
+        [ev addObject:[NSString stringWithFormat:@"代码判定点: %lu 个(★真门 %lu · 其余候选 %lu)", (unsigned long)nCodePts, (unsigned long)nRealGate, (unsigned long)(nCodePts > nRealGate ? nCodePts - nRealGate : 0)]];
+    } else if (nCodePts > 0) {
+        mfType = @"代码判定型(指令级 patch)";
+        route = [NSString stringWithFormat:@"实验模拟页判定点列表 ⚡ patch(%lu 点)", (unsigned long)nCodePts];
+        [ev addObject:skLine];
+        [ev addObject:[NSString stringWithFormat:@"代码判定点: %lu 个(isPro 写点/读侧 getter)", (unsigned long)nCodePts]];
+    } else if (stateType) {
+        mfType = @"状态型(UserDefaults)"; route = @"实验模拟页: F9 状态解锁直写";
+        [ev addObject:[NSString stringWithFormat:@"UserDefaults 实存语义 key %lu 个", (unsigned long)liveKeyN]];
+    } else if (skLocal) {
+        mfType = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@)", skType];
+        route = entFuncs.count ? @"实验模拟页判定点列表 ⚡ patch" : @"判定点未定位 — 可开实时日志观测 + 逛购买页重扫";
+        [ev addObject:skLine];
+    } else {
+        mfType = @"未识别"; route = @"未发现订阅验证 SDK — 可开实时日志观测 + 逛购买页重扫";
+        if (netTotal) [ev addObject:[NSString stringWithFormat:@"网络捕获 %lu 条(无已知判定域)", (unsigned long)netTotal]];
+    }
+    if (excNote) [ev addObject:excNote];
 
     // v2.58.55: 本次会话侦查点位缓存 — 已废除(2.58.61 用户定案)
     //   侦查→mfAppPatchEntDumpsMerge 入库, 实验/列表 UI 只读持久层, 无"本次有效"概念
     // v2.58.74: 轮次结束 — 剔除本轮未扫出且用户未持久化的陈旧点后, 卡片"共 N 点"= 本轮真值
     mfAppPatchEntDumpsEndRound();
     RECON_P("done");
-    // v2.58.170 第二刀: 详情页只留"判型证据"类 lines(SK形态/SDK指纹/端点), 过程日志(N个拦下/
-    //   未命中/已入库/深槽点)剔除 —— 结论页只讲结论, 过程去 [f8v2]/[recon] 调试行。
-    NSMutableArray *cleanLines = [NSMutableArray array];
-    for (NSString *l in lines) {
-        if ([l containsString:@"拦下"] || [l containsString:@"未命中"] || [l containsString:@"均不入库"]
-            || [l containsString:@"已入库"] || [l containsString:@"候选未入库"] || [l containsString:@"深槽装载点"]
-            || [l containsString:@"判定点位:"] || [l containsString:@"解锁路线:"]) continue;   // 过程/旧路线文案 → 详情页不显示(route 统一收口)
-        [cleanLines addObject:l];
-    }
-    return @{@"verdict": verdict, @"type": mfType, @"route": route, @"lines": cleanLines,
+    // v2.58.177: lines = 唯一事实源派生的 ev(不再对 detector 散装文案做黑名单过滤 — 从源头就不产)。
+    return @{@"verdict": verdict, @"type": mfType, @"route": route, @"lines": ev,
              @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide), @"sk": @(skLocal),
              @"sk2": @(sk2stream),
              @"sktype": skType, @"validator": validator,
