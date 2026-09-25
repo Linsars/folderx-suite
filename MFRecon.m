@@ -180,7 +180,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
     //   主二进制无 SK 符号 → stub-match bail → 判型全丢)。
     //   现在: 返回空结构而非 nil, 调用方照常消费; 并明确日志"交框架扫描兜底"。
     #define F8V2_BAIL(tag) do { mfLog(@"[f8v2] ✗ 步骤:%s 中断(降级返回空结果, 侦查继续)", tag); \
-        return @{@"cands": @[], @"ncalls": @0, @"skstubs": @0, @"skimports": @0, @"sk2pts": @[]}; } while (0)
+        return @{@"cands": @[], @"ncalls": @0, @"skstubs": @0, @"skimports": @0, @"sk2pts": @[], @"deepPts": @[]}; } while (0)
 
     // ---- LC: __text/__stubs section(rev2 不再需要 fixups 表) ----
     const struct load_command *lc = (const struct load_command *)((const uint8_t *)mh + sizeof(struct mach_header_64));
@@ -1842,7 +1842,12 @@ static NSDictionary *mfReconF8v2Scan(void) {
 
     NSString *imgName = mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main";
     NSMutableArray *out = [NSMutableArray array];
-    NSUInteger f8v2Seg = 0;   // v2.58.76: F8v2 段边界(语义锚定候选, 截断时必须保位)
+    // v2.58.174 架构修正(dbg_161/162 "判定点腿飞了"): F10 深槽判定点腿物理隔离。
+    //   deepslot 是判型逻辑钦定的云型双因子本地腿(reflix 0x14211bc/0x11d5398), 不是通用候选。
+    //   旧架构把它塞进 out → 与 f8v3 getter 同池走 top12 截断 → 语义锚定占满 keep 时被当噪声丢弃。
+    //   判型钦定点位必须直通入库, 不进候选池竞争 → 独立 deepPts, 全程不流经 out 截断管线。
+    NSMutableArray *deepPts = [NSMutableArray array];
+    NSUInteger f8v2Seg = 0;   // v2.58.76: F8v2 段(语义锚定候选, 截断时必须保位)
     // v2.58.16: top6→top12 + CE 消费者无条件保位 — dbg_16 实锤真判定函数
     // (CE 唯一消费者 0x100070cb0, score=5) 被垃圾候选(假 stub 的 calls大户)挤出 top6
     for (NSUInteger i = 0; i < cands.count && i < 12; i++) {
@@ -2509,7 +2514,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     if (!pt) continue;
                                     nDS10++;
                                     mfLog(@"[f10] ★深槽装载点 @%#llx x%u (host=%#llx caller=%#llx)", (unsigned long long)pt, ptRt, (unsigned long long)tgt, (unsigned long long)cf);
-                                    [out addObject:@{
+                                    // v2.58.174: 深槽判定腿 → deepPts(隔离), 不进 out 截断管线
+                                    [deepPts addObject:@{
                                         @"img": imgName,
                                         @"sym": [NSString stringWithFormat:@"deepslot@%llx.%u", (unsigned long long)(pt - textVM), ptRt],
                                         @"vmaddr": @(pt),
@@ -2539,12 +2545,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         NSMutableArray *pool = [NSMutableArray array];
                         for (NSUInteger i = 0; i < mo.count; i++) {
                             NSDictionary *it = mo[i];
-                            // v2.58.174 根因修复(dbg_161/162 "判定点腿飞了"): deepslot(F10 深槽判定点腿)
-                            //   无条件保位。deepslot 在 f8v2Seg 之后加入, 旧逻辑归 pool; 当语义锚定候选≥4
-                            //   时 room=0 → pool 一个不填 → F10 判定点腿(reflix 0x14211bc/0x11d5398)被
-                            //   当噪声截断丢弃。deepslot 是 F10 专属强判定点(score93, 云型双因子的本地腿),
-                            //   与 f8v3 共享 getter 噪声不同类, 绝不能进 pool 参与截断。
-                            if ([it[@"shape"] isEqualToString:@"deepslot"] || (i < f8v2Seg && [it[@"score"] intValue] >= 3)) [keep addObject:it];
+                            // v2.58.174: deepslot 已隔离到 deepPts 不入 out, 此处只在 f8v2/f8v3 候选间截断。
+                            if (i < f8v2Seg && [it[@"score"] intValue] >= 3) [keep addObject:it];
                             else [pool addObject:it];
                         }
                         [pool sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
@@ -2567,10 +2569,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
                         [mo removeAllObjects];
                         [mo addObjectsFromArray:keep];
                         [mo addObjectsFromArray:[pool subarrayWithRange:NSMakeRange(0, fill)]];
-                        NSUInteger nDeepKept = 0;
-                        for (NSDictionary *it in keep) if ([it[@"shape"] isEqualToString:@"deepslot"]) nDeepKept++;
-                        mfLog(@"[f8v3] 截断: 语义锚定保位=%lu 槽(含 F10 深槽 %lu), getter 填充=%lu (池 %lu)",
-                              (unsigned long)keep.count, (unsigned long)nDeepKept, (unsigned long)fill, (unsigned long)pool.count);
+                        mfLog(@"[f8v3] 截断: 语义锚定保位=%lu 槽, getter 填充=%lu (池 %lu)",
+                              (unsigned long)keep.count, (unsigned long)fill, (unsigned long)pool.count);
                     }
                 }
             }
@@ -2578,7 +2578,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
     }
     } // @autoreleasepool F8v3
     return @{@"cands": out, @"ncalls": @(nCall), @"skstubs": @(nSkStub), @"skimports": @(nSkStub),
-             @"sk2pts": sk2pts};
+             @"sk2pts": sk2pts, @"deepPts": deepPts};   // v2.58.174: 深槽判定腿隔离直通
     }
 }
 
@@ -2819,6 +2819,7 @@ NSDictionary *mfReconFingerprint(void) {
     RECON_P("F8v2-done");
     NSArray *cands = f8v2[@"cands"];
     NSArray *sk2pts = f8v2[@"sk2pts"];
+    NSArray *deepPts = f8v2[@"deepPts"] ?: @[];   // v2.58.174: F10 深槽判定腿(隔离, 判型钦定直通入库)
     BOOL sk2LocalType = NO;
     {
         NSUInteger nS = 0;
@@ -3171,22 +3172,17 @@ NSDictionary *mfReconFingerprint(void) {
                 // 抑制 F8 点位: 不 merge 不显示 — lines 只报 SK2 路线
                 [lines addObject:@"F8v2 swifttext 候选: 该 app 已有 isPro 指令级点位, 函数符号候选未入库"];
             } else if (cloudBrands.count) {
-                // v2.58.40: F10 点位也要 merge 入库(云验证型专属判定点 — 深槽装载链)
-                NSUInteger nDeep = 0;
-                if ([cands isKindOfClass:[NSArray class]]) {
-                    NSMutableArray *deepOnly = [NSMutableArray array];
-                    for (NSDictionary *c in cands) if ([c[@"shape"] isEqualToString:@"deepslot"]) { [deepOnly addObject:c]; nDeep++; }
-                    if (deepOnly.count) {
-                        extern void mfAppPatchEntDumpsMerge(NSArray *);
-                        mfAppPatchEntDumpsMerge(deepOnly);
-                        [entFuncs addObjectsFromArray:deepOnly];
-                    }
-                }
+                // v2.58.174: F10 深槽判定腿(deepPts)直通入库 — 判型钦定的云型双因子本地腿,
+                //   已在 F8v2 隔离(不流经 out/top12 截断), 这里无条件全量 merge, 绝不退化。
+                NSUInteger nDeep = deepPts.count;
                 if (nDeep) {
+                    extern void mfAppPatchEntDumpsMerge(NSArray *);
+                    mfAppPatchEntDumpsMerge(deepPts);
+                    [entFuncs addObjectsFromArray:deepPts];
                     [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个 F10 深槽装载点已入库 — 见实验模拟页 ⚡", (unsigned long)nDeep]];
                     [lines addObject:@"解锁路线: 云端 mock(订阅注入开关) + ⚡深槽装载点 双因子 — F8v2 swifttext 点位对云验证型高危, 已抑制不入库"];
                 } else {
-                    [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: F10 未命中(无深槽装载链) — F8v2 swifttext %lu 候选对云验证型高危, 均不入库", (unsigned long)([cands isKindOfClass:[NSArray class]] ? cands.count : 0)]];
+                    [lines addObject:@"entitlement 判定点位: F10 未命中(无深槽装载链) — F8v2 swifttext 候选对云验证型高危, 均不入库"];
                     [lines addObject:@"解锁路线: 云端 mock(订阅注入开关)单因子 — 深槽链不在本 app 判型内"];
                 }
             } else if ([candsRef isKindOfClass:[NSArray class]] && candsRef.count && !gBlockCodePts) {
