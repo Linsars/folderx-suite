@@ -1679,8 +1679,10 @@ void mfShowLabPage(void) {
 - (void)mfShowBatteryPage { mfShowBatteryPage(); }
 - (void)mfHostLogSwitchChanged:(UISwitch *)sw {
     mfSetBoolPref(@"mfHostLogEnabled", sw.on);
-    if (sw.on) mfHostLogStart();
-    else mfHostLogStop();
+    extern void mfEntObserveInstall(void);
+    extern void mfEntObserveSetOn(BOOL on);
+    if (sw.on) { mfHostLogStart(); mfEntObserveInstall(); }   // v2.58.164: 观测随实时日志开
+    else { mfHostLogStop(); mfEntObserveSetOn(NO); }          // 关: 停记录(swizzle 已挂不卸)
     // 状态栏即时刷新(不等 0.5s timer)
     UIView *page = objc_getAssociatedObject(sw, "hlPage");
     UILabel *st = [page viewWithTag:201];
@@ -2611,6 +2613,10 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
         // v2.6.17: 宿主日志(pipe+dup2)——开关默认 OFF,开过则冷启动即接管 fd
         if (mfPrefBool(@"mfHostLogEnabled", NO)) {
             mfHostLogStart();
+            // v2.58.164: 运行时权益观测搭车实时日志开关 —— 同一 if, ctor 早期装载,
+            //   赶在 app 读 Pro getter 之前 swizzle 上, 一读即被实时日志捕获显示。
+            extern void mfEntObserveInstall(void);
+            mfEntObserveInstall();
         }
         // v2.6.85: CloudKit once 预热——有 iCloud entitlement 的 app 启动时后台预热 CK
         // （点按钮时才首调 CK = once 运行中途触发 = SIGTRAP @ CK+0x9e89c，三次复现实锤）

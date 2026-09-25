@@ -1090,3 +1090,129 @@ void mfShowCDFilePage(NSString *zipPath, NSString *entryName) {
     mfPushPage(page);
     [ctl load];
 }
+
+// ================= 运行时权益观测 (v2.58.164) =================
+// 用户定案: 观测搭车「实时日志」开关 —— 开关开过 → 冷启动 ctor 早期装载(与
+//   mfHostLogStart 同一 if) → app 一读 Pro getter 就 [obs] 现形, 被实时日志捕获显示。
+// 纯观测: 调原实现拿真实返回值, 只记录不改写(不影响 app 行为)。
+// 覆盖边界: 只抓 @objc / OC 的权益判定 getter(零参 + 返回 BOOL)。纯 Swift 非 @objc
+//   方法不在 objc runtime, 抓不到 —— 这是原理边界, 不装万能。
+// 安全枚举: 只枚举 app bundle 内镜像(主二进制 + 内嵌 SDK 如 SwiftyStoreKit/RevenueCat),
+//   跳系统库; 逐镜像 objc_copyClassNamesForImage(绝不 objc_copyClassList 全进程
+//   force-realize —— 那会让 iOS26 Swift 泛型 conformance 崩, Real Crash 2026-09-06)。
+// 为什么这是"观测"不是又一个脆弱判据: 记的是运行时真实返回值 + 值变化, 不猜指令、
+//   不依赖二进制明文串、不本地推断 —— 它在运行时自证, 天然对不上不了(治本地失真的病)。
+
+#import <objc/runtime.h>
+#include <ctype.h>
+
+static NSLock *g_obsLock;
+static NSMutableDictionary<NSString *, NSString *> *g_obsLastVal;   // "Cls.sel" → 上次值(去重)
+static NSUInteger g_obsCount;
+static BOOL g_obsOn = NO;   // v2.58.164: 记录开关(swizzle 一旦挂上不卸, 靠 flag 控记录 — 同 L0 范式)
+
+// 值记录: 首见 或 值变化 才打日志(高频 getter 稳定返回同值时不刷屏; 购买后 NO→YES 立刻现形)
+static void mfObsRecord(NSString *cls, NSString *sel, NSString *val) {
+    if (!g_obsLock || !g_obsOn) return;
+    NSString *key = [NSString stringWithFormat:@"%@.%@", cls, sel];
+    int action = 0;   // 0=无 1=首见 2=值变化
+    NSString *last = nil;
+    [g_obsLock lock];
+    last = g_obsLastVal[key];
+    if (!last) { g_obsLastVal[key] = val; action = 1; }
+    else if (![last isEqualToString:val]) { g_obsLastVal[key] = val; action = 2; }
+    [g_obsLock unlock];
+    // 日志在锁外打(mfLog 自带锁 + 走 fd, 不在持锁时做 IO)
+    if (action == 2)      mfLog(@"[obs] ★值变化 %@: %@ → %@", key, last, val);
+    else if (action == 1) mfLog(@"[obs] %@ = %@ (首见)", key, val);
+}
+
+// 权益语义词根(小写子串匹配) —— 通用, 零 app 硬编码
+static BOOL mfObsIsEntSel(const char *s) {
+    static const char *KW[] = {
+        "ispro","haspro","ispremium","haspremium","isvip","hasvip","isplus",
+        "issubscri","subscribed","issubscribed","hasactivesub",
+        "isentitle","hasentitle","entitled","entitlement",
+        "isunlock","unlocked","ispaid","ismember","ismembership",
+        "isactive","canaccess","isupgrad","ispurchas","purchased",
+        "islifetime","isforever","isperpetual","isvalidpro","haslicense","islicensed",
+        NULL
+    };
+    char buf[160]; int i = 0;
+    for (; s[i] && i < 159; i++) buf[i] = (char)tolower((unsigned char)s[i]);
+    buf[i] = 0;
+    for (int k = 0; KW[k]; k++) if (strstr(buf, KW[k])) return YES;
+    return NO;
+}
+
+// 单个方法: 权益语义 + 零参 + 返回 BOOL/_Bool → swizzle 记录 wrapper
+static void mfObsTryHook(Class cc, Method m, const char *clsName, BOOL isMeta) {
+    if (g_obsCount >= 800) return;
+    SEL sel = method_getName(m);
+    const char *sn = sel_getName(sel);
+    if (!sn || strchr(sn, ':')) return;          // 只零参 getter(读侧判定几乎都是)
+    if (!mfObsIsEntSel(sn)) return;               // 权益语义
+    char *rt = method_copyReturnType(m);
+    char r = rt ? rt[0] : 0;
+    if (rt) free(rt);
+    if (r != 'B' && r != 'c') return;             // 只 BOOL(_Bool)/BOOL(signed char) —— ABI 1 字节, 安全
+
+    IMP orig = method_getImplementation(m);
+    NSString *clsN = [NSString stringWithUTF8String:clsName];
+    NSString *selN = NSStringFromSelector(sel);
+    IMP wrap = imp_implementationWithBlock(^BOOL(id s, SEL c2) {
+        BOOL v = ((BOOL(*)(id, SEL))orig)(s, c2);
+        mfObsRecord(clsN, selN, v ? @"YES" : @"NO");
+        return v;                                 // 纯观测: 原样返回, 不改
+    });
+    method_setImplementation(m, wrap);
+    g_obsCount++;
+    mfLog(@"[obs] 挂载 %c%@.%@", isMeta ? '+' : '-', clsN, selN);
+}
+
+void mfEntObserveInstall(void) {
+    g_obsOn = YES;   // 装载即开启记录
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        g_obsLock = [NSLock new];
+        g_obsLastVal = [NSMutableDictionary dictionary];
+        g_obsCount = 0;
+        // 逐镜像原子快照(objc_copyImageNames + strdup 自持 —— 防 dlclose 悬挂, Real Crash #2)
+        unsigned ic = 0;
+        const char **imgs = objc_copyImageNames(&ic);
+        if (!imgs || !ic) { mfLog(@"[obs] 无镜像可枚举"); return; }
+        char **safe = malloc(sizeof(char *) * ic);
+        for (unsigned i = 0; i < ic; i++) safe[i] = strdup(imgs[i] ?: "");
+        free(imgs);
+
+        NSUInteger nCls = 0;
+        for (unsigned i = 0; i < ic && g_obsCount < 800; i++) {
+            const char *img = safe[i];
+            // 只 app bundle 内镜像(主二进制 + 内嵌 framework/SDK), 跳 /System /usr/lib 系统库
+            if (!strstr(img, ".app/")) continue;
+            unsigned cn = 0;
+            char **names = objc_copyClassNamesForImage(img, &cn);
+            for (unsigned j = 0; j < cn && g_obsCount < 800; j++) {
+                Class c = objc_getClass(names[j]);
+                if (!c) continue;
+                nCls++;
+                for (int meta = 0; meta < 2; meta++) {
+                    Class cc = meta ? object_getClass(c) : c;
+                    unsigned mc = 0;
+                    Method *ms = class_copyMethodList(cc, &mc);
+                    for (unsigned k = 0; k < mc; k++)
+                        mfObsTryHook(cc, ms[k], names[j], meta);
+                    free(ms);
+                }
+            }
+            if (names) free(names);
+        }
+        for (unsigned i = 0; i < ic; i++) free(safe[i]);
+        free(safe);
+        mfLog(@"[obs] 权益观测装载: 扫 %lu 类 → 挂 %lu 个权益 getter(实时日志现形; app 读 Pro 即录)",
+              (unsigned long)nCls, (unsigned long)g_obsCount);
+    });
+}
+
+// v2.58.164: 记录开关 — 实时日志开关关闭时一并停记录(swizzle 不卸, 靠 flag)。
+void mfEntObserveSetOn(BOOL on) { g_obsOn = on; }
