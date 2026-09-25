@@ -2847,6 +2847,21 @@ NSDictionary *mfReconFingerprint(void) {
                 epHits, (unsigned long)(nLocalPts + nVfyPts)]];
         }
     }
+    // ══════════ v2.58.169 判型总闸(第一刀: 前置入库闸门) ══════════
+    // 病(dbg_155): 框架扫描/sk2/cands 的 merge 全在判型之前跑, verdict 最后才算, 管不住入库
+    //   → mailnow 被塞 3 个 SwiftyStoreKit 内部点(needsFinishTransaction, 非 Pro 门)。
+    // 治: 把"本地代码点无意义"的判型信号提到所有 merge 之前, 一个闸门 gBlockCodePts 统管:
+    //   服务端票据/自研服务端 + 运行时观测确证的收据验证型(购买流消费者/收据验证类) →
+    //   本地指令 patch 结构性无效, 一个点都不入库(杜绝"什么都往 patch 引擎塞")。
+    //   信号全部就绪: srvTicket/srvSelfIap 上方已赋值; obs 是 extern 运行时查询。
+    extern BOOL mfObsReceiptVerifierSeen(void);
+    extern NSUInteger mfObsFlowClassCount(void);
+    BOOL gObsReceipt = mfObsReceiptVerifierSeen();
+    NSUInteger gObsFlow = mfObsFlowClassCount();
+    BOOL gBlockCodePts = srvTicket || srvSelfIap || gObsReceipt || (gObsFlow > 0);
+    if (gBlockCodePts)
+        mfLog(@"[f8v2] ★判型总闸: 本地代码点闸门关闭(srvTicket=%d srvSelfIap=%d obs收据=%d obs购买流=%lu) — 框架/sk2/cands 点位不入库",
+              srvTicket, srvSelfIap, gObsReceipt, (unsigned long)gObsFlow);
     NSMutableArray *entFuncs = [NSMutableArray array];
     // v2.58.74: 轮次开始 — 标记库中点位"本轮未见", merge 时置 seen, 结束剔除陈旧
     extern void mfAppPatchEntDumpsBeginRound(void);
@@ -2957,13 +2972,16 @@ NSDictionary *mfReconFingerprint(void) {
         // v2.58 接线: 侦查→实验模拟页数据通道 — 扫到的点位直接合并进 mfEntDumps_<bid>
         // 持久存储, 实验模拟页判定点卡片从这读(不再依赖规则表/橙色生成按钮)
         // v2.58.55: 抑制判据已提到块外(sk2LocalType, 单一事实来源)
-        if (entFuncs.count) {
+        // v2.58.169: 判型总闸 — 本地代码点闸门关闭时(服务端型/收据验证型)不入库框架符号点
+        if (entFuncs.count && !gBlockCodePts) {
             extern void mfAppPatchEntDumpsMerge(NSArray *);
             mfAppPatchEntDumpsMerge(entFuncs);
+        } else if (entFuncs.count && gBlockCodePts) {
+            [lines addObject:[NSString stringWithFormat:@"框架符号候选 %lu 个: 判型总闸拦下(本地 patch 对此型无效) — 不入库", (unsigned long)entFuncs.count]];
         }
         }   // v2.58.55: if (!sk2LocalType) 闭合 — SK2 流型时整块框架扫描跳过
         RECON_P("frameworkscan-done");
-        if (entFuncs.count) {
+        if (entFuncs.count && !gBlockCodePts) {
             RECON_P("branch-entfuncs");
             [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: %lu 个(可 patch) — 见实验模拟页", (unsigned long)entFuncs.count]];
             for (NSDictionary *f in [entFuncs subarrayWithRange:NSMakeRange(0, MIN(4, entFuncs.count))]) {
@@ -3020,7 +3038,11 @@ NSDictionary *mfReconFingerprint(void) {
             extern void mfAppPatchEntDumpsMerge(NSArray *);
             NSArray *mergePts = sk2ptsRef;
             RECON_P("merge-predone");
-            if ([mergePts isKindOfClass:[NSArray class]] && mergePts.count) {
+            if (gBlockCodePts) {
+                // v2.58.169 判型总闸: 服务端型/收据验证型 → sk2 代码点结构性无效, 一律不入库
+                if (mergePts.count)
+                    [lines addObject:[NSString stringWithFormat:@"代码判定点 %lu 个: 判型总闸拦下(本地 patch 对此型无效) — 不入库", (unsigned long)mergePts.count]];
+            } else if ([mergePts isKindOfClass:[NSArray class]] && mergePts.count) {
                 mfAppPatchEntDumpsMerge(mergePts);
                 RECON_P("merge-done");
                 [entFuncs addObjectsFromArray:mergePts];
@@ -3061,7 +3083,7 @@ NSDictionary *mfReconFingerprint(void) {
                     [lines addObject:[NSString stringWithFormat:@"entitlement 判定点位: F10 未命中(无深槽装载链) — F8v2 swifttext %lu 候选对云验证型高危, 均不入库", (unsigned long)([cands isKindOfClass:[NSArray class]] ? cands.count : 0)]];
                     [lines addObject:@"解锁路线: 云端 mock(订阅注入开关)单因子 — 深槽链不在本 app 判型内"];
                 }
-            } else if ([candsRef isKindOfClass:[NSArray class]] && candsRef.count) {
+            } else if ([candsRef isKindOfClass:[NSArray class]] && candsRef.count && !gBlockCodePts) {
                 extern void mfAppPatchEntDumpsMerge(NSArray *);
                 mfAppPatchEntDumpsMerge(candsRef);
                 [entFuncs addObjectsFromArray:candsRef];
@@ -3130,12 +3152,9 @@ NSDictionary *mfReconFingerprint(void) {
     NSUInteger nRealGate = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2vfy"] && [f[@"score"] intValue] >= 99) nRealGate++;
-    // v2.58.168 B: 观测喂判型 — 运行时观测(实时日志开关下)结果, 提到 verdict 链之前取值
-    //   (extern/取值不能插在 else-if 链中间, 否则断链)。
-    extern BOOL mfObsReceiptVerifierSeen(void);
-    extern NSUInteger mfObsFlowClassCount(void);
-    BOOL obsReceipt = mfObsReceiptVerifierSeen();
-    NSUInteger obsFlow = mfObsFlowClassCount();
+    // v2.58.168/169 B: 观测喂判型 — 信号已在判型总闸(上方)取过, 这里复用 gObsReceipt/gObsFlow。
+    BOOL obsReceipt = gObsReceipt;
+    NSUInteger obsFlow = gObsFlow;
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
