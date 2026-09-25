@@ -1270,23 +1270,26 @@ void mfEntObserveInstall(void) {
                 if (!c) continue;
                 nCls++;
                 BOOL entClass = mfObsIsEntClass(names[j]);   // v2.58.165: 权益类 → 全量 dump 诊断
-                // v2.58.166: 流观测 —— 该类实现 paymentQueue:updatedTransactions: 就挂(SK1 购买
-                //   结果回调, 纯 Swift 判定型 app 唯一能观测的信号)。签名固定, 安全。
+                // v2.58.166/167: 流观测 —— 类**自己**实现 paymentQueue:updatedTransactions: 才挂
+                //   (SK1 购买结果回调, 纯 Swift 判定型 app 唯一可观测信号)。
+                // v2.58.167 崩溃修复(dbg 153): 只查 class_copyMethodList(自身方法表), 绝不用
+                //   class_getInstanceMethod / class_getMethodImplementation —— 后者走完整父类链 +
+                //   触发 +resolveInstanceMethod:(跑 app 代码) + realize 全链, 对 1310 类在 launch 期
+                //   逐个跑 → 启动超 20s → FRONTBOARD watchdog SIGKILL(栈顶 ckLog→NSLocale 只是撞线快照)。
                 {
                     SEL flowSel = NSSelectorFromString(@"paymentQueue:updatedTransactions:");
-                    Method fm = class_getInstanceMethod(c, flowSel);
-                    if (fm && class_getMethodImplementation(c, flowSel) != (IMP)mfObsFlowCb) {
-                        // 只在该类自己实现了(非继承)时挂, 避免重复
-                        unsigned own = 0; Method *oml = class_copyMethodList(c, &own); BOOL self_impl = NO;
-                        for (unsigned z = 0; z < own; z++) if (method_getName(oml[z]) == flowSel) { self_impl = YES; break; }
-                        free(oml);
-                        if (self_impl) {
-                            IMP o = method_getImplementation(fm);
-                            g_obsFlowOrig[[NSString stringWithUTF8String:names[j]]] = [NSValue valueWithPointer:o];
-                            method_setImplementation(fm, (IMP)mfObsFlowCb);
+                    unsigned own = 0; Method *oml = class_copyMethodList(c, &own);
+                    for (unsigned z = 0; z < own; z++) {
+                        if (method_getName(oml[z]) != flowSel) continue;
+                        IMP cur = method_getImplementation(oml[z]);
+                        if (cur != (IMP)mfObsFlowCb) {
+                            g_obsFlowOrig[[NSString stringWithUTF8String:names[j]]] = [NSValue valueWithPointer:cur];
+                            method_setImplementation(oml[z], (IMP)mfObsFlowCb);
                             mfLog(@"[obs] 挂流观测 -%s.paymentQueue:updatedTransactions:", names[j]);
                         }
+                        break;
                     }
+                    free(oml);
                 }
                 for (int meta = 0; meta < 2; meta++) {
                     Class cc = meta ? object_getClass(c) : c;
