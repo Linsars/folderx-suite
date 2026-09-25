@@ -124,7 +124,15 @@ static BOOL mfMangledModule(const char *nm, char *out, size_t outsz) {
 }
 
 // 框架权益门语义打分(小写 mangled 全名) — score>0 才是候选, 越高越像真门。
+// 框架权益门语义打分(小写 mangled 全名) — 返回值 >0 才是候选, 越高越像真门。
+//   负向词命中直接返 -1(陷阱门: 打了有害或无效, 绝不入库)。
 static int mfEntSemScore(const char *lower) {
+    // ★负向词优先: 试用资格/反作弊/促销/系统权限 — 打这些不解锁, 甚至反效果(dbg_159:
+    //   isEligibleForIntroOffer 恒真 → "年度会员变 7 天免费")。命中即弃。
+    const char *neg[] = {"intro","trial","freetrial","cheat","promo","coupon","referr",
+                         "speechrecognition","locationservice","isauthorizedforwidget",
+                         "calendar","notification","microphone","camera","contacts","photolibrary",NULL};
+    for (int i=0; neg[i]; i++) if (strstr(lower, neg[i])) return -1;
     int s = 0;
     // 强锚: scripting 战役验证过的真门族 + 通用权益守卫命名(具体, 不易撞)
     const char *strong[] = {"proaccessguard","accessguard","entitlementoracle","entitlement",
@@ -137,8 +145,9 @@ static int mfEntSemScore(const char *lower) {
                          "ispaiduser","ispremiumuser",NULL};
     for (int i=0; ent[i]; i++) if (strstr(lower, ent[i])) { s += 5; break; }
     // 判定语义: auth/manage/vip/member/paid(覆盖 canManageModels/isClaudeAuthActive/isGPTAuthActive)
+    //   注: iseligible 从此层移除 — 它几乎只出现在 isEligibleForIntro(试用), 已被负向词拦。
     const char *sem[] = {"authactive","isauth","canmanage","manages","ismember","membership",
-                         "isvip","ispaid","canaccess","iseligible","isactivated",NULL};
+                         "isvip","ispaid","canaccess","isactivated","isunlocked","hasaccess",NULL};
     for (int i=0; sem[i]; i++) if (strstr(lower, sem[i])) { s += 3; break; }
     return s;
 }
@@ -2919,7 +2928,9 @@ NSDictionary *mfReconFingerprint(void) {
         //   现在: ① 检查改为每框架都做 ② 符号循环内也检查(每 4096 符号一次)。
         CFAbsoluteTime fwT0 = CFAbsoluteTimeGetCurrent();
         unsigned fwScanned = 0, fwTotal = 0;
-        for (uint32_t i = 0; i < ic && entFuncs.count < 24; i++) {
+        // v2.58.172: 外层上限 24→400(与单框架 400 一致) — 旧 24 会在收集阶段过早停下一个框架,
+        //   与"收集全部候选后 topN"矛盾。真正的量控在 merge 前排序取 topN, 不在扫描阶段截断。
+        for (uint32_t i = 0; i < ic && entFuncs.count < 400; i++) {
             const char *n = _dyld_get_image_name(i);
             if (!n) continue;
             NSString *full = [NSString stringWithUTF8String:n];
@@ -2974,13 +2985,18 @@ NSDictionary *mfReconFingerprint(void) {
                 if (!anyHit) continue;
             }
             unsigned imgHits = 0;
-            for (uint32_t k = 0; k < nsyms && imgHits < 12; k++) {
+            // v2.58.172: 去 12 上限(dbg_159 定谳) — 旧 imgHits<12 = 扫到"符号表前 12 个命中"就停,
+            //   ScriptingKit 120 万符号线性遍历, score 10 真门(ProAccessGuard)排在 isEligible/
+            //   isAuthorized/checkIsCheater 之后 → 被切掉, 159 全 score 3/5 无真门。
+            //   现在: 扫到时间预算(5s)为止, 收集全部 score>0 候选(上限 400 防爆), merge 前按 score
+            //   降序取 topN → 真门一定冒头排第一, 陷阱靠负向词(-1)剔除, 数量仍可控(非放洪水进 patch)。
+            for (uint32_t k = 0; k < nsyms && imgHits < 400; k++) {
                 // v2.58.121: 符号循环内也查预算 — 单框架符号数可能 10 万+(ScriptingKit 120 万),
                 //   只在框架间查不够(dbg_114: 8s 预算没生效, 卡死在单框架遍历里)。
                 if ((k & 0xFFF) == 0xFFF && (CFAbsoluteTimeGetCurrent() - fwT0 > 5.0)) {
                     mfLog(@"[reconP] frameworkscan 时间预算到(5s, 符号级): 框架 %@ k=%u/%u, 收 %lu 点位",
                           full.lastPathComponent, k, nsyms, (unsigned long)entFuncs.count);
-                    imgHits = 12; break;
+                    break;
                 }
                 if (!(syms[k].n_type & N_SECT) || !syms[k].n_value) continue;
                 const char *nm = strtab + syms[k].n_un.n_strx;
@@ -3030,12 +3046,23 @@ NSDictionary *mfReconFingerprint(void) {
             }
         }
         // v2.58 接线: 侦查→实验模拟页数据通道 — 扫到的点位直接合并进 mfEntDumps_<bid>
-        // v2.58.171: 框架门按语义分降序 — 真门(score 10+, ProAccessGuard 族)靠前, 判定语义(3)垫后。
+        // v2.58.171/172: 框架门按语义分降序 — 真门(score 10+, ProAccessGuard 族)靠前, 判定语义(3)垫后。
         if (entFuncs.count > 1)
             [entFuncs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
                 int sa = [a[@"score"] intValue], sb = [b[@"score"] intValue];
                 return sa > sb ? NSOrderedAscending : (sa < sb ? NSOrderedDescending : NSOrderedSame);
             }];
+        // v2.58.172: 排序后取 topN(≤12)入库 — 收集阶段放开(扫全部 score>0), 量控在此。
+        //   真门(score 高)一定在前 N 内, 低分噪声被截断。dbg_159: 试用/反作弊已被负向词(-1)剔,
+        //   这里再截断保证判定点列表干净可读(用户不必在几十个里翻)。
+        {
+            const NSUInteger kEntTopN = 12;
+            if (entFuncs.count > kEntTopN) {
+                NSUInteger dropped = entFuncs.count - kEntTopN;
+                [entFuncs removeObjectsInRange:NSMakeRange(kEntTopN, dropped)];
+                mfLog(@"[f8v2] 框架门 topN 截断: 保留前 %lu(按 score 降序), 丢弃低分 %lu", (unsigned long)kEntTopN, (unsigned long)dropped);
+            }
+        }
         // v2.58.169: 判型总闸 — 本地代码点闸门关闭时(服务端型/收据验证型)不入库框架符号点
         if (entFuncs.count && !gBlockCodePts) {
             extern void mfAppPatchEntDumpsMerge(NSArray *);
