@@ -592,6 +592,20 @@ static void apEntDumpsLoad(void) {
         {
             NSArray *tombs2 = apTombstones();
             if (tombs2.count) {
+                // v2.58.170: 清历史污染 — manual@0x1027c75bc/0x1027cb5bc 是 pythonide 地址, 曾被
+                //   ctor 无差别塞进全部 app 墓碑(dbg 157)。这两个 sym 从任何 app 墓碑里剔除。
+                static NSArray *kTombPurge;
+                static dispatch_once_t oncePurge;
+                dispatch_once(&oncePurge, ^{ kTombPurge = @[@"manual@0x1027c75bc", @"manual@0x1027cb5bc"]; });
+                NSMutableArray *tombClean = [tombs2 mutableCopy];
+                BOOL tombChanged = NO;
+                for (NSString *bad in kTombPurge)
+                    if ([tombClean containsObject:bad]) { [tombClean removeObject:bad]; tombChanged = YES; }
+                if (tombChanged) {
+                    mfWritePrefObj([NSString stringWithFormat:@"mfTombstones_%@", apCurBundleID()], tombClean.count ? tombClean : nil);
+                    apLog(@"[entdump] ♻️ 清历史墓碑污染(pythonide 单靶子残留) → 剩 %lu", (unsigned long)tombClean.count);
+                    tombs2 = tombClean;
+                }
                 NSMutableArray *clean2 = [NSMutableArray array];
                 for (NSDictionary *d2 in g_entDumps) {
                     NSString *sy2 = d2[@"sym"] ?: @"";

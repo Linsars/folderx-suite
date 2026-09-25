@@ -3194,12 +3194,41 @@ NSDictionary *mfReconFingerprint(void) {
                                                      withString:[NSString stringWithFormat:@"%@(疑似多 SDK)", names]];
     }
 
+    // ══════════ v2.58.170 判型总闸第二刀: 单一 type + 单一 route 收口 ══════════
+    // 病(dbg_155/156): 详情页 42 处 addObject 各 detector 自说自话 → 同页出现
+    //   "服务器票据型本地无效" vs "解锁路线云端mock" vs "F10均不入库" 三句打架 + 一堆
+    //   内部过程日志(N个拦下/未命中)。用户: 这是判型总结页, 不是日志垃圾场。
+    // 治: 判型信号已全就绪(上方), 这里一次性定 type(唯一) + route(唯一解锁路线)。
+    //   详情页只显示 verdict(结论) + route(该怎么做), 过程日志降级(见下 mfReconShowDetailPage 过滤)。
+    NSString *mfType, *route;
+    if (cloud && mach)      { mfType = @"云验证+本地许可服务器"; route = @"实验模拟页: 订阅注入(mock 回包) + ⚡F10 深槽点 双因子"; }
+    else if (cloud)         { mfType = @"云端订阅验证型"; route = @"实验模拟页: 订阅注入开关(mock 回包)"; }
+    else if (mach)          { mfType = @"本地许可服务器型"; route = @"实验模拟页: 开 EXCPROBE 应答器"; }
+    else if (serverSide)    { mfType = @"服务器权益型"; route = @"⛔ 权益在服务端会话, 本地解锁无效 — 无可用本地路线"; }
+    else if (srvSelfIap)    { mfType = @"自研服务端权益型"; route = @"⛔ 权益由自家后端下发, 本地解锁无效 — 无可用本地路线"; }
+    else if (srvTicket)     { mfType = @"服务器授权票据型"; route = @"⛔ 权益=服务器签发 JWT 票据, 本地 patch 结构性无效 — 无可用本地路线"; }
+    else if (obsReceipt || obsFlow > 0) { mfType = @"收据验证型(运行时观测确证)"; route = @"实验模拟页: L1 收据伪造开关"; }
+    else if (nRealGate > 0) { mfType = @"代码判定型(本地 SK2 验证链)"; route = [NSString stringWithFormat:@"实验模拟页判定点列表 ⚡ patch(★真门 %lu 个优先)", (unsigned long)nRealGate]; }
+    else if (nCodePts > 0)  { mfType = @"代码判定型(指令级 patch)"; route = [NSString stringWithFormat:@"实验模拟页判定点列表 ⚡ patch(%lu 点)", (unsigned long)nCodePts]; }
+    else if (stateType)     { mfType = @"状态型(UserDefaults)"; route = @"实验模拟页: F9 状态解锁直写"; }
+    else if (skLocal)       { mfType = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@)", skType]; route = @"实验模拟页判定点列表 ⚡ patch"; }
+    else                    { mfType = @"未识别"; route = @"未发现订阅验证 SDK — 可开实时日志观测 + 逛购买页重扫"; }
+
     // v2.58.55: 本次会话侦查点位缓存 — 已废除(2.58.61 用户定案)
     //   侦查→mfAppPatchEntDumpsMerge 入库, 实验/列表 UI 只读持久层, 无"本次有效"概念
     // v2.58.74: 轮次结束 — 剔除本轮未扫出且用户未持久化的陈旧点后, 卡片"共 N 点"= 本轮真值
     mfAppPatchEntDumpsEndRound();
     RECON_P("done");
-    return @{@"verdict": verdict, @"lines": lines,
+    // v2.58.170 第二刀: 详情页只留"判型证据"类 lines(SK形态/SDK指纹/端点), 过程日志(N个拦下/
+    //   未命中/已入库/深槽点)剔除 —— 结论页只讲结论, 过程去 [f8v2]/[recon] 调试行。
+    NSMutableArray *cleanLines = [NSMutableArray array];
+    for (NSString *l in lines) {
+        if ([l containsString:@"拦下"] || [l containsString:@"未命中"] || [l containsString:@"均不入库"]
+            || [l containsString:@"已入库"] || [l containsString:@"候选未入库"] || [l containsString:@"深槽装载点"]
+            || [l containsString:@"判定点位:"] || [l containsString:@"解锁路线:"]) continue;   // 过程/旧路线文案 → 详情页不显示(route 统一收口)
+        [cleanLines addObject:l];
+    }
+    return @{@"verdict": verdict, @"type": mfType, @"route": route, @"lines": cleanLines,
              @"cloud": @(cloud), @"mach": @(mach), @"srv": @(serverSide), @"sk": @(skLocal),
              @"sk2": @(sk2stream),
              @"sktype": skType, @"validator": validator,
@@ -3292,18 +3321,32 @@ static void mfReconShowDetailPage(NSDictionary *recon);   // 前置
 @end
 static void mfReconShowDetailPage(NSDictionary *recon) {
     UIView *page = mfMakePage(@"侦查详情", YES);
-    UILabel *v = [[UILabel alloc] initWithFrame:CGRectMake(16, 46, g_mfCardW - 32, 40)];
-    v.text = recon[@"verdict"];
-    v.font = [UIFont systemFontOfSize:13.5 weight:UIFontWeightSemibold];
+    // v2.58.170 第二刀: 详情页头 = 判型结论(type) + 解锁路线(route), 单一收口。
+    UILabel *v = [[UILabel alloc] initWithFrame:CGRectMake(16, 46, g_mfCardW - 32, 44)];
+    v.text = [NSString stringWithFormat:@"判型: %@", recon[@"type"] ?: recon[@"verdict"]];
+    v.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
     v.numberOfLines = 0;
     v.textColor = [recon[@"cloud"] boolValue] ? [UIColor systemGreenColor] :
                   [recon[@"mach"] boolValue] ? [UIColor systemPurpleColor] :
-                  [recon[@"sk"] boolValue] ? [UIColor systemBlueColor] : [UIColor secondaryLabelColor];
+                  [recon[@"sk"] boolValue] ? [UIColor systemBlueColor] : [UIColor labelColor];
+    [v sizeToFit];
+    CGRect vf = v.frame; vf.origin = CGPointMake(16, 46); vf.size.width = g_mfCardW - 32; v.frame = vf;
     [page addSubview:v];
+    // 解锁路线行(唯一, 绿=有路线 / 灰=服务端型无本地路线)
+    CGFloat routeY = CGRectGetMaxY(v.frame) + 6;
+    UILabel *rl = [[UILabel alloc] initWithFrame:CGRectMake(16, routeY, g_mfCardW - 32, 40)];
+    NSString *routeTxt = recon[@"route"] ?: @"";
+    rl.text = [NSString stringWithFormat:@"路线: %@", routeTxt];
+    rl.font = [UIFont systemFontOfSize:12.5];
+    rl.numberOfLines = 0;
+    rl.textColor = [routeTxt hasPrefix:@"⛔"] ? [UIColor systemGrayColor] : [UIColor systemTealColor];
+    [rl sizeToFit];
+    CGRect rf = rl.frame; rf.origin = CGPointMake(16, routeY); rf.size.width = g_mfCardW - 32; rl.frame = rf;
+    [page addSubview:rl];
 
     CGFloat tvY = 96;
     NSArray *entFuncs = recon[@"entFuncs"];
-    CGFloat btnY = 92;   // v2.58.7: 按钮纵向游标 — 修 y=92 多按钮叠放(2.58.6 只修了 cloud 分支, else-if 链换分支就复现)
+    CGFloat btnY = CGRectGetMaxY(rl.frame) + 10;   // v2.58.170: 接在 type+route 行之后(不再硬编码 92, 防与新头部重叠)
     BOOL hasEnt = [entFuncs isKindOfClass:[NSArray class]] && entFuncs.count;
     if (hasEnt) {
         // v2.57 链B: 发现 entitlement 判定点位 → 一键生成 swifttext 规则进实验模拟页

@@ -2601,14 +2601,11 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
             return;
         }
 
-        // v2.58.146: 清理 142-145 的单靶子遗留(硬编码点 + probe hook 已废弃)。
-        //   逆向定位的"一个门"对这类分布式判定不成立(dbg_136 定谳), 单靶子路子作废。
-        //   保留 delete 调用以清除老版本装机残留的持久化错误点。
-        {
-            extern void mfAppPatchEntDumpDelete(NSString *);
-            mfAppPatchEntDumpDelete(@"manual@0x1027c75bc");
-            mfAppPatchEntDumpDelete(@"manual@0x1027cb5bc");
-        }
+        // v2.58.170: 删除 142-146 的单靶子遗留清理调用 —— 它是墓碑跨 app 污染源(dbg 157 + plist 实证)。
+        //   根因: mfAppPatchEntDumpDelete 无论点位在不在库都 apTombstoneAdd, 而这两行在**每个 app**
+        //   ctor 都跑(无 bundleID 门控) → 把 pythonide 的 manual@0x1027c75bc/0x1027cb5bc 无差别塞进
+        //   全部 41 个 app 的 mfTombstones_<bid> → 用户清墓碑后重启又被塞回 → 永远"清不掉的 2 个"。
+        //   使命(清 pythonide 早期错误录入残留)早完成 → 直接删。历史污染由 apEntDumpsLoad 自愈剔除。
         // v2.58.157: 清理 155/156 遗留的独立配方存储(状态注入已并入 patch 引擎判定点)。
         //   实际 hook 装载由判定点引擎 apEntDumpsApply 的 hookinj@ 分支驱动(用户 ⚡ 后 on=YES 冷启动重打)。
         {
