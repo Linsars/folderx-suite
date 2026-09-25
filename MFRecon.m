@@ -38,15 +38,23 @@ extern UIViewController *g_mfPanelRootVC;
 extern mach_port_t g_mitmMyPort;   // 自家 EXCPROBE 端口(0=未武装)
 
 // ---- 品牌串 → SDK 名映射(判定报告用具体名字, 不打抽象标签) ----
+// v2.58.176 主轴重构(dbg_164 bazaart 定谳): SDK 分"判定型/非判定型"。
+//   病根: 旧表把 7 个 SDK 一锅烩, 命中任一→cloud=YES→独占"云验证型 + RC mock"路线。
+//   但 Superwall 是付费墙 UI 编排 SDK(A/B + paywall 展示), 权益真伪由 app 的
+//   PurchaseController 回填, 它自己不做判定 → 检测到它对"判定本体在哪"零信息量。
+//   bazaart 只有 Superwall(无 RC), 却被判 RC 云型 → mock RC subscribers 响应 →
+//   app 根本不读 → 解不开(用户实锤"开 rc 开关也解锁不了")。
+//   kind=ent(判定型): RC/Adapty/Qonversion/Apphud/Purchasely/Glassfy — 真持权益响应, 触发 cloud 分支。
+//   kind=ui (非判定): Superwall — 只作提示 line, 不触发 cloud 分支(降级后 app 落到真实的 SK/自研判定)。
 static NSArray *mfRecCloudBrands(void) {
     return @[
-        @{@"pats": @[@"api.revenuecat.com", @"rc-backup", @"revenuecat", @"RevenueCat", @"com.revenuecat"], @"name": @"RevenueCat"},
-        @{@"pats": @[@"superwall", @"Superwall"], @"name": @"Superwall"},
-        @{@"pats": @[@"adapty", @"Adapty"], @"name": @"Adapty"},
-        @{@"pats": @[@"qonversion", @"Qonversion"], @"name": @"Qonversion"},
-        @{@"pats": @[@"apphud", @"Apphud"], @"name": @"Apphud"},
-        @{@"pats": @[@"purchasely", @"Purchasely"], @"name": @"Purchasely"},
-        @{@"pats": @[@"Glassfy"], @"name": @"Glassfy"},
+        @{@"pats": @[@"api.revenuecat.com", @"rc-backup", @"revenuecat", @"RevenueCat", @"com.revenuecat"], @"name": @"RevenueCat", @"kind": @"ent"},
+        @{@"pats": @[@"adapty", @"Adapty"], @"name": @"Adapty", @"kind": @"ent"},
+        @{@"pats": @[@"qonversion", @"Qonversion"], @"name": @"Qonversion", @"kind": @"ent"},
+        @{@"pats": @[@"apphud", @"Apphud"], @"name": @"Apphud", @"kind": @"ent"},
+        @{@"pats": @[@"purchasely", @"Purchasely"], @"name": @"Purchasely", @"kind": @"ent"},
+        @{@"pats": @[@"Glassfy"], @"name": @"Glassfy", @"kind": @"ent"},
+        @{@"pats": @[@"SuperwallKit", @"superwall", @"Superwall"], @"name": @"Superwall", @"kind": @"ui"},
     ];
 }
 
@@ -2593,6 +2601,9 @@ NSDictionary *mfReconFingerprint(void) {
     NSMutableArray *lines = [NSMutableArray array];
     NSMutableSet *cloudBrands = [NSMutableSet set];
     BOOL mach = NO;
+    BOOL gRcptVerify = NO;   // v2.58.176: 收据验证型信号(verifyReceipt 网络 / 本地收据文件 / 收据解析库)
+    BOOL gRcptNetwork = NO;  // v2.58.176: verifyReceipt 网络验证(收据 mock 端点在场)
+    BOOL gRcptLocal = NO;    // v2.58.176: 本地收据文件读取(appStoreReceiptURL — L1 伪造对症)
     NSString *skType = @"未知", *validator = @"无收据验证特征";
 
     // ---- F1 二进制品牌串/域名串 ----
@@ -2621,9 +2632,16 @@ NSDictionary *mfReconFingerprint(void) {
             if (brandHit) break;
         }
         if (brandHit) {
-            [cloudBrands addObject:b[@"name"]];
-            binHits++;
-            if (binHits <= 6) [lines addObject:[NSString stringWithFormat:@"二进制含订阅 SDK 串: %@ → %@", b[@"pats"][0], b[@"name"]]];
+            // v2.58.176: 只有判定型云 SDK(kind=ent)进 cloudBrands 触发 cloud 分支;
+            //   非判定型(kind=ui, Superwall)只作提示 line, 不参与判型主轴。
+            NSString *kind = b[@"kind"] ?: @"ent";
+            if ([kind isEqualToString:@"ent"]) {
+                [cloudBrands addObject:b[@"name"]];
+                binHits++;
+                if (binHits <= 6) [lines addObject:[NSString stringWithFormat:@"二进制含订阅验证 SDK 串: %@ → %@(权益判定型云 SDK)", b[@"pats"][0], b[@"name"]]];
+            } else {
+                [lines addObject:[NSString stringWithFormat:@"二进制含 %@ 串(付费墙 UI/编排 SDK, 非权益判定源) — 不作云验证判型依据", b[@"name"]]];
+            }
         } else if (spmOnly) {
             [lines addObject:[NSString stringWithFormat:@"剔除 %@ 串命中: 仅存在于 SPM 依赖清单 URL(github.com/…) — 工具库依赖, 非订阅 SDK", b[@"name"]]];
         }
@@ -2712,6 +2730,7 @@ NSDictionary *mfReconFingerprint(void) {
             [seenUrl addObject:u];
             NSString *lu = u.lowercaseString;
             for (NSDictionary *b in mfRecCloudBrands()) {
+                if (![(b[@"kind"] ?: @"ent") isEqualToString:@"ent"]) continue;   // v2.58.176: 非判定型 SDK(Superwall)域名命中不触发 cloud 判型
                 for (NSString *pat in b[@"pats"]) {
                     if ([lu containsString:pat.lowercaseString]) {
                         hits++;
@@ -2792,19 +2811,36 @@ NSDictionary *mfReconFingerprint(void) {
         // 二进制串: SK1 selector(__objc_methname 里必留) / SK2 / CMS-OpenSSL 验签 import
         // v2.58: 扫描源 = 主二进制 + app 框架(scanBlobs) — SK2 特征常在自带框架里
         BOOL sk1 = NO, sk2 = NO, cms = NO;
+        // v2.58.176 (dbg_164 定谳): SK1 收据网络验证锚 — verifyReceipt/收据端点/收据URL。
+        //   病根: bazaart 重度依赖 buy.itunes.apple.com/verifyReceipt(高级版靠它), 但旧检测
+        //   只认本地收据解析库(InAppReceipt/PKCS7 类), 漏认最标准的 SK1 收据网络验证端点 →
+        //   错报"无收据验证特征"。这正是 Surge 模块拦 verifyReceipt 注入伪造收据能解高级版的锚。
+        BOOL vrcpt = NO;   // verifyReceipt 网络验证型
+        BOOL lrcpt = NO;   // 本地收据文件读取型(appStoreReceiptURL/transactionReceipt)
         for (NSData *blob in scanBlobs) {
             const uint8_t *bp = blob.bytes; NSUInteger bn = blob.length;
             if (!sk1 && (mfRecFind(bp, bn, "addPayment:") || mfRecFind(bp, bn, "updatedTransactions:") ||
                          mfRecFind(bp, bn, "restoreCompletedTransactions"))) sk1 = YES;
             if (!sk2 && (mfRecFind(bp, bn, "currentEntitlements") || mfRecFind(bp, bn, "AppTransaction"))) sk2 = YES;
             if (!cms && (mfRecFind(bp, bn, "CMSDecoder") || mfRecFind(bp, bn, "d2i_PKCS7") || mfRecFind(bp, bn, "EVP_VerifyFinal"))) cms = YES;
-            if (sk1 && sk2 && cms) break;
+            if (!vrcpt && (mfRecFind(bp, bn, "verifyReceipt") || mfRecFind(bp, bn, "buy.itunes.apple.com") || mfRecFind(bp, bn, "sandbox.itunes.apple.com"))) vrcpt = YES;
+            if (!lrcpt && (mfRecFind(bp, bn, "appStoreReceiptURL") || mfRecFind(bp, bn, "transactionReceipt"))) lrcpt = YES;
+            if (sk1 && sk2 && cms && vrcpt && lrcpt) break;
         }
         if (sk1 && sk2) skType = @"SK1+SK2 混合";
         else if (sk2) skType = @"SK2(JWS)";
         else if (sk1) skType = @"SK1(队列)";
-        if (libHits.count) validator = [libHits componentsJoinedByString:@"/"];
-        else if (cms) validator = @"自研 CMS/OpenSSL 验签";
+        // v2.58.176: validator 优先级 — 具体收据验证特征 > 泛 CMS。收据锚是解锁路线的直接依据。
+        NSMutableArray *vparts = [NSMutableArray array];
+        if (libHits.count) [vparts addObject:[libHits componentsJoinedByString:@"/"]];
+        if (vrcpt) [vparts addObject:@"verifyReceipt 网络验证(可 mock 收据响应)"];
+        if (lrcpt) [vparts addObject:@"本地收据文件(appStoreReceiptURL — 可 L1 伪造)"];
+        if (cms && !libHits.count) [vparts addObject:@"自研 CMS/OpenSSL 验签"];
+        if (vparts.count) validator = [vparts componentsJoinedByString:@" + "];
+        // v2.58.176: 收据验证信号入 recon(供判型总闸做 SK1 收据型锚 + 详情页路线)
+        gRcptVerify = (vrcpt || lrcpt || libHits.count > 0);
+        gRcptNetwork = vrcpt;
+        gRcptLocal = lrcpt;
         [lines addObject:[NSString stringWithFormat:@"SK 形态: %@ · 本地校验策略: %@", skType, validator]];
     }
 
@@ -3030,6 +3066,28 @@ NSDictionary *mfReconFingerprint(void) {
                     fwLeaf[z] = 0;
                 }
                 if (strcmp(mod, fwLeaf) != 0) continue;   // 只收框架自有模块的符号(非 vendored 库)
+                // ②′ v2.58.176 第三方 SDK 厂商排除(dbg_164 bazaart 定谳): FBSDKCoreKit.isSubscription
+                //    /FBLoginKit.isAuthenticated 命中 subscri/auth 语义词, 但那是 Facebook SDK 自己的
+                //    埋点/登录功能, 不是宿主 app 的权益判定 → patch 它们对解锁零作用(dbg_164 传了 3 个
+                //    这种错点进引擎)。与 kEntPats 白名单本质不同: 这里锚的是"已发布的第三方 SDK 厂商
+                //    框架名"(FBSDK/Google/Firebase/广告/分析/崩溃/登录 SDK — 命名工业标准且稳定),
+                //    而非"权益判定长什么样"(那才是会被改名/混淆打败的脆弱锚)。这类框架**定义上**
+                //    不持有宿主权益逻辑, 结构性排除。
+                {
+                    static NSArray *kVendorSDK; static dispatch_once_t ov;
+                    dispatch_once(&ov, ^{ kVendorSDK = @[
+                        @"fbsdk", @"facebook", @"googlesignin", @"googleutilities", @"gtmsessionfetcher",
+                        @"firebase", @"firebasecore", @"firebaseanalytics", @"firebasecrashlytics",
+                        @"appsflyer", @"adjust", @"branch", @"sentry", @"bugsnag", @"datadog",
+                        @"amplitude", @"mixpanel", @"onesignal", @"segment", @"braze", @"appboy",
+                        @"kochava", @"singular", @"iterable", @"instabug", @"embrace",
+                        @"googlemobileads", @"gads", @"applovin", @"ironsource", @"admob",
+                        @"nielsen", @"comscore", @"tealium", @"mparticle", @"customerio",
+                        @"grpc", @"protobuf", @"nio", @"swiftprotobuf", @"gtm" ]; });
+                    BOOL vendor = NO;
+                    for (NSString *v in kVendorSDK) if (strstr(fwLeaf, v.UTF8String)) { vendor = YES; break; }
+                    if (vendor) continue;   // 第三方非权益 SDK 框架 — 不收其"权益词命中"符号
+                }
                 // ② 语义打分: score>0 才是候选(无语义词的 isSelected/isReady/passwordValid → 0 淘汰)
                 char low[256];
                 { size_t z = 0; for (; nm[z] && z < sizeof(low)-1; z++) low[z] = (char)tolower((unsigned char)nm[z]); low[z] = 0; }
@@ -3072,11 +3130,16 @@ NSDictionary *mfReconFingerprint(void) {
             }
         }
         // v2.58.169: 判型总闸 — 本地代码点闸门关闭时(服务端型/收据验证型)不入库框架符号点
-        if (entFuncs.count && !gBlockCodePts) {
+        // v2.58.176 根因 A 修复(dbg_164): 云验证型也不入库框架门 — 云型判定本体在云端回包,
+        //   框架符号门(即使过了厂商/语义过滤)对云型是噪声, 与 sk2 代码点同理抑制。
+        //   (bazaart 经 176 Superwall 降级后 cloudBrands 已空不走此路, 但真 RC 型仍需此闸)。
+        if (entFuncs.count && !gBlockCodePts && !cloudBrands.count) {
             extern void mfAppPatchEntDumpsMerge(NSArray *);
             mfAppPatchEntDumpsMerge(entFuncs);
-        } else if (entFuncs.count && gBlockCodePts) {
-            [lines addObject:[NSString stringWithFormat:@"框架符号候选 %lu 个: 判型总闸拦下(本地 patch 对此型无效) — 不入库", (unsigned long)entFuncs.count]];
+        } else if (entFuncs.count && (gBlockCodePts || cloudBrands.count)) {
+            [lines addObject:[NSString stringWithFormat:@"框架符号候选 %lu 个: %@ — 不入库", (unsigned long)entFuncs.count,
+                              cloudBrands.count ? @"云验证型(判定在云端回包, 框架门为噪声)" : @"判型总闸拦下(本地 patch 对此型无效)"]];
+            [entFuncs removeAllObjects];   // v2.58.176: 云型/服务端型清空框架门, 防下游 nDeepLib 等误算入
         }
         }   // v2.58.55: if (!sk2LocalType) 闭合 — SK2 流型时整块框架扫描跳过
         RECON_P("frameworkscan-done");
@@ -3291,6 +3354,15 @@ NSDictionary *mfReconFingerprint(void) {
     //   条件: 观测命中收据验证类 或 观测挂到 SK1 购买流消费者(paymentQueue:updatedTransactions:)。
     else if (obsReceipt || obsFlow > 0) verdict = [NSString stringWithFormat:@"收据验证型(运行时观测确证: %@购买流消费者 %lu 个) — 解锁路线: 🧪实验模拟页 L1 收据伪造开关(判定读收据, 非代码门)",
                                        obsReceipt ? @"收据验证类命中 · " : @"", (unsigned long)obsFlow];
+    // v2.58.176 (dbg_164 bazaart 定谳): 静态收据验证型 — verifyReceipt 网络端点 / 本地收据文件在场。
+    //   与 obsReceipt(运行时观测)互补: 静态串命中即判, 不依赖观测挂载。
+    //   bazaart 高级版靠 buy.itunes.apple.com/verifyReceipt(Surge 模块拦它注入伪造收据即解),
+    //   路线 = 云验证 mock 开关(拦 verifyReceipt 响应) 或 L1(本地收据文件伪造)。
+    else if (gRcptNetwork)  verdict = [NSString stringWithFormat:@"收据验证型(verifyReceipt 网络验证%@) — 解锁路线: 云验证 mock 开关(拦 verifyReceipt 注入收据)%@",
+                                       skLocal ? [NSString stringWithFormat:@" · %@", skType] : @"",
+                                       gRcptLocal ? @" 或 L1 收据伪造(本地收据文件)" : @""];
+    else if (gRcptLocal)    verdict = [NSString stringWithFormat:@"收据验证型(本地收据文件 appStoreReceiptURL%@) — 解锁路线: 🧪L1 收据伪造开关",
+                                       skLocal ? [NSString stringWithFormat:@" · %@", skType] : @""];
     // v2.58.7: 纯 StoreKit 本地校验型分支(2.58.6 缺失 — SK2 明明已判定却显示"未发现订阅验证 SDK"兜底文案)
     else if (skLocal)       verdict = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@ · %@) — 判定点已入库, 实验模拟页左划 patch", skType, validator];
     else                    verdict = @"未发现订阅验证 SDK";
@@ -3319,6 +3391,11 @@ NSDictionary *mfReconFingerprint(void) {
     else if (srvSelfIap)    { mfType = @"自研服务端权益型"; route = @"⛔ 权益由自家后端下发, 本地解锁无效 — 无可用本地路线"; }
     else if (srvTicket)     { mfType = @"服务器授权票据型"; route = @"⛔ 权益=服务器签发 JWT 票据, 本地 patch 结构性无效 — 无可用本地路线"; }
     else if (obsReceipt || obsFlow > 0) { mfType = @"收据验证型(运行时观测确证)"; route = @"实验模拟页: L1 收据伪造开关"; }
+    else if (gRcptNetwork)  { mfType = @"收据验证型(verifyReceipt 网络验证)";
+                              route = gRcptLocal
+                                ? @"实验模拟页: 云验证 mock 开关(拦 verifyReceipt 注入收据) 或 L1 收据伪造"
+                                : @"实验模拟页: 云验证 mock 开关(拦 verifyReceipt 注入收据)"; }
+    else if (gRcptLocal)    { mfType = @"收据验证型(本地收据文件)"; route = @"实验模拟页: L1 收据伪造开关"; }
     else if (nRealGate > 0) { mfType = @"代码判定型(本地 SK2 验证链)"; route = [NSString stringWithFormat:@"实验模拟页判定点列表 ⚡ patch(★真门 %lu 个优先)", (unsigned long)nRealGate]; }
     else if (nCodePts > 0)  { mfType = @"代码判定型(指令级 patch)"; route = [NSString stringWithFormat:@"实验模拟页判定点列表 ⚡ patch(%lu 点)", (unsigned long)nCodePts]; }
     else if (stateType)     { mfType = @"状态型(UserDefaults)"; route = @"实验模拟页: F9 状态解锁直写"; }
