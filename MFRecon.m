@@ -3133,6 +3133,14 @@ NSDictionary *mfReconFingerprint(void) {
                 // v2.58.169 判型总闸: 服务端型/收据验证型 → sk2 代码点结构性无效, 一律不入库
                 if (mergePts.count)
                     [lines addObject:[NSString stringWithFormat:@"代码判定点 %lu 个: 判型总闸拦下(本地 patch 对此型无效) — 不入库", (unsigned long)mergePts.count]];
+            } else if (cloudBrands.count) {
+                // v2.58.173 云型 sk2 代码点抑制: reflix 战役定谳 — 云验证型双因子 =
+                //   mock(云端回包) + F10 深槽装载点(判定点腿, reflix 的 0x14211bc)。
+                //   sk2vfy/sk2br/sk2plan 是标准 SK2 API 通用结构(2.58.116 定谳: 任何 SK2
+                //   app 都有, 非特征), 判定本体在云端 → 入库只会用通用噪声淹没真判定点腿。
+                //   → sk2 点不入库(只 mfLog 记录, 不进详情页 lines); F10 深槽由下方专管。
+                if (mergePts.count)
+                    mfLog(@"[f8v2] 云验证型 sk2 代码点 %lu 个不入库(通用 SK2 结构非判定腿, 判定点腿=F10 深槽)", (unsigned long)mergePts.count);
             } else if ([mergePts isKindOfClass:[NSArray class]] && mergePts.count) {
                 mfAppPatchEntDumpsMerge(mergePts);
                 RECON_P("merge-done");
@@ -3246,6 +3254,10 @@ NSDictionary *mfReconFingerprint(void) {
     // v2.58.168/169 B: 观测喂判型 — 信号已在判型总闸(上方)取过, 这里复用 gObsReceipt/gObsFlow。
     BOOL obsReceipt = gObsReceipt;
     NSUInteger obsFlow = gObsFlow;
+    // v2.58.173: F10 深槽判定点腿入库数(reflix 双因子第二条腿 — "判定点腿飞了"根因修复)。
+    //   云型 sk2 已在上方抑制, entFuncs 云型只余 deepslot; 此处专数 deepslot 保证语义精确。
+    NSUInteger nDeepLib = 0;
+    for (NSDictionary *f in entFuncs) if ([f[@"shape"] isEqualToString:@"deepslot"]) nDeepLib++;
     NSString *verdict;
     if (cloud && mach)      verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 + 本地许可服务器(异常端口) — 双面, mock+⚡F10 深槽点 双因子", cloudBrands.allObjects.firstObject];
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
@@ -3292,8 +3304,13 @@ NSDictionary *mfReconFingerprint(void) {
     // 治: 判型信号已全就绪(上方), 这里一次性定 type(唯一) + route(唯一解锁路线)。
     //   详情页只显示 verdict(结论) + route(该怎么做), 过程日志降级(见下 mfReconShowDetailPage 过滤)。
     NSString *mfType, *route;
-    if (cloud && mach)      { mfType = @"云验证+本地许可服务器"; route = @"实验模拟页: 订阅注入(mock 回包) + ⚡F10 深槽点 双因子"; }
-    else if (cloud)         { mfType = @"云端订阅验证型"; route = @"实验模拟页: 订阅注入开关(mock 回包)"; }
+    if (cloud && mach)      { mfType = @"云验证+本地许可服务器"; route = nDeepLib > 0
+                                ? [NSString stringWithFormat:@"实验模拟页双因子: ①订阅注入(mock 回包) ②⚡F10 深槽判定点 %lu 个 ③EXCPROBE 应答器", (unsigned long)nDeepLib]
+                                : @"实验模拟页: 订阅注入(mock 回包) + EXCPROBE 应答器"; }
+    else if (cloud)         { mfType = nDeepLib > 0 ? @"云端订阅验证型(双因子: mock + F10 深槽判定点)" : @"云端订阅验证型";
+                              route = nDeepLib > 0
+                                ? [NSString stringWithFormat:@"实验模拟页双因子: ①订阅注入开关(mock 回包) ②判定点列表⚡F10 深槽装载点 %lu 个", (unsigned long)nDeepLib]
+                                : @"实验模拟页: 订阅注入开关(mock 回包)"; }
     else if (mach)          { mfType = @"本地许可服务器型"; route = @"实验模拟页: 开 EXCPROBE 应答器"; }
     else if (serverSide)    { mfType = @"服务器权益型"; route = @"⛔ 权益在服务端会话, 本地解锁无效 — 无可用本地路线"; }
     else if (srvSelfIap)    { mfType = @"自研服务端权益型"; route = @"⛔ 权益由自家后端下发, 本地解锁无效 — 无可用本地路线"; }
