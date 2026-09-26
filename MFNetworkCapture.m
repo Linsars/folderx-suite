@@ -397,11 +397,12 @@ static void mfRecordCapture(MFNetRecord *rec) {
             }
         } else {
             self.record.respBody = self.data;
-            // v2.58.111: 未替换的 /iap/ 响应也记原文(schema 诊断)
-            if ([self.record.url containsString:@"/iap/"] && self.data.length > 0) {
+            // v2.58.111/181: /iap/ 与 verifyReceipt 响应记原文(schema 诊断) — dbg_168 定位收据档
+            //   真伪需看 verifyReceipt 真实响应判不判权益(关 mock 跑一次即捕获此原文)。
+            if (([self.record.url containsString:@"/iap/"] || [self.record.url.lowercaseString containsString:@"/verifyreceipt"]) && self.data.length > 0) {
                 NSString *orig = [[NSString alloc] initWithData:self.data encoding:NSUTF8StringEncoding];
                 if (!orig) orig = [NSString stringWithFormat:@"<%lu bytes binary>", (unsigned long)self.data.length];
-                if (orig.length > 400) orig = [orig substringToIndex:400];
+                if (orig.length > 600) orig = [orig substringToIndex:600];
                 mfLog(@"[net-orig] %@ -> %@", self.record.url.lastPathComponent, orig);
             }
         }

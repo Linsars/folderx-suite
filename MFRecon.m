@@ -1514,7 +1514,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
     //   注入由 MFProbe hook_inject 执行器落地(hook 选择器入口按配方填结构)。
     // =====================================================================
     {
-        extern void mfAppPatchEntDumpsMerge(NSArray *);   // hookinj 判定点入库(并入 patch 引擎)
+        extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);   // hookinj 判定点入库(并入 patch 引擎)
         const char *PERIODW[] = {"lifetime","perpetual","forever","yearly","annual","monthly","weekly"};
         const int  PERIODP[]  = {0,1,2,3,4,5,6};   // 档位优先级(小=更持久)
         // 状态语义槽词表: 订阅生命周期词(正向+负向都算"状态槽")。宿主可能条件构造 active/expired,
@@ -1799,7 +1799,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     @"score": @(96), @"calls": @(0), @"fn": @(fh),
                     @"note": [NSString stringWithFormat:@"状态注入·方案B(disc授权bool强制): 校验器 %#llx 内 and→movz#1, 令宿主构造 active(适配运行时偏移)", (unsigned long long)(fh-textVM)],
                 };
-                extern void mfAppPatchEntDumpsMerge(NSArray *);
+                extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
                 mfAppPatchEntDumpsMerge(@[pt]);
                 nRecipe++;
                 mfLog(@"[f8v2] ★sk2recipe fn=%#llx: 自检 %d/6 不足但 ★方案B就绪(disc强制点 %#llx: %08x→%08x) → 注册 %@",
@@ -1836,7 +1836,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     @"note": [NSString stringWithFormat:@"状态注入(hook 选择器+构造 active): plan=%s size=%u", tierName, ssz],
                     @"recipe": recipe,        // 配方 JSON 内嵌点位 — patch 引擎执行时传给 mfProbeInstallRecipe
                 };
-                extern void mfAppPatchEntDumpsMerge(NSArray *);
+                extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
                 mfAppPatchEntDumpsMerge(@[pt]);
                 nRecipe++;
                 mfLog(@"[f8v2]   ✅ 注册 hookinj 判定点 %@(默认 off, 判定点列表 ⚡ 执行)", sym);
@@ -2622,6 +2622,7 @@ NSDictionary *mfReconFingerprint(void) {
     NSString *excNote = nil;
     // — 自研 IAP 端点信号(F7/srvSelfIap 派生用) —
     int gEpHits = 0;
+    NSUInteger gCodePtsInStore = 0;   // v2.58.181: sk2 代码点**实际入库**数(扣墓碑/去重后, merge 返回) — 详情页据此报数, 治 24 vs 17 虚高
     NSString *skType = @"未知", *validator = @"无收据验证特征";
 
     // ---- F1 二进制品牌串/域名串 ----
@@ -3138,7 +3139,7 @@ NSDictionary *mfReconFingerprint(void) {
         //   框架符号门(即使过了厂商/语义过滤)对云型是噪声, 与 sk2 代码点同理抑制。
         //   (bazaart 经 176 Superwall 降级后 cloudBrands 已空不走此路, 但真 RC 型仍需此闸)。
         if (entFuncs.count && !gBlockCodePts && !cloudBrands.count) {
-            extern void mfAppPatchEntDumpsMerge(NSArray *);
+            extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
             mfAppPatchEntDumpsMerge(entFuncs);
         } else if (entFuncs.count && (gBlockCodePts || cloudBrands.count)) {
             [entFuncs removeAllObjects];   // v2.58.176/177: 云型/服务端型清空框架门(内部, 证据由末尾 type 派生, 不写散装 lines)
@@ -3178,7 +3179,7 @@ NSDictionary *mfReconFingerprint(void) {
             NSArray *candsRef = cands;
             RECON_P("merge-enter");
             NSArray *sk2ptsRef = sk2pts;
-            extern void mfAppPatchEntDumpsMerge(NSArray *);
+            extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
             NSArray *mergePts = sk2ptsRef;
             RECON_P("merge-predone");
             if (gBlockCodePts) {
@@ -3188,7 +3189,7 @@ NSDictionary *mfReconFingerprint(void) {
                 if (mergePts.count)
                     mfLog(@"[f8v2] 云验证型 sk2 代码点 %lu 个不入库(通用 SK2 结构非判定腿, 判定点腿=F10 深槽)", (unsigned long)mergePts.count);
             } else if ([mergePts isKindOfClass:[NSArray class]] && mergePts.count) {
-                mfAppPatchEntDumpsMerge(mergePts);
+                gCodePtsInStore = mfAppPatchEntDumpsMerge(mergePts);   // v2.58.181: 真实入库数(扣墓碑/去重)
                 RECON_P("merge-done");
                 [entFuncs addObjectsFromArray:mergePts];   // v2.58.177: 入库, 证据由末尾 type 派生
             }
@@ -3198,12 +3199,12 @@ NSDictionary *mfReconFingerprint(void) {
             } else if (cloudBrands.count) {
                 // v2.58.174: F10 深槽判定腿(deepPts)直通入库 — 判型钦定, 已隔离不流经截断, 无条件全量 merge。
                 if (deepPts.count) {
-                    extern void mfAppPatchEntDumpsMerge(NSArray *);
+                    extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
                     mfAppPatchEntDumpsMerge(deepPts);
                     [entFuncs addObjectsFromArray:deepPts];
                 }
             } else if ([candsRef isKindOfClass:[NSArray class]] && candsRef.count && !gBlockCodePts) {
-                extern void mfAppPatchEntDumpsMerge(NSArray *);
+                extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
                 mfAppPatchEntDumpsMerge(candsRef);
                 [entFuncs addObjectsFromArray:candsRef];   // v2.58.177: 入库, 证据由末尾 type 派生
             }
@@ -3356,20 +3357,20 @@ NSDictionary *mfReconFingerprint(void) {
         [ev addObject:@"票据字段族在场(iat/exp/kid/grace_seconds + entitlements:sync + permanent_entitlements_authoritative)"];
     } else if (gRcptNetwork || obsReceipt) {
         // 收据验证型(verifyReceipt 网络): 静态串 / 运行时捕获 / 观测确证。
-        // v2.58.180 (dbg_167 用户定谳): 撤销"高级档/超级档"臆造命名 — 那是 bazaart 特有的
-        //   分档叫法, 不是所有 app 都有。引擎只陈述**客观结构**: 有收据验证端点 + 有本地代码门 =
-        //   两条独立可试路径, 不假设它们对应什么"档位"。也不假称谁是真门(sk2 未定论)。
-        BOOL hasCodeChain = (nCodePts > 0 || nRealGate > 0);
+        // v2.58.180/181 (dbg_167/168 用户定谳): 客观结构陈述, 不臆造"档位"; 报数用**实际入库数**
+        //   gCodePtsInStore(merge 返回, 扣墓碑/去重), 不用扫出的候选总数 nCodePts — 治 24 vs 17
+        //   (扫出 24 候选, 实际入库 17, 详情页旧报 24 = 虚高, 与传进 patch 引擎的 17 对不上)。
+        BOOL hasCodeChain = (gCodePtsInStore > 0);
         mfType = hasCodeChain ? @"收据验证型(verifyReceipt) + 本地代码门(候选)" : @"收据验证型(verifyReceipt 网络验证)";
         NSMutableString *rt = [NSMutableString stringWithString:@"路径A 收据mock: 拦 verifyReceipt 注入收据(实验模拟页云验证mock开关)"];
         if (gRcptLocal) [rt appendString:@" / L1 收据伪造"];
-        if (hasCodeChain) [rt appendFormat:@" · 路径B 本地代码门: 判定点列表 ⚡ %lu 点(候选待验)", (unsigned long)nCodePts];
+        if (hasCodeChain) [rt appendFormat:@" · 路径B 本地代码门: 判定点列表 ⚡ %lu 点(候选待验)", (unsigned long)gCodePtsInStore];
         route = rt;
         [ev addObject:skLine];
         if (netVrfyHits) [ev addObject:[NSString stringWithFormat:@"网络捕获实锤: %lu 条 verifyReceipt 请求(%@)", (unsigned long)netVrfyHits, netVrfyURLs.firstObject ?: @""]];
         else if (netTotal) [ev addObject:[NSString stringWithFormat:@"网络捕获 %lu 条(verifyReceipt 见二进制静态串)", (unsigned long)netTotal]];
         if (obsFlow > 0) [ev addObject:[NSString stringWithFormat:@"运行时观测: SK 购买流消费者 %lu 个", (unsigned long)obsFlow]];
-        if (hasCodeChain) [ev addObject:[NSString stringWithFormat:@"本地代码门 %lu 个(★形态强锚 %lu)已入库 — 候选, 是否真判定门未定论, 可 ⚡ 逐个试", (unsigned long)nCodePts, (unsigned long)nRealGate]];
+        if (hasCodeChain) [ev addObject:[NSString stringWithFormat:@"本地代码门 %lu 个已入库(候选, 是否真判定门未定论, 可 ⚡ 逐个试)", (unsigned long)gCodePtsInStore]];
     } else if (gRcptLocal) {
         mfType = @"收据验证型(本地收据文件)"; route = @"实验模拟页: L1 收据伪造开关";
         [ev addObject:skLine];

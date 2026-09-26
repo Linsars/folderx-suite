@@ -699,10 +699,11 @@ void mfAppPatchEntDumpsEndRound(void) {
               (unsigned long)[[keep filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"on == YES"]] count]);
     }
 }
-void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
-    if (![newOnes isKindOfClass:[NSArray class]]) return;
+NSUInteger mfAppPatchEntDumpsMerge(NSArray *newOnes) {
+    if (![newOnes isKindOfClass:[NSArray class]]) return 0;
     apEntDumpsLoad();
     NSArray *tombs = apTombstones();   // v2.58.70: 墓碑点位永不复活
+    NSUInteger inStore = 0;            // v2.58.181: 本次实际入库(新增+重温, 扣墓碑/去重)条数 — 详情页报数用
     for (NSDictionary *n in newOnes) {
         if (![n isKindOfClass:[NSDictionary class]]) continue;
         NSString *nsym = n[@"sym"] ?: @"";
@@ -719,6 +720,7 @@ void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
             m[@"seen"] = @YES;                    // v2.58.74: 本轮扫出
             [g_entDumps addObject:m];
             g_entRoundSeen++;
+            inStore++;                            // v2.58.181: 新增计入
         } else {
             // v2.58.18: 旧点位补 shape 字段(重扫后分类升级, 不动用户持久化开关)
             // v2.58.30: 同时补 vmaddr/slide — dbg_30 定谳: ivarRead@/ivarGetter@
@@ -731,6 +733,7 @@ void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
                 if ([m[@"img"] isEqualToString:n[@"img"]] && [m[@"sym"] isEqualToString:n[@"sym"]]) {
                     m[@"seen"] = @YES;            // v2.58.74: 本轮重温 → 不算陈旧
                     g_entRoundSeen++;
+                    inStore++;                    // v2.58.181: 重温(库内已有)也算本次在库
                     if (n[@"shape"] && !m[@"shape"]) m[@"shape"] = n[@"shape"];
                     if (n[@"vmaddr"] && !m[@"vmaddr"]) m[@"vmaddr"] = n[@"vmaddr"];
                     if (n[@"slide"] && !m[@"slide"]) m[@"slide"] = n[@"slide"];
@@ -741,6 +744,7 @@ void mfAppPatchEntDumpsMerge(NSArray *newOnes) {
         }
     }
     apEntDumpsSave();
+    return inStore;   // v2.58.181: 详情页据此报"实际入库 N"(而非扫出的候选总数 — 治 24 vs 17 虚高)
 }
 void mfAppPatchEntDumpSetOn(NSString *sym, BOOL on) {
     apEntDumpsLoad();
