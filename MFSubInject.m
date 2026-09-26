@@ -521,7 +521,12 @@ static void mfSubDeliver(NSURL *u, void (^h)(NSData *, NSURLResponse *, NSError 
 }
 
 static id mf_dtReq(id self, SEL _cmd, NSURLRequest *req, void (^handler)(NSData *, NSURLResponse *, NSError *)) {
-    if (!g_subOn || !handler || !req.URL || !mfSubIsTarget(req.URL))
+    // v2.58.183 (dbg_170 定谳): verifyReceipt 让路 — 老 completionHandler hook 绝不对它凭空伪造。
+    //   dbg_170 实锤双路径打架: 真信封注入(MFURLProtocol)与本 hook 的 mfSubDeliver(伪造 adam_id:100000
+    //   假信封)成对触发, app 吃的是假信封 → 不亮。verifyReceipt 只能走 MFURLProtocol 真信封注入,
+    //   本 hook 直接放行(让 NSURLProtocol 层接管)。RC/Adapty 无签名端点仍走本 hook 伪造(无冲突)。
+    extern BOOL mfSubInjectWantReceiptInject(NSURL *);
+    if (!g_subOn || !handler || !req.URL || mfSubInjectWantReceiptInject(req.URL) || !mfSubIsTarget(req.URL))
         return ((DTReqIMP)orig_dtReq)(self, _cmd, req, handler);
     NSURL *u = req.URL;
     return ((DTReqIMP)orig_dtReq)(self, _cmd, req, ^(NSData *d, NSURLResponse *r, NSError *e) {
@@ -530,7 +535,8 @@ static id mf_dtReq(id self, SEL _cmd, NSURLRequest *req, void (^handler)(NSData 
 }
 
 static id mf_dtURL(id self, SEL _cmd, NSURL *u, void (^handler)(NSData *, NSURLResponse *, NSError *)) {
-    if (!g_subOn || !handler || !u || !mfSubIsTarget(u))
+    extern BOOL mfSubInjectWantReceiptInject(NSURL *);
+    if (!g_subOn || !handler || !u || mfSubInjectWantReceiptInject(u) || !mfSubIsTarget(u))
         return ((DTURLIMP)orig_dtURL)(self, _cmd, u, handler);
     return ((DTURLIMP)orig_dtURL)(self, _cmd, u, ^(NSData *d, NSURLResponse *r, NSError *e) {
         mfSubDeliver(u, handler);
