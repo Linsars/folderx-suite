@@ -211,6 +211,28 @@ static void mfRecordCapture(MFNetRecord *rec) {
     self.record.reqHeaders = req.allHTTPHeaderFields;
     self.record.reqBody = req.HTTPBody;
     self.record.timestamp = [NSDate date];
+
+    // v2.58.180 (dbg_167): 订阅注入 mock 全局层入口 — 命中 target 直接应答 mock body, 不转发网络。
+    //   这是 verifyReceipt/RC/Adapty 等订阅端点 mock 真正生效的地方(旧 completionHandler hook
+    //   拦不到 async/await, MFURLProtocol 通吃所有 NSURLSession)。放在规则改写之前, 独立开关驱动。
+    {
+        extern BOOL mfSubInjectMockFor(NSURL *, NSData **);
+        NSData *mockBody = nil;
+        if (mfSubInjectMockFor(req.URL, &mockBody) && mockBody.length) {
+            NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:req.URL statusCode:200
+                                        HTTPVersion:@"HTTP/1.1"
+                                       headerFields:@{@"Content-Type": @"application/json",
+                                                      @"Content-Length": [NSString stringWithFormat:@"%lu", (unsigned long)mockBody.length]}];
+            [self.client URLProtocol:self didReceiveResponse:resp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:mockBody];
+            [self.client URLProtocolDidFinishLoading:self];
+            self.record.status = 200;
+            self.record.respBody = mockBody;
+            self.record.summary = @"SUBINJECT-MOCK";
+            mfRecordCapture(self.record);
+            return;
+        }
+    }
     // v2.58.111: iap 类 URL 请求体落日志(诊断: 看请求侧真实发的是什么)
     if ([self.record.url containsString:@"/iap/"]) {
         NSString *bodyDesc = nil;

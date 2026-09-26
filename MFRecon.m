@@ -2739,12 +2739,14 @@ NSDictionary *mfReconFingerprint(void) {
                 if (matched) break;
             }
             if (matched) continue;
-            // ② v2.58.177 收据验证端点(dbg_165 根因③: 旧分类器只认云品牌, 不认 verifyReceipt
-            //    → 抓到 77 条却报"无云验证域"。收据验证端点是 SK1 收据型的判定本体, 必须认)。
-            if ([lu containsString:@"verifyreceipt"] || [lu containsString:@"buy.itunes.apple.com"]
-                || [lu containsString:@"sandbox.itunes.apple.com"]) {
+            // ② 收据验证端点 — v2.58.180 (dbg_167 用户定谳): 精确到 /verifyReceipt 路径,
+            //   不光凭域名。buy.itunes.apple.com 下还有别的苹果端点(MZFinance 等非收据验证),
+            //   光匹配域名会把它们全误判成 verifyReceipt。/verifyReceipt 是 SK1 收据验证的标准
+            //   端点路径, 特异且通用(app 走自建代理转发也保留此路径名)。RC 等云品牌请求已在
+            //   ① 分支先行匹配 continue, 不会落到这里(回答"RC 那种请求"之问)。
+            if ([lu containsString:@"/verifyreceipt"]) {
                 netVrfyHits++;
-                gRcptNetwork = YES;   // 运行时实锤 verifyReceipt 在用(比静态串更强)
+                gRcptNetwork = YES;   // 运行时捕获到 verifyReceipt 请求(比静态串强)
                 if (netVrfyURLs.count < 3) [netVrfyURLs addObject:u];
             }
         }
@@ -2829,7 +2831,7 @@ NSDictionary *mfReconFingerprint(void) {
                          mfRecFind(bp, bn, "restoreCompletedTransactions"))) sk1 = YES;
             if (!sk2 && (mfRecFind(bp, bn, "currentEntitlements") || mfRecFind(bp, bn, "AppTransaction"))) sk2 = YES;
             if (!cms && (mfRecFind(bp, bn, "CMSDecoder") || mfRecFind(bp, bn, "d2i_PKCS7") || mfRecFind(bp, bn, "EVP_VerifyFinal"))) cms = YES;
-            if (!vrcpt && (mfRecFind(bp, bn, "verifyReceipt") || mfRecFind(bp, bn, "buy.itunes.apple.com") || mfRecFind(bp, bn, "sandbox.itunes.apple.com"))) vrcpt = YES;
+            if (!vrcpt && mfRecFind(bp, bn, "/verifyReceipt")) vrcpt = YES;   // v2.58.180: 精确到路径, 不凭域名(dbg_167)
             if (!lrcpt && (mfRecFind(bp, bn, "appStoreReceiptURL") || mfRecFind(bp, bn, "transactionReceipt"))) lrcpt = YES;
             if (sk1 && sk2 && cms && vrcpt && lrcpt) break;
         }
@@ -3353,24 +3355,21 @@ NSDictionary *mfReconFingerprint(void) {
         mfType = @"服务器授权票据型"; route = @"⛔ 权益=服务器签发 JWT 票据, 本地 patch 结构性无效 — 无可用本地路线";
         [ev addObject:@"票据字段族在场(iat/exp/kid/grace_seconds + entitlements:sync + permanent_entitlements_authoritative)"];
     } else if (gRcptNetwork || obsReceipt) {
-        // v2.58.177 收据验证型(verifyReceipt 网络): 静态串 或 运行时捕获 或 观测确证。
-        // v2.58.179 多链并报(dbg_166 用户定谳): bazaart 是多链 app —
-        //   ①verifyReceipt 收据链(已实锤: 高级档 Surge/云验证 mock 拦 verifyReceipt 即解) +
-        //   ②本地 SK2 代码门(候选: 超级档可能走此, 收据 mock 够不着 — 但尚未定论是否真门)。
-        //   收据型≠"无本地链", sk2 门照常入库供试(闸门已放行); 但诚实标注 sk2 是"候选未定论",
-        //   不假称它=超级档真门(用户: sk2 点位还没定论, 别当结论压)。
-        BOOL hasSk2Chain = (nCodePts > 0 || nRealGate > 0);
-        mfType = hasSk2Chain ? @"多链: 收据验证型(verifyReceipt, 实锤) + 本地 SK2 代码门(候选)" : @"收据验证型(verifyReceipt 网络验证)";
-        NSMutableString *rt = [NSMutableString stringWithString:@"①收据档(实锤): 云验证 mock 开关(拦 verifyReceipt 注入收据)"];
-        if (gRcptLocal) [rt appendString:@" 或 L1 收据伪造"];
-        if (hasSk2Chain) [rt appendFormat:@" ②本地档(候选待验): 判定点列表 ⚡ %@ %lu 点",
-                          nRealGate > 0 ? @"★真门" : @"sk2门", (unsigned long)(nRealGate > 0 ? nRealGate : nCodePts)];
+        // 收据验证型(verifyReceipt 网络): 静态串 / 运行时捕获 / 观测确证。
+        // v2.58.180 (dbg_167 用户定谳): 撤销"高级档/超级档"臆造命名 — 那是 bazaart 特有的
+        //   分档叫法, 不是所有 app 都有。引擎只陈述**客观结构**: 有收据验证端点 + 有本地代码门 =
+        //   两条独立可试路径, 不假设它们对应什么"档位"。也不假称谁是真门(sk2 未定论)。
+        BOOL hasCodeChain = (nCodePts > 0 || nRealGate > 0);
+        mfType = hasCodeChain ? @"收据验证型(verifyReceipt) + 本地代码门(候选)" : @"收据验证型(verifyReceipt 网络验证)";
+        NSMutableString *rt = [NSMutableString stringWithString:@"路径A 收据mock: 拦 verifyReceipt 注入收据(实验模拟页云验证mock开关)"];
+        if (gRcptLocal) [rt appendString:@" / L1 收据伪造"];
+        if (hasCodeChain) [rt appendFormat:@" · 路径B 本地代码门: 判定点列表 ⚡ %lu 点(候选待验)", (unsigned long)nCodePts];
         route = rt;
         [ev addObject:skLine];
-        if (netVrfyHits) [ev addObject:[NSString stringWithFormat:@"网络捕获实锤: %lu 条 verifyReceipt 验证请求(如 %@)", (unsigned long)netVrfyHits, netVrfyURLs.firstObject ?: @""]];
+        if (netVrfyHits) [ev addObject:[NSString stringWithFormat:@"网络捕获实锤: %lu 条 verifyReceipt 请求(%@)", (unsigned long)netVrfyHits, netVrfyURLs.firstObject ?: @""]];
         else if (netTotal) [ev addObject:[NSString stringWithFormat:@"网络捕获 %lu 条(verifyReceipt 见二进制静态串)", (unsigned long)netTotal]];
         if (obsFlow > 0) [ev addObject:[NSString stringWithFormat:@"运行时观测: SK 购买流消费者 %lu 个", (unsigned long)obsFlow]];
-        if (hasSk2Chain) [ev addObject:[NSString stringWithFormat:@"本地 SK2 代码门 %lu 个(★真门 %lu)已入库 — 候选, 未定论是否超级档真门, 可 ⚡ 试", (unsigned long)nCodePts, (unsigned long)nRealGate]];
+        if (hasCodeChain) [ev addObject:[NSString stringWithFormat:@"本地代码门 %lu 个(★形态强锚 %lu)已入库 — 候选, 是否真判定门未定论, 可 ⚡ 逐个试", (unsigned long)nCodePts, (unsigned long)nRealGate]];
     } else if (gRcptLocal) {
         mfType = @"收据验证型(本地收据文件)"; route = @"实验模拟页: L1 收据伪造开关";
         [ev addObject:skLine];

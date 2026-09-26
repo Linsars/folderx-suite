@@ -556,6 +556,11 @@ static void mfInstallSecurityBypass(void) {
 void mfSubInjectEnable(void) {
     if (g_subOn) return;
     mfInstallSecurityBypass();
+    // v2.58.180: 确保 NSURLProtocol 全局拦截层在场 — mock 的真正生效路径是 MFURLProtocol
+    //   (通吃 async/await/delegate), 不能只靠下面两个 completionHandler hook。开订阅注入即装,
+    //   不依赖用户单独开"网络捕获"。幂等(dispatch_once)。
+    extern void mfInstallNetworkCapture(void);
+    mfInstallNetworkCapture();
     Class c = [NSURLSession class];
     Method m1 = class_getInstanceMethod(c, @selector(dataTaskWithRequest:completionHandler:));
     Method m2 = class_getInstanceMethod(c, @selector(dataTaskWithURL:completionHandler:));
@@ -592,3 +597,26 @@ void mfSubInjectAutoStart(void) {
 
 long mfSubInjectHits(void) { return g_subHits; }
 BOOL mfSubInjectIsOn(void) { return g_subOn; }
+
+// v2.58.180 (dbg_167 定谳): 订阅注入 mock 走 NSURLProtocol 全局层的入口。
+//   病根: mfSubInjectEnable 只 hook dataTaskWith{Request,URL}:completionHandler: 两个方法,
+//   拦不到现代 async/await(URLSession.data(for:))与 delegate 请求 → verifyReceipt(bazaart 高级档
+//   判定本体)从眼皮底下溜走, mock 是死代码(167 实锤 #1 mock 拦到的是无关老组件请求)。
+//   治: MFNetworkCapture 的 MFURLProtocol 已 swizzle protocolClasses, 通吃所有 NSURLSession
+//   (completionHandler/async/delegate 一网打尽)。这里给它一个查询入口: 命中 target 就返回 mock body,
+//   由 NSURLProtocol 直接应答(不转发网络)。completionHandler 双方法 hook 保留(覆盖 swizzle 前
+//   建的老 session), 两路同 mfSubJSON 不冲突。
+//   返回 YES = 该 URL 命中订阅注入; *outJSON 填 mock body。
+BOOL mfSubInjectMockFor(NSURL *u, NSData **outJSON) {
+    if (!g_subOn || !u) return NO;
+    // 自家 mfprobe 探针流量绝不 mock(recon offerings 扫描靠真实回包定性, mock 会打死侦查)
+    NSString *full = u.absoluteString.lowercaseString;
+    if ([full containsString:@"mfprobe"]) return NO;
+    if (!mfSubIsTarget(u)) return NO;
+    NSString *json = mfSubJSON(u);
+    if (!json.length) return NO;
+    if (outJSON) *outJSON = [json dataUsingEncoding:NSUTF8StringEncoding];
+    g_subHits++;
+    mfLog(@"[subinject] (URLProtocol 全局层) mock %@%@", u.host, u.path);
+    return YES;
+}
