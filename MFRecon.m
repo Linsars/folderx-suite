@@ -2952,6 +2952,11 @@ NSDictionary *mfReconFingerprint(void) {
     extern NSUInteger mfObsFlowClassCount(void);
     BOOL gObsReceipt = mfObsReceiptVerifierSeen();
     NSUInteger gObsFlow = mfObsFlowClassCount();
+    // v2.58.179 (dbg_166 定谳, 撤销 178): 收据强锚**不再**进入库闸门。
+    //   178 把 gRcptStrong 塞进 gBlockCodePts → verifyReceipt 型的 sk2 代码门被全压 → 废掉
+    //   多链的第二条腿。bazaart 是多链: verifyReceipt(高级档 mock) + SK2 签名链(超级档 sk2 门),
+    //   两条并存。收据型只对应"收据 mock 路线", 绝不代表"没有可 patch 的本地 sk2 链" —
+    //   sk2 门照常入库(超级档就靠它)。闸门只留真正"本地 patch 结构性无效"的服务端/票据/观测型。
     BOOL gBlockCodePts = srvTicket || srvSelfIap || gObsReceipt || (gObsFlow > 0);
     if (gBlockCodePts)
         mfLog(@"[f8v2] ★判型总闸: 本地代码点闸门关闭(srvTicket=%d srvSelfIap=%d obs收据=%d obs购买流=%lu) — 框架/sk2/cands 点位不入库",
@@ -3286,25 +3291,21 @@ NSDictionary *mfReconFingerprint(void) {
     //   sk2pro(写点)+sk2get(读侧) 这类**指令级 patch**, UserDefaults 直写只是辅助/部分。
     // v2.58.117: 文案跟上 — 用户反馈(dbg_108) "65 点"虚高(含通用噪声/标准 SK2 门)。
     //   现在: 有真门时优先播报真门数(score>=99), 其余点标注为"候选"; 无真门时旧文案保留。
-    else if (nRealGate > 0) verdict = [NSString stringWithFormat:@"代码判定型(本地 SK2 验证链) — ★真门 %lu 个(Optional 解包门, 优先试) · 其余 %lu 候选 — 实验模拟页⚡即解锁",
+    else if (nRealGate > 0) verdict = [NSString stringWithFormat:@"代码判定型(本地 SK2 验证链) — ★真门 %lu 个 · 其余 %lu 候选",
                                        (unsigned long)nRealGate, (unsigned long)(nCodePts > nRealGate ? nCodePts - nRealGate : 0)];
-    else if (nCodePts > 0)  verdict = [NSString stringWithFormat:@"代码判定型(指令级 patch %lu 点: isPro 写点/读侧 getter) — 实验模拟页⚡即解锁", (unsigned long)nCodePts];
-    else if (stateType)     verdict = @"状态型(UserDefaults 实存语义key) — 🧪实验模拟→F9 状态解锁 直写";
+    else if (nCodePts > 0)  verdict = [NSString stringWithFormat:@"代码判定型(指令级 patch %lu 点: isPro 写点/读侧 getter)", (unsigned long)nCodePts];
+    else if (stateType)     verdict = @"状态型(UserDefaults 实存语义key)";
     // v2.58.168 B: 观测确证的收据验证型 — 运行时铁证优先于静态兜底(解决"判定点未发现")。
     //   条件: 观测命中收据验证类 或 观测挂到 SK1 购买流消费者(paymentQueue:updatedTransactions:)。
-    else if (obsReceipt || obsFlow > 0) verdict = [NSString stringWithFormat:@"收据验证型(运行时观测确证: %@购买流消费者 %lu 个) — 解锁路线: 🧪实验模拟页 L1 收据伪造开关(判定读收据, 非代码门)",
+    else if (obsReceipt || obsFlow > 0) verdict = [NSString stringWithFormat:@"收据验证型(运行时观测确证: %@购买流消费者 %lu 个)",
                                        obsReceipt ? @"收据验证类命中 · " : @"", (unsigned long)obsFlow];
     // v2.58.176 (dbg_164 bazaart 定谳): 静态收据验证型 — verifyReceipt 网络端点 / 本地收据文件在场。
-    //   与 obsReceipt(运行时观测)互补: 静态串命中即判, 不依赖观测挂载。
-    //   bazaart 高级版靠 buy.itunes.apple.com/verifyReceipt(Surge 模块拦它注入伪造收据即解),
-    //   路线 = 云验证 mock 开关(拦 verifyReceipt 响应) 或 L1(本地收据文件伪造)。
-    else if (gRcptNetwork)  verdict = [NSString stringWithFormat:@"收据验证型(verifyReceipt 网络验证%@) — 解锁路线: 云验证 mock 开关(拦 verifyReceipt 注入收据)%@",
-                                       skLocal ? [NSString stringWithFormat:@" · %@", skType] : @"",
-                                       gRcptLocal ? @" 或 L1 收据伪造(本地收据文件)" : @""];
-    else if (gRcptLocal)    verdict = [NSString stringWithFormat:@"收据验证型(本地收据文件 appStoreReceiptURL%@) — 解锁路线: 🧪L1 收据伪造开关",
+    else if (gRcptNetwork)  verdict = [NSString stringWithFormat:@"收据验证型(verifyReceipt 网络验证%@)",
+                                       skLocal ? [NSString stringWithFormat:@" · %@", skType] : @""];
+    else if (gRcptLocal)    verdict = [NSString stringWithFormat:@"收据验证型(本地收据文件 appStoreReceiptURL%@)",
                                        skLocal ? [NSString stringWithFormat:@" · %@", skType] : @""];
     // v2.58.7: 纯 StoreKit 本地校验型分支(2.58.6 缺失 — SK2 明明已判定却显示"未发现订阅验证 SDK"兜底文案)
-    else if (skLocal)       verdict = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@ · %@) — 判定点已入库, 实验模拟页左划 patch", skType, validator];
+    else if (skLocal)       verdict = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@ · %@)", skType, validator];
     else                    verdict = @"未发现订阅验证 SDK";
     if (cloudBrands.count > 1) {
         NSString *names = [[cloudBrands.allObjects sortedArrayUsingSelector:@selector(compare)] componentsJoinedByString:@"/"];
@@ -3352,15 +3353,24 @@ NSDictionary *mfReconFingerprint(void) {
         mfType = @"服务器授权票据型"; route = @"⛔ 权益=服务器签发 JWT 票据, 本地 patch 结构性无效 — 无可用本地路线";
         [ev addObject:@"票据字段族在场(iat/exp/kid/grace_seconds + entitlements:sync + permanent_entitlements_authoritative)"];
     } else if (gRcptNetwork || obsReceipt) {
-        // v2.58.177 收据验证型(verifyReceipt 网络): 静态串 或 运行时捕获 或 观测确证。多信号收敛到一个 type。
-        mfType = @"收据验证型(verifyReceipt 网络验证)";
-        route = gRcptLocal
-            ? @"实验模拟页: 云验证 mock 开关(拦 verifyReceipt 注入收据) 或 L1 收据伪造(本地收据文件)"
-            : @"实验模拟页: 云验证 mock 开关(拦 verifyReceipt 注入收据)";
+        // v2.58.177 收据验证型(verifyReceipt 网络): 静态串 或 运行时捕获 或 观测确证。
+        // v2.58.179 多链并报(dbg_166 用户定谳): bazaart 是多链 app —
+        //   ①verifyReceipt 收据链(已实锤: 高级档 Surge/云验证 mock 拦 verifyReceipt 即解) +
+        //   ②本地 SK2 代码门(候选: 超级档可能走此, 收据 mock 够不着 — 但尚未定论是否真门)。
+        //   收据型≠"无本地链", sk2 门照常入库供试(闸门已放行); 但诚实标注 sk2 是"候选未定论",
+        //   不假称它=超级档真门(用户: sk2 点位还没定论, 别当结论压)。
+        BOOL hasSk2Chain = (nCodePts > 0 || nRealGate > 0);
+        mfType = hasSk2Chain ? @"多链: 收据验证型(verifyReceipt, 实锤) + 本地 SK2 代码门(候选)" : @"收据验证型(verifyReceipt 网络验证)";
+        NSMutableString *rt = [NSMutableString stringWithString:@"①收据档(实锤): 云验证 mock 开关(拦 verifyReceipt 注入收据)"];
+        if (gRcptLocal) [rt appendString:@" 或 L1 收据伪造"];
+        if (hasSk2Chain) [rt appendFormat:@" ②本地档(候选待验): 判定点列表 ⚡ %@ %lu 点",
+                          nRealGate > 0 ? @"★真门" : @"sk2门", (unsigned long)(nRealGate > 0 ? nRealGate : nCodePts)];
+        route = rt;
         [ev addObject:skLine];
         if (netVrfyHits) [ev addObject:[NSString stringWithFormat:@"网络捕获实锤: %lu 条 verifyReceipt 验证请求(如 %@)", (unsigned long)netVrfyHits, netVrfyURLs.firstObject ?: @""]];
         else if (netTotal) [ev addObject:[NSString stringWithFormat:@"网络捕获 %lu 条(verifyReceipt 见二进制静态串)", (unsigned long)netTotal]];
         if (obsFlow > 0) [ev addObject:[NSString stringWithFormat:@"运行时观测: SK 购买流消费者 %lu 个", (unsigned long)obsFlow]];
+        if (hasSk2Chain) [ev addObject:[NSString stringWithFormat:@"本地 SK2 代码门 %lu 个(★真门 %lu)已入库 — 候选, 未定论是否超级档真门, 可 ⚡ 试", (unsigned long)nCodePts, (unsigned long)nRealGate]];
     } else if (gRcptLocal) {
         mfType = @"收据验证型(本地收据文件)"; route = @"实验模拟页: L1 收据伪造开关";
         [ev addObject:skLine];
@@ -3513,50 +3523,34 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
     NSArray *entFuncs = recon[@"entFuncs"];
     CGFloat btnY = CGRectGetMaxY(rl.frame) + 10;   // v2.58.170: 接在 type+route 行之后(不再硬编码 92, 防与新头部重叠)
     BOOL hasEnt = [entFuncs isKindOfClass:[NSArray class]] && entFuncs.count;
-    if (hasEnt) {
-        // v2.57 链B: 发现 entitlement 判定点位 → 一键生成 swifttext 规则进实验模拟页
-        // v2.58: 扫描时已自动 merge 进 mfEntDumps, 此按钮退役 — 换为直通判定点卡片
-        UIButton *gen = [UIButton buttonWithType:UIButtonTypeSystem];
-        gen.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
-        gen.backgroundColor = [UIColor systemOrangeColor];
-        gen.layer.cornerRadius = 9;
-        [gen setTitle:[NSString stringWithFormat:@"🎯 判定点已入库(%lu) — 去实验模拟左划 patch", (unsigned long)entFuncs.count] forState:UIControlStateNormal];
-        [gen setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        gen.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-        [gen addTarget:page action:NSSelectorFromString(@"mfReconGoLab") forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(page, "reconEntFuncs", entFuncs, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [page addSubview:gen];
+    // v2.58.178: 详情页动作按钮由 route 派生(唯一事实源) — 不再各分支硬编码"去实验模拟左划 patch"。
+    //   dbg_166: 收据验证型(0 判定点入库)不该出现"判定点已入库 N"橙按钮。按钮跟着 route 走:
+    //   route 含"⛔"(无本地路线) → 不出操作按钮; 否则出一个"去实验模拟(执行 route)"按钮。
+    NSString *routeForBtn = recon[@"route"] ?: @"";
+    BOOL noLocalRoute = [routeForBtn hasPrefix:@"⛔"];
+    if (!noLocalRoute) {
+        UIButton *go = [UIButton buttonWithType:UIButtonTypeSystem];
+        go.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
+        go.backgroundColor = [recon[@"cloud"] boolValue] ? [UIColor systemGreenColor]
+                            : [recon[@"mach"] boolValue] ? [UIColor systemPurpleColor]
+                            : [UIColor systemOrangeColor];
+        go.layer.cornerRadius = 9;
+        // 按钮文案 = 该 type 的动作动词, 从 route 首段截取(冒号后), 保证与顶部 route 同源。
+        NSString *actTxt;
+        if ([recon[@"mach"] boolValue] && ![recon[@"cloud"] boolValue]) actTxt = @"⏯ 去 IAP工具箱开 EXCPROBE 应答器";
+        else if (hasEnt) actTxt = [NSString stringWithFormat:@"🧪 去实验模拟(%lu 判定点已入库)", (unsigned long)entFuncs.count];
+        else actTxt = @"🧪 去实验模拟页执行解锁路线";
+        [go setTitle:actTxt forState:UIControlStateNormal];
+        [go setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        go.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        SEL act = ([recon[@"mach"] boolValue] && ![recon[@"cloud"] boolValue])
+            ? NSSelectorFromString(@"mfReconGoExc") : NSSelectorFromString(@"mfReconGoLab");
+        [go addTarget:page action:act forControlEvents:UIControlEventTouchUpInside];
+        if (hasEnt) objc_setAssociatedObject(page, "reconEntFuncs", entFuncs, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [page addSubview:go];
         btnY += 44;
-    }
-    if ([recon[@"cloud"] boolValue]) {
-        // v2.58: 云验证型也带判定点时补 patch 直通文案(链路不再断在按钮文案上)
-        UIButton *lab = [UIButton buttonWithType:UIButtonTypeSystem];
-        lab.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
-        lab.backgroundColor = [UIColor systemGreenColor];
-        lab.layer.cornerRadius = 9;
-        [lab setTitle:[NSString stringWithFormat:@"🧪 去实验模拟（云验证 mock%@）",
-            hasEnt ? @" + 判定点 patch" : @""] forState:UIControlStateNormal];
-        [lab setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        lab.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-        [lab addTarget:page action:NSSelectorFromString(@"mfReconGoLab") forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(page, "reconGoLab", @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [page addSubview:lab];
-        btnY += 44;
-    } else if ([recon[@"mach"] boolValue]) {
-        // v2.54.0: mach 型(本地许可服务器, 同族) → 引导去开 EXCPROBE 应答器
-        UIButton *exc = [UIButton buttonWithType:UIButtonTypeSystem];
-        exc.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
-        exc.backgroundColor = [UIColor systemPurpleColor];
-        exc.layer.cornerRadius = 9;
-        [exc setTitle:@"⏯ 去 IAP工具箱开 EXCPROBE 应答器" forState:UIControlStateNormal];
-        [exc setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        exc.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
-        [exc addTarget:page action:NSSelectorFromString(@"mfReconGoExc") forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(page, "reconGoExc", @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [page addSubview:exc];
-        btnY += 44;
-    } else if (![recon[@"mach"] boolValue] && ![recon[@"sk"] boolValue]) {
-        // v2.58.7: 纯兜底引导 — cloud/mach/SK 全空才显示(Scripting 类纯 SK 型已由 verdict+橙按钮覆盖, 不再误出)
+    } else if (![recon[@"cloud"] boolValue] && ![recon[@"mach"] boolValue] && ![recon[@"sk"] boolValue]) {
+        // 未识别兜底(仅 cloud/mach/sk 全空且无本地路线时) — 引导补捕获重扫
         UIButton *cap = [UIButton buttonWithType:UIButtonTypeSystem];
         cap.frame = CGRectMake(16, btnY, g_mfCardW - 32, 38);
         cap.backgroundColor = [UIColor systemBlueColor];
@@ -3568,6 +3562,7 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
         [page addSubview:cap];
         btnY += 44;
     }
+    // noLocalRoute(服务端型/票据型 ⛔)时不出操作按钮 — 结论页明说无本地路线, 不给假动作。
     tvY = btnY;
     UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(12, tvY, g_mfCardW - 24, g_mfCardH - tvY - 12)];
     tv.backgroundColor = UIColor.clearColor;
@@ -3591,35 +3586,25 @@ static void mfReconShowDetailPage(NSDictionary *recon) {
 }
 @end
 
-// SK 验证后回填第三类判定(纯 StoreKit/本地型) — recon 无云/mach 指纹时 SK 产品就是形态答案
+// SK 验证后回填(v2.58.179 收编进唯一事实源): 只补一条"SK 验证通过 <pid>"客观证据,
+//   绝不覆盖 verdict/type/route — 判型已由 mfReconFingerprint 末尾统一裁定(收据型/多链/SK2 等)。
+//   dbg_166 定谳: 此函数旧实现自造 "纯 StoreKit 本地校验型" verdict + "队列信任候选→推荐 L0"
+//   "SK2 JWS 型判定点已入库" 三条硬编码文案, 完全绕开判型总闸 → 与详情页 route 打架。
+//   现在: 判型不动, 卡片副标题只更新证据条数, verdict 保持总闸结论。
 void mfReconApplySKResult(NSDictionary *recon, UIView *page, NSString *topPid, BOOL isLifetime) {
     if ([recon[@"cloud"] boolValue] || [recon[@"mach"] boolValue]) return;   // 已有判定, 不覆盖
     MFReconCard *card = objc_getAssociatedObject(page, "reconCard");
     if (!card) return;
     NSMutableArray *lines = [recon[@"lines"] mutableCopy];
-    [lines addObject:[NSString stringWithFormat:@"SK 验证通过: %@ (%@) — 无云验证 SDK/mach 端口 → 纯 StoreKit 本地校验型", topPid, isLifetime ? @"lifetime" : @"消耗型/订阅"]];
-    NSString *val = recon[@"validator"] ?: @"无收据验证特征";
-    NSString *sk = recon[@"sktype"] ?: @"未知";
-    NSString *rec, *verdict;
-    if ([sk containsString:@"SK2"] && ![sk containsString:@"SK1"]) {
-        rec = @"SK2 JWS 型 — 判定点已入库(实验模拟页左划 patch 即恒真)";
-        verdict = [NSString stringWithFormat:@"纯 StoreKit(SK2 JWS) — %@", topPid];
-    } else if ([val containsString:@"TPInAppReceipt"] || [val containsString:@"CMS"]) {
-        rec = @"收据验证型 → 推荐 L1 收据伪造 + L2 Sec 放行(2.50)";
-        verdict = [NSString stringWithFormat:@"纯 StoreKit 本地验证(收据校验: %@) — %@", val, topPid];
-    } else {
-        rec = @"队列信任候选 → 推荐 L0 队列伪造试探(2.49)";
-        verdict = [NSString stringWithFormat:@"纯 StoreKit 本地验证(无收据校验特征) — %@", topPid];
-    }
-    [lines addObject:rec];
+    // 仅补客观证据: SK 产品验证通过(不下判型结论 — 类型是收据型/SK2/多链由总闸定, 这里不僭越)
+    [lines addObject:[NSString stringWithFormat:@"SK 验证通过: %@ (%@)", topPid, isLifetime ? @"lifetime" : @"消耗型/订阅"]];
     NSMutableDictionary *upd = [recon mutableCopy];
     upd[@"lines"] = lines;
     recon = upd;
     objc_setAssociatedObject(card, "recon", recon, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(page, "reconCard", card, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    UILabel *v = [card viewWithTag:901], *sub = [card viewWithTag:902];
-    v.text = [NSString stringWithFormat:@"侦查: %@", verdict];
-    v.textColor = [UIColor systemBlueColor];
+    // verdict 保持总闸结论不变(只刷证据条数) — 不再自造 "纯 StoreKit 本地校验型" 覆盖。
+    UILabel *sub = [card viewWithTag:902];
     sub.text = [NSString stringWithFormat:@"%lu 条证据 · 点看详情", (unsigned long)lines.count];
 }
 
