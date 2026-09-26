@@ -1418,6 +1418,9 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
         }
         NSData *nb = apEntNewBytesFor(d, nil);
         // 序言形态拦截(与单点 ⚡ 同判据 — 4 字节无法安全表达, 毁栈)
+        //   v2.58.185: 新字节自带 ret 收尾(mov w0,#1;ret 型, 如 sk2ladder 档位门)→ 函数入口即返回,
+        //   绝不 fall through 到残余序言, 不毁栈/不被尾部覆盖 → 豁免序言拦截。(dbg_172: 批量路径
+        //   漏了这道豁免, sk2ladder@0x4afa10 被当序言 skip, 唯一能点亮的门从没写进内存。)
         NSString *old = d[@"old"];
         NSData *ob = ([old isKindOfClass:[NSString class]] && old.length) ? apHexToBytes(old) : nil;
         if (ob.length >= 4) {
@@ -1425,7 +1428,9 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
             BOOL isPrologue = ((o0 & 0xFFC003FF) == 0xD10003FF && ((o0 >> 10) & 0xFFF)) ||
                               ((o0 & 0x7FC00000) == 0x29800000 && ((o0 >> 5) & 0x1F) == 31) ||
                               (o0 == 0xD503237F);
-            if (isPrologue) { skip++; apLog(@"[entdump] ⛔ 批量跳过序言 %@", sym); continue; }
+            BOOL selfReturning = NO;
+            if (nb.length >= 8) { uint32_t li = 0; [nb getBytes:&li range:NSMakeRange(nb.length - 4, 4)]; if (li == 0xD65F03C0u) selfReturning = YES; }
+            if (isPrologue && !selfReturning) { skip++; apLog(@"[entdump] ⛔ 批量跳过序言 %@", sym); continue; }
         }
         // 幂等: 当前已是目标字节(本会话已 patch 过) → 直接置 on
         //   v2.58.123: 双守卫组例外 — 主门已打但 guard2 未打时仍要走完整 patch 路径
@@ -1716,7 +1721,10 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
             BOOL isPrologue = ((o0 & 0xFFC003FF) == 0xD10003FF && ((o0 >> 10) & 0xFFF)) ||
                               ((o0 & 0x7FC00000) == 0x29800000 && ((o0 >> 5) & 0x1F) == 31) ||
                               (o0 == 0xD503237F);
-            if (isPrologue) {
+            // v2.58.185: 自返回豁免(同持久化/批量路径) — 新字节末 4B=ret 则入口即返回, 安全。
+            BOOL selfReturning = NO;
+            if (newBytes.length >= 8) { uint32_t li = 0; [newBytes getBytes:&li range:NSMakeRange(newBytes.length - 4, 4)]; if (li == 0xD65F03C0u) selfReturning = YES; }
+            if (isPrologue && !selfReturning) {
                 apLog(@"[entdump] ⛔ %@ 序言形态(%08x) 拒绝 patch — 4 字节无法安全表达(毁栈+返回值被覆盖)", sym, o0);
                 mfToast(@"⛔ 该点是函数序言 — 无法安全 patch（会毁栈）");
                 return;

@@ -3623,6 +3623,17 @@ NSDictionary *mfReconFingerprint(void) {
         if (netTotal) [ev addObject:[NSString stringWithFormat:@"网络捕获 %lu 条(无已知判定域)", (unsigned long)netTotal]];
     }
     if (excNote) [ev addObject:excNote];
+    // v2.58.185 (dbg_172 定谳): sk2ladder 梯子档位门证据 — 详情页必须显式报出, 否则用户看不到这枚
+    //   "唯一能点亮高档"的点位(172 详情页只报收据型4行, 档位门被淹没在"24个候选"里, 用户批量patch
+    //   时它又被序言守卫误 skip → 从没写进内存)。档位门是独立第二判别(高档==某组高档SKU), 与收据/云正交。
+    if (ladderPts.count) {
+        NSMutableString *lt = [NSMutableString stringWithFormat:@"★梯子档位门 %lu 个(sk2ladder", (unsigned long)ladderPts.count];
+        NSMutableSet *tiers = [NSMutableSet set];
+        for (NSDictionary *lp in ladderPts) if (lp[@"tier"]) [tiers addObject:lp[@"tier"]];
+        if (tiers.count) [lt appendFormat:@": %@ 档", [[tiers allObjects] componentsJoinedByString:@"/"]];
+        [lt appendString:@") — 高档 SKU 身份门, ⚡ 恒真解锁高档(与收据型正交, 单独试)"];
+        [ev addObject:lt];
+    }
 
     // v2.58.55: 本次会话侦查点位缓存 — 已废除(2.58.61 用户定案)
     //   侦查→mfAppPatchEntDumpsMerge 入库, 实验/列表 UI 只读持久层, 无"本次有效"概念
