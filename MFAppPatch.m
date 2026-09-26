@@ -683,7 +683,8 @@ void mfAppPatchEntDumpsEndRound(void) {
         //   有效点, 不该被侦查轮次当陈旧清掉。dbg_131 manual 踩过一次, dbg_144 hookinj 同款复现。
         BOOL isFixed = [m[@"shape"] isEqualToString:@"manual"] || [m[@"sym"] hasPrefix:@"manual@"]
                      || [m[@"shape"] isEqualToString:@"hookinj"] || [m[@"sym"] hasPrefix:@"hookinj@"]
-                     || [m[@"shape"] isEqualToString:@"discforce"] || [m[@"sym"] hasPrefix:@"discforce@"];   // v2.58.161: 方案B点同豁免
+                     || [m[@"shape"] isEqualToString:@"discforce"] || [m[@"sym"] hasPrefix:@"discforce@"]   // v2.58.161: 方案B点同豁免
+                     || [m[@"shape"] isEqualToString:@"sk2ladder"] || [m[@"sym"] hasPrefix:@"sk2ladder@"];   // v2.58.184: 梯子档位门判型钦定, 同豁免
         if (!seen && !on && !isFixed) {
             apLog(@"[entdump] ⚰ 陈旧点剔除 %@ (本轮未扫出且未持久化)", m[@"sym"]);
             continue;
@@ -837,6 +838,12 @@ void apEntDumpsApply(void) {
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
                 newBytes = apHexToBytes(d[@"new"]);
             else newBytes = apHexToBytes(@"20008052");   // mov w0,#1 兜底
+        } else if ([d[@"sym"] hasPrefix:@"sk2ladder@"]) {
+            // v2.58.184: 梯子档位门 — 恒真(mov w0,#1; ret), 令所有该档 UI 门认为"已购该档"。
+            //   new 存库内字节(20008052c0035fd6); 走标准 vm_protect 字节 patch(下方 old 校验+8字节写)。
+            if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length])
+                newBytes = apHexToBytes(d[@"new"]);
+            else newBytes = apHexToBytes(@"20008052c0035fd6");   // mov w0,#1; ret 兜底
         } else if ([d[@"sym"] hasPrefix:@"sk2vfy@"]) {
             // v2.58.114: SK2 验证判定门 — b.cond → NOP(让"无效"分支失效)
             //   sym 格式 sk2vfy@0x<off>; new 存库内字节(nop)
@@ -886,7 +893,15 @@ void apEntDumpsApply(void) {
                 BOOL isPrologue = ((o0 & 0xFFC003FF) == 0xD10003FF && ((o0 >> 10) & 0xFFF)) ||
                                   ((o0 & 0x7FC00000) == 0x29800000 && ((o0 >> 5) & 0x1F) == 31) ||
                                   (o0 == 0xD503237F);
-                if (isPrologue) {
+                // v2.58.184: 若新字节自带 ret 收尾(≥8B 且末 4B = ret 0xd65f03c0), 则替换序言安全 —
+                //   函数入口即 mov w0,#1; ret, 立刻返回, 绝不 fall through 到函数体, 不毁栈/不被尾部覆盖。
+                //   dbg_86 序言拒绝的前提是"4B mov 无 ret → 继续执行残余序言写坏调用者栈"; 有 ret 不成立。
+                BOOL selfReturning = NO;
+                if (newBytes.length >= 8) {
+                    uint32_t lastI = 0; [newBytes getBytes:&lastI range:NSMakeRange(newBytes.length - 4, 4)];
+                    if (lastI == 0xD65F03C0u) selfReturning = YES;   // ret
+                }
+                if (isPrologue && !selfReturning) {
                     apLog(@"[entdump] ⛔ %@ 序言形态(%08x) 拒绝 patch — 4 字节无法安全表达(会毁栈且返回值被覆盖)",
                           [d[@"sym"] lastPathComponent], o0);
                     g_apProPhit++;

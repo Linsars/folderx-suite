@@ -506,6 +506,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
     //   不执行, NOP 全空转; 真正解锁的是 sk2pro/sk2get 两个代码 patch 点)。
     //   "事务流验证型"概念随之废除, 不再出现在侦查判决/卡片文案。
     NSMutableArray *sk2pts = [NSMutableArray array];
+    NSMutableArray *ladderPts = [NSMutableArray array];   // v2.58.184: sk2ladder 梯子档位门(判型钦定直通)
 
     // =====================================================================
     // sk2pro (v2.58.52): isPro 写入点 — dbg_54 定谳: 空流时判别点循环体
@@ -1501,6 +1502,222 @@ static NSDictionary *mfReconF8v2Scan(void) {
         }
         mfLog(@"[f8v2] sk2plan: 强命中=%d, 校验器簇=%d 个, ★入库 pro 比较门=%d 个(sk2vfy 形态, 可 ⚡) — 通用指纹",
               nPlan, nCluster, nGateReg);
+    }
+
+    // =====================================================================
+    // sk2ladder (v2.58.184): 多档梯子档位门 — "SKU 身份定档"型 app 的通用判定指纹。
+    //   动机(bazaart dbg_171 定谳): 侦查四层(语义打分/sk2plan 内联指纹/@objc 观测/收据检测)
+    //   全部假设"存在一个 is-Pro 布尔门, patch 成 true 就解锁"。但 bazaart 是三档梯子
+    //   Free→Premium→Super, 档位靠"当前激活产品 SKU == 某组高档 SKU"的字符串比对决定,
+    //   不是布尔门。四层各自漏因:
+    //     ① 语义打分: 比的是产品 SKU 字面量(Bazaart_Super_Yearly_v4)非权益语义词 → score 低被淹
+    //     ② sk2plan: 抓内联 MOVZ/MOVK 拼 ASCII 计划名; 这里 SKU 是 immortal String 常量结构
+    //        (adrp+add 取结构体 → String.==), 指令形态不同 → 不命中
+    //     ③ @objc 观测: 这类判别是纯 Swift 自由函数, 无 @objc → 观测层看不见
+    //     ④ 收据检测: 收据注入满足"激活产品"→低档亮; 高档是架在低档之上的第二判别, 收据到不了
+    //   通用指纹(零 app 硬编码): 一个小函数(≤0x300)引用 ≥2 个"同一高档 tier"的 SKU 常量串,
+    //   返回 bool(cset/and w,#1/mov #0+#1), 被多点调用(fan-in≥3) → 这是"当前档位是不是 X 档"
+    //   的档位门。恒真它(mov w0,#1;ret) = 所有该档 UI 门都认为已购该档 → 解锁, 且不进会崩的
+    //   高档内购 VC(bazaart 超级 VC 强解包真实交易字段的崩溃随之消失)。
+    //   tier 词表分档: base(SKU 最多档=已由低档解锁基线)不做候选, 只锚定 upsell 高档。
+    // =====================================================================
+    if (cstrVM && cstrSize) {
+        // —— tier 关键词(小写 segment 精确匹配, 避免 "prof"/"process" 误伤) ——
+        static const char *kTierW[] = {"premium","super","pro","plus","vip","ultimate",
+            "unlimited","max","gold","platinum","elite","deluxe","lifetime","mega","prime","advanced","supporter"};
+        const int kTierN = (int)(sizeof(kTierW)/sizeof(kTierW[0]));
+        static const char *kPeriodW[] = {"month","year","week","annual","quarter","lifetime",
+            "forever","perpetual","daily","biweekly","monthly","yearly","weekly"};
+        const int kPeriodN = (int)(sizeof(kPeriodW)/sizeof(kPeriodW[0]));
+        // small-string segment 分词 tier 命中(下划线/点/连字符/驼峰边界切分近似: 逐词扫)
+        // 实现: 把串小写化, 对每个 tier 词做"被分隔符或串首尾包围"的 segment 匹配。
+        BOOL (^segHas)(const char *, const char *) = ^BOOL(const char *low, const char *w) {
+            size_t wl = strlen(w); const char *p = low;
+            while ((p = strstr(p, w))) {
+                char before = (p == low) ? '_' : p[-1];
+                char after  = p[wl];
+                BOOL bsep = !(before>='a'&&before<='z') && !(before>='0'&&before<='9');
+                BOOL asep = !(after>='a'&&after<='z') && !(after>='0'&&after<='9');
+                if (bsep && asep) return YES;
+                p += wl;
+            }
+            return NO;
+        };
+        // —— ① 扫 __cstring 收集"SKU 形态 + 带 tier 词"的常量串 (va → tierMask) ——
+        // SKU 形态: [A-Za-z0-9_.-], 6..70 长, 含周期词 或 _v<digit> 或 价格 dd_dd。
+        #define LAD_MAXSKU 512
+        static uint64_t skuVA[LAD_MAXSKU]; static uint32_t skuTier[LAD_MAXSKU]; static int skuLen[LAD_MAXSKU];
+        int nLadSku = 0;
+        uint32_t tierTotal[32] = {0};   // 每 tier 命中 SKU 数(定 base 档)
+        const uint8_t *cstrMem = (const uint8_t *)((uintptr_t)cstrVM + (uintptr_t)slide);
+        for (uint64_t i = 0; i < cstrSize && nLadSku < LAD_MAXSKU; ) {
+            const uint8_t *s = cstrMem + i;
+            uint64_t maxn = cstrSize - i; size_t len = strnlen((const char *)s, maxn < 80 ? maxn : 80);
+            if (len < 6 || len > 70) { i += (len ? len + 1 : 1); continue; }
+            char low[72]; int ok = 1;
+            for (size_t k = 0; k < len; k++) {
+                char c = s[k];
+                if (!((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='_'||c=='.'||c=='-')) { ok = 0; break; }
+                low[k] = (c>='A'&&c<='Z') ? (c+32) : c;
+            }
+            low[len] = 0;
+            if (!ok) { i += len + 1; continue; }
+            // SKU 形态门
+            BOOL hasPeriod = NO;
+            for (int t = 0; t < kPeriodN; t++) if (strstr(low, kPeriodW[t])) { hasPeriod = YES; break; }
+            BOOL hasVer = NO; { const char *v = low; while ((v = strstr(v, "_v"))) { if (v[2]>='0'&&v[2]<='9') { hasVer = YES; break; } v += 2; } }
+            BOOL hasPrice = NO; for (size_t k = 0; k + 5 <= len; k++) if (low[k]>='0'&&low[k]<='9'&&low[k+1]>='0'&&low[k+1]<='9'&&low[k+2]=='_'&&low[k+3]>='0'&&low[k+3]<='9'&&low[k+4]>='0'&&low[k+4]<='9') { hasPrice = YES; break; }
+            if (!hasPeriod && !hasVer && !hasPrice) { i += len + 1; continue; }
+            // tier 命中(segment 精确)
+            uint32_t mask = 0;
+            for (int t = 0; t < kTierN && t < 32; t++) if (segHas(low, kTierW[t])) mask |= (1u << t);
+            if (mask) {
+                skuVA[nLadSku] = cstrVM + i; skuTier[nLadSku] = mask; skuLen[nLadSku] = (int)len;
+                for (int t = 0; t < kTierN && t < 32; t++) if (mask & (1u<<t)) tierTotal[t]++;
+                nLadSku++;
+            }
+            i += len + 1;
+        }
+        if (nLadSku >= 2) {
+            // SKU 地址区间(快速剪枝: val 落区间外直接跳过 512 内层扫描)
+            uint64_t skuMin = ~0ULL, skuMax = 0;
+            for (int k = 0; k < nLadSku; k++) { if (skuVA[k] < skuMin) skuMin = skuVA[k]; if (skuVA[k] > skuMax) skuMax = skuVA[k]; }
+            // base 档 = SKU 数最多的 tier(它代表已解锁基线, 不做恒真候选; 只锚定 upsell 高档)
+            int baseT = -1; uint32_t baseN = 0;
+            for (int t = 0; t < kTierN && t < 32; t++) if (tierTotal[t] > baseN) { baseN = tierTotal[t]; baseT = t; }
+            // —— ② 扫 __text: adrp+add(±0/-0x20 Swift 串元) 落到 SKU 串 → 记 (fn → tier → 命中 SKU 计数) ——
+            // 复用近邻寄存器追踪(与 sk2plan planLitNear 同思路, 全局线性一遍)。
+            // fn 聚合: 用小哈希表(开链) fn→{tierCnt[32], baseCnt}
+            typedef struct LadFn { uint64_t fn; uint16_t cnt[32]; uint16_t baseCnt; struct LadFn *next; } LadFn;
+            #define LAD_HN 2048
+            static LadFn *ladBk[LAD_HN];
+            for (int b = 0; b < LAD_HN; b++) ladBk[b] = NULL;   // 复位(static 跨调用残留)
+            NSMutableData *arena = [NSMutableData dataWithLength:sizeof(LadFn) * 4096];
+            LadFn *pool = (LadFn *)arena.mutableBytes; __block int poolN = 0; const int poolCap = 4096;
+            LadFn *(^fnSlot)(uint64_t) = ^LadFn *(uint64_t fn) {
+                uint32_t h = (uint32_t)((fn >> 4) * 2654435761u) & (LAD_HN - 1);
+                for (LadFn *e = ladBk[h]; e; e = e->next) if (e->fn == fn) return e;
+                if (poolN >= poolCap) return NULL;
+                LadFn *e = &pool[poolN++]; e->fn = fn; e->baseCnt = 0;
+                for (int t = 0; t < 32; t++) e->cnt[t] = 0;
+                e->next = ladBk[h]; ladBk[h] = e; return e;
+            };
+            // 归属函数: 沿 sk2plan 同款序言回扫
+            uint64_t (^ownerFn)(uint64_t) = ^uint64_t(uint64_t pc) {
+                for (uint64_t b = pc; b > textVM && pc - b < 0x8000; b -= 4) {
+                    uint32_t bw = *(const uint32_t *)((uintptr_t)b + (uintptr_t)slide);
+                    if (bw == 0xD503237F ||
+                        ((bw & 0xFF8003FF) == 0xD10003FF && ((bw >> 10) & 0xFFF)) ||
+                        ((bw & 0xFFC003E0) == 0xA98003E0)) return b;
+                }
+                return 0;
+            };
+            // adrp 寄存器页缓存
+            uint64_t regPage[32] = {0}; uint64_t regPC[32] = {0};
+            for (uint64_t p = textVM; p + 4 <= textVM + textSize; p += 4) {
+                uint32_t w = *(const uint32_t *)((uintptr_t)p + (uintptr_t)slide);
+                if ((w & 0x9F000000) == 0x90000000) {         // ADRP
+                    uint32_t rd = w & 0x1F;
+                    int64_t immlo = (w >> 29) & 3, immhi = (w >> 5) & 0x7FFFF;
+                    int64_t v = (immhi << 2) | immlo; if (v & (1LL<<20)) v -= (1LL<<21);
+                    regPage[rd] = (p & ~0xFFFULL) + (uint64_t)(v << 12); regPC[rd] = p;
+                } else if ((w & 0x7F800000) == 0x11000000) {  // ADD imm
+                    uint32_t rn = (w >> 5) & 0x1F, sh = (w >> 22) & 1, a12 = (w >> 10) & 0xFFF;
+                    if (regPC[rn] && p - regPC[rn] <= 24) {
+                        uint64_t val = regPage[rn] + ((uint64_t)a12 << (sh ? 12 : 0));
+                        // 剪枝: val 或 val+0x20 必落 SKU 串地址区间, 否则跳过 512 内层扫描
+                        if ((val < skuMin || val > skuMax) && (val + 0x20 < skuMin || val + 0x20 > skuMax)) goto lad_next;
+                        // 命中 SKU 串? (val 直指串 或 val+0x20 指串 — Swift 串元结构在串前 0x20)
+                        for (int k = 0; k < nLadSku; k++) {
+                            if (skuVA[k] == val || skuVA[k] == val + 0x20) {
+                                uint64_t fn = ownerFn(p);
+                                if (fn) {
+                                    LadFn *e = fnSlot(fn);
+                                    if (e) {
+                                        uint32_t m = skuTier[k];
+                                        for (int t = 0; t < 32; t++) if (m & (1u<<t)) {
+                                            if (t == baseT) { if (e->baseCnt < 0xFFFF) e->baseCnt++; }
+                                            else if (e->cnt[t] < 0xFFFF) e->cnt[t]++;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                lad_next:;   // v2.58.184: 剪枝跳转落点(跳过 SKU 内层扫描, 继续下条指令)
+            }
+            // —— ③ 判档位门: upsell tier 命中 ≥2, 函数小(≤0x300), baseRef≤4, bool 返回, fan-in≥3 ——
+            // bool 返回自检: 函数体含 CSET/CSINC(wd,wzr,wzr) 或 (mov w,#1 且 mov w,#0) 或 and w,#1。
+            BOOL (^isBoolFn)(uint64_t, uint64_t) = ^BOOL(uint64_t fn, uint64_t end) {
+                BOOL has1 = NO, has0 = NO;
+                for (uint64_t g = fn; g + 4 <= end; g += 4) {
+                    uint32_t w = *(const uint32_t *)((uintptr_t)g + (uintptr_t)slide);
+                    if ((w & 0x7FE0FC00) == 0x1A9F07E0) return YES;   // CSINC/CSET Wd,WZR,WZR,cond
+                    if ((w & 0xFFFFFC00) == 0x12000000 && (w & 0x1F) == 0) return YES; // and w0,w?,#1
+                    if (w == 0x52800020) has1 = YES;                 // mov w0,#1
+                    if (w == 0x52800000) has0 = YES;                 // mov w0,#0
+                }
+                return has1 && has0;
+            };
+            // fan-in: 扫 __text bl 计目标函数被多少不同函数调用
+            uint16_t (^fanIn)(uint64_t) = ^uint16_t(uint64_t fn) {
+                uint16_t n = 0; uint64_t lastCaller = 0;
+                for (uint64_t p = textVM; p + 4 <= textVM + textSize; p += 4) {
+                    uint32_t w = *(const uint32_t *)((uintptr_t)p + (uintptr_t)slide);
+                    if ((w & 0xFC000000) != 0x94000000) continue;    // BL
+                    int32_t imm = w & 0x03FFFFFF; if (imm & (1<<25)) imm -= (1<<26);
+                    if (textVM + (p - textVM) + ((int64_t)imm << 2) != (int64_t)fn) continue;
+                    uint64_t c = ownerFn(p);
+                    if (c && c != lastCaller) { n++; lastCaller = c; if (n > 200) break; }
+                }
+                return n;
+            };
+            int nLadGate = 0;
+            for (int b = 0; b < poolN; b++) {
+                LadFn *e = &pool[b];
+                // 选该函数命中最强的 upsell tier
+                int bestT = -1, bestCnt = 0;
+                for (int t = 0; t < kTierN && t < 32; t++) if (t != baseT && e->cnt[t] > bestCnt) { bestCnt = e->cnt[t]; bestT = t; }
+                if (bestT < 0 || bestCnt < 2) continue;
+                if (e->baseCnt > 4) continue;   // 多档映射大函数(把低档也全枚举了)排除
+                uint64_t fn = e->fn;
+                uint64_t end = fn; { // 函数尾: 下一个序言或 +0x300 上限
+                    uint64_t lim = fn + 0x300; if (lim > textVM + textSize) lim = textVM + textSize;
+                    uint64_t g = fn + 4;
+                    for (; g + 4 <= lim; g += 4) {
+                        uint32_t w = *(const uint32_t *)((uintptr_t)g + (uintptr_t)slide);
+                        if (w == 0xD503237F || ((w & 0xFF8003FF) == 0xD10003FF && ((w >> 10) & 0xFFF)) ||
+                            ((w & 0xFFC003E0) == 0xA98003E0)) { end = g; break; }
+                    }
+                    if (!end) end = lim;
+                }
+                if (end - fn > 0x300) continue;              // 只收小函数(档位门是纯比较)
+                if (!isBoolFn(fn, end)) continue;
+                uint16_t fi = fnSlot ? fanIn(fn) : 0;
+                if (fi < 3) continue;                         // 多点收口(UI 门共用判别器)
+                // ★命中: 恒真档位门 (mov w0,#1; ret)
+                uint32_t old0 = *(const uint32_t *)((uintptr_t)fn + (uintptr_t)slide);
+                [ladderPts addObject:[@{
+                    @"img": mainPath ? [[NSString stringWithUTF8String:mainPath] lastPathComponent] : @"main",
+                    @"sym": [NSString stringWithFormat:@"sk2ladder@%#llx", (unsigned long long)(fn - textVM)],
+                    @"vmaddr": @(fn), @"slide": @((long)slide),
+                    @"score": @(96), @"calls": @(fi),
+                    @"shape": @"sk2ladder", @"kind": @"sk2ladder",
+                    @"tier": [NSString stringWithUTF8String:kTierW[bestT]],
+                    @"old": mfLeHex(old0),
+                    @"new": @"20008052c0035fd6",   // mov w0,#1 ; ret (档位门恒真)
+                } mutableCopy]];
+                nLadGate++;
+                mfLog(@"[f8v2] ★sk2ladder 档位门 @%#llx tier=%s SKU命中=%d fan-in=%u (恒真→该档解锁)",
+                      (unsigned long long)(fn - textVM), kTierW[bestT], bestCnt, fi);
+            }
+            mfLog(@"[f8v2] sk2ladder: tier SKU 串=%d, base 档=%s, ★入库档位门=%d 个(恒真解锁高档, app-agnostic)",
+                  nLadSku, baseT >= 0 ? kTierW[baseT] : "?", nLadGate);
+        } else {
+            mfLog(@"[f8v2] sk2ladder: tier SKU 串=%d(<2) — 非多档梯子型, 跳过", nLadSku);
+        }
     }
 
     // =====================================================================
@@ -2586,7 +2803,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
     }
     } // @autoreleasepool F8v3
     return @{@"cands": out, @"ncalls": @(nCall), @"skstubs": @(nSkStub), @"skimports": @(nSkStub),
-             @"sk2pts": sk2pts, @"deepPts": deepPts};   // v2.58.174: 深槽判定腿隔离直通
+             @"sk2pts": sk2pts, @"deepPts": deepPts, @"ladderPts": ladderPts};   // v2.58.174: 深槽判定腿隔离直通; v2.58.184: sk2ladder 档位门直通
     }
 }
 
@@ -2866,6 +3083,7 @@ NSDictionary *mfReconFingerprint(void) {
     NSArray *cands = f8v2[@"cands"];
     NSArray *sk2pts = f8v2[@"sk2pts"];
     NSArray *deepPts = f8v2[@"deepPts"] ?: @[];   // v2.58.174: F10 深槽判定腿(隔离, 判型钦定直通入库)
+    NSArray *ladderPts = f8v2[@"ladderPts"] ?: @[];   // v2.58.184: sk2ladder 梯子档位门(判型钦定直通入库)
     BOOL sk2LocalType = NO;
     {
         NSUInteger nS = 0;
@@ -3192,6 +3410,15 @@ NSDictionary *mfReconFingerprint(void) {
                 gCodePtsInStore = mfAppPatchEntDumpsMerge(mergePts);   // v2.58.181: 真实入库数(扣墓碑/去重)
                 RECON_P("merge-done");
                 [entFuncs addObjectsFromArray:mergePts];   // v2.58.177: 入库, 证据由末尾 type 派生
+            }
+            // v2.58.184: sk2ladder 档位门 — 判型钦定直通入库(不流经 gBlockCodePts/cloudBrands 抑制,
+            //   也不进候选截断)。梯子档位门是"高档==某组高档 SKU"的独立第二判别, 与收据/云/服务端型正交:
+            //   收据注入让低档亮后, 高档仍靠这枚门比对 → 必须恒真才解锁。app-agnostic, 零硬编码。
+            if ([ladderPts isKindOfClass:[NSArray class]] && ladderPts.count) {
+                extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
+                mfAppPatchEntDumpsMerge(ladderPts);
+                [entFuncs addObjectsFromArray:ladderPts];
+                mfLog(@"[f8v2] sk2ladder: %lu 档位门直通入库(判型钦定, 不受服务端/云/收据型抑制)", (unsigned long)ladderPts.count);
             }
             // v2.58.55: SK2 流型(非云)抑制 F8v2 swifttext 点位; 云型 F10 deepslot 直通(双因子本地腿)。
             if (sk2LocalType) {
