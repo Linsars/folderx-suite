@@ -598,6 +598,74 @@ void mfSubInjectAutoStart(void) {
 long mfSubInjectHits(void) { return g_subHits; }
 BOOL mfSubInjectIsOn(void) { return g_subOn; }
 
+// v2.58.182: verifyReceipt 真信封响应注入(dbg_169 定谳) — 收据验证型的 app-agnostic 正解。
+//   dbg_169 实锤: bazaart 逛内购页自发打 verifyReceipt, 响应是苹果真信封(adam_id/bundle_id/
+//   download_id/latest_receipt 真 PKCS7 签名, 全是该 app 特有真值)。我们旧做法"凭空伪造整信封"
+//   (adam_id:100000/latest_receipt:mfsk1-blob 全假) → app 一比对 adam_id 或二次校验签名即废。
+//   正解(=Surge/Reven 网关原理, 但进程内做): 放行真请求到苹果 → 拿真信封 → 只往 in_app/
+//   latest_receipt_info 注入目标产品(动态 mfSubPids) → 保留所有真实字段回传。
+//   ★换任何 app 不失效: 真值全部透传自苹果, 产品来自动态发现, 零 app 硬编码 — 只做"数组注入"通用操作。
+BOOL mfSubInjectWantReceiptInject(NSURL *u) {
+    if (!g_subOn || !u.host) return NO;
+    NSString *full = u.absoluteString.lowercaseString;
+    if ([full containsString:@"mfprobe"]) return NO;   // 自家探针不碰
+    NSString *h = u.host.lowercaseString, *p = (u.path ?: @"").lowercaseString;
+    return ([h isEqualToString:@"buy.itunes.apple.com"] || [h isEqualToString:@"sandbox.itunes.apple.com"])
+           && [p hasSuffix:@"/verifyreceipt"];
+}
+
+NSData *mfSubInjectRewriteVerifyReceipt(NSData *origResp) {
+    if (!g_subOn || !origResp.length) return nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:origResp options:NSJSONReadingMutableContainers error:NULL];
+    if (![obj isKindOfClass:[NSDictionary class]]) return nil;   // 非 JSON/解析失败 → 返回 nil = 透传真实(不破坏 app)
+    NSMutableDictionary *root = obj;
+    NSArray *pids = mfSubPids();
+    if (!pids.count) return nil;
+
+    long long nowMs = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
+    NSString *nowMsStr = [@(nowMs) stringValue];
+    NSString *futMsStr = @"4092768000000";                 // ~2099-09, 远未来(订阅永不过期)
+    NSString *pdate = @"2026-01-01 00:00:00 Etc/GMT";       // 文本日期(app 判权益主要读 _ms 字段)
+    NSString *fdate = @"2099-09-09 00:00:00 Etc/GMT";
+
+    // 注入条目: 每个动态发现的产品一条(全给, app 查哪个权益产品都命中 — 比"挑一个"更鲁棒且 app-agnostic)
+    NSMutableArray *inApp = [NSMutableArray array];
+    NSMutableArray *pri = [NSMutableArray array];
+    long long tid = 7700000000001;
+    for (NSString *pid in pids) {
+        if (![pid isKindOfClass:[NSString class]] || !pid.length) continue;
+        NSString *tidStr = [@(tid) stringValue];
+        [inApp addObject:@{
+            @"quantity":@"1", @"product_id":pid,
+            @"transaction_id":tidStr, @"original_transaction_id":tidStr,
+            @"purchase_date":pdate, @"purchase_date_ms":nowMsStr, @"purchase_date_pst":pdate,
+            @"original_purchase_date":pdate, @"original_purchase_date_ms":nowMsStr, @"original_purchase_date_pst":pdate,
+            @"expires_date":fdate, @"expires_date_ms":futMsStr, @"expires_date_pst":fdate,
+            @"is_trial_period":@"false", @"is_in_intro_offer_period":@"false",
+            @"web_order_line_item_id":tidStr,
+        }];
+        [pri addObject:@{@"auto_renew_product_id":pid, @"product_id":pid,
+                         @"original_transaction_id":tidStr, @"auto_renew_status":@"1"}];
+        tid++;
+    }
+    if (!inApp.count) return nil;
+
+    root[@"status"] = @0;   // 强制有效(app 真收据 status 可能 21006 订阅过期等 → 归 0)
+    // 保留真实 receipt 块全部字段(adam_id/bundle_id/download_id/version_external_identifier/
+    //   original_purchase_date 等 app 特有真值), 只替换 in_app 数组。
+    if ([root[@"receipt"] isKindOfClass:[NSDictionary class]]) {
+        NSMutableDictionary *rc = [root[@"receipt"] mutableCopy];
+        rc[@"in_app"] = inApp;
+        root[@"receipt"] = rc;
+    }
+    root[@"latest_receipt_info"] = inApp;
+    root[@"pending_renewal_info"] = pri;
+    // root[@"latest_receipt"](真 PKCS7 base64 签名) 原样保留不动 — app 二次校验时读它
+    NSData *out = [NSJSONSerialization dataWithJSONObject:root options:0 error:NULL];
+    if (out) mfLog(@"[subinject] verifyReceipt 真信封注入: %lu 产品(adam_id/bundle_id/latest_receipt 等真实字段保留)", (unsigned long)inApp.count);
+    return out;
+}
+
 // v2.58.180 (dbg_167 定谳): 订阅注入 mock 走 NSURLProtocol 全局层的入口。
 //   病根: mfSubInjectEnable 只 hook dataTaskWith{Request,URL}:completionHandler: 两个方法,
 //   拦不到现代 async/await(URLSession.data(for:))与 delegate 请求 → verifyReceipt(bazaart 高级档

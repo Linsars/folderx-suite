@@ -176,6 +176,7 @@ static void mfRecordCapture(MFNetRecord *rec) {
 @property (strong) NSURLResponse *response;
 @property (strong) NSData *replaceBody;   // replaceResp 预构建的替换 body
 @property BOOL replacingBody;             // 是否正在替换 body（原始数据不转发）
+@property BOOL injectReceipt;             // v2.58.182: verifyReceipt 真信封注入(缓冲真响应→改写→回传)
 @end
 
 @implementation MFURLProtocol
@@ -212,13 +213,16 @@ static void mfRecordCapture(MFNetRecord *rec) {
     self.record.reqBody = req.HTTPBody;
     self.record.timestamp = [NSDate date];
 
-    // v2.58.180 (dbg_167): 订阅注入 mock 全局层入口 — 命中 target 直接应答 mock body, 不转发网络。
-    //   这是 verifyReceipt/RC/Adapty 等订阅端点 mock 真正生效的地方(旧 completionHandler hook
-    //   拦不到 async/await, MFURLProtocol 通吃所有 NSURLSession)。放在规则改写之前, 独立开关驱动。
+    // v2.58.180/182 (dbg_167/169): 订阅注入 mock 全局层入口。
+    //   ★verifyReceipt 例外: 不在此拦截伪造 — 它必须放行到苹果拿真信封(adam_id/latest_receipt
+    //   等真值), 再在响应路径做"真信封注入"(见 didCompleteWithError)。旧的凭空伪造整信封
+    //   对 verifyReceipt 无效(dbg_169: app 比对 adam_id/校验签名即废)。RC/Adapty 等纯 JSON
+    //   无签名端点仍走此处即时伪造。
     {
         extern BOOL mfSubInjectMockFor(NSURL *, NSData **);
+        extern BOOL mfSubInjectWantReceiptInject(NSURL *);
         NSData *mockBody = nil;
-        if (mfSubInjectMockFor(req.URL, &mockBody) && mockBody.length) {
+        if (!mfSubInjectWantReceiptInject(req.URL) && mfSubInjectMockFor(req.URL, &mockBody) && mockBody.length) {
             NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:req.URL statusCode:200
                                         HTTPVersion:@"HTTP/1.1"
                                        headerFields:@{@"Content-Type": @"application/json",
@@ -284,6 +288,16 @@ static void mfRecordCapture(MFNetRecord *rec) {
     }
     
     // 转发请求
+    // v2.58.182: verifyReceipt 真信封注入模式 — 请求原样放行到苹果(真收据真的发出去),
+    //   但响应先缓冲(injectReceipt=YES → didReceiveData 只累积不转发), 待 didComplete 拿到
+    //   完整真信封后改写 in_app 再一次性回传。app-agnostic: 真值透传, 只做数组注入。
+    {
+        extern BOOL mfSubInjectWantReceiptInject(NSURL *);
+        if (mfSubInjectWantReceiptInject(req.URL)) {
+            self.injectReceipt = YES;
+            self.record.summary = @"SUBINJECT-RECEIPT";
+        }
+    }
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     self.session = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
     NSURLSessionDataTask *task = [self.session dataTaskWithRequest:req];
@@ -300,6 +314,17 @@ static void mfRecordCapture(MFNetRecord *rec) {
     didReceiveResponse:(NSURLResponse *)response
     completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
     self.response = response;
+    // v2.58.182: verifyReceipt 真信封注入 — 缓冲真响应, 暂不下发(Content-Length 待改写后定),
+    //   到 didComplete 拿全 body 改 in_app 再一次性回传。这里只接住 response, 允许继续收 data。
+    if (self.injectReceipt) {
+        if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+            self.record.status = ((NSHTTPURLResponse *)response).statusCode;
+            self.record.respHeaders = ((NSHTTPURLResponse *)response).allHeaderFields;
+        }
+        self.data = [NSMutableData new];
+        completionHandler(NSURLSessionResponseAllow);
+        return;
+    }
     if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
         NSHTTPURLResponse *httpResp = (NSHTTPURLResponse *)response;
         self.record.status = httpResp.statusCode;
@@ -367,6 +392,11 @@ static void mfRecordCapture(MFNetRecord *rec) {
 }
 
 - (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    if (self.injectReceipt) {
+        // v2.58.182: 缓冲真信封全文(verifyReceipt 响应通常几 KB~几十 KB), 不转发, 待 didComplete 改写
+        if (self.data.length < 2u*1024*1024) [self.data appendData:data];
+        return;
+    }
     if (self.replacingBody) {
         // v2.58.111: 仍然累积原始数据(不转发) —— 诊断需要, 见 didCompleteWithError
         //   64KB 上限: 诊断用途, 防病态大响应占内存
@@ -382,6 +412,24 @@ static void mfRecordCapture(MFNetRecord *rec) {
         [self.client URLProtocol:self didFailWithError:error];
         self.record.status = -1;
         self.record.summary = [NSString stringWithFormat:@"ERROR: %@", error.localizedDescription];
+    } else if (self.injectReceipt) {
+        // v2.58.182: verifyReceipt 真信封注入 — 拿到完整真响应, 改写 in_app 后一次性下发。
+        //   app-agnostic: 真值(adam_id/bundle_id/download_id/latest_receipt 签名)透传, 只注入产品。
+        extern NSData *mfSubInjectRewriteVerifyReceipt(NSData *);
+        NSData *rewritten = mfSubInjectRewriteVerifyReceipt(self.data);
+        NSData *outBody = rewritten ?: self.data;   // 改写失败(非JSON/无产品) → 透传真实, 绝不破坏 app
+        NSMutableDictionary *hdrs = [(self.record.respHeaders ?: @{}) mutableCopy];
+        hdrs[@"Content-Length"] = [NSString stringWithFormat:@"%lu", (unsigned long)outBody.length];
+        [hdrs removeObjectForKey:@"Content-Encoding"];   // 已解压的明文 JSON, 去掉 gzip 声明防上层二次解码
+        NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:task.response.URL ?: self.request.URL
+                                    statusCode:(self.record.status > 0 ? self.record.status : 200)
+                                   HTTPVersion:@"HTTP/1.1" headerFields:hdrs];
+        [self.client URLProtocol:self didReceiveResponse:resp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+        [self.client URLProtocol:self didLoadData:outBody];
+        [self.client URLProtocolDidFinishLoading:self];
+        self.record.respBody = outBody;
+        mfRecordCapture(self.record);
+        return;
     } else {
         if (self.replacingBody && self.replaceBody) {
             // 发送替换后的 body（正常路径数据已在 didReceiveData 转发，此处只发替换 body）
