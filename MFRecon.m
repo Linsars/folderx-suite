@@ -1661,18 +1661,26 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 }
                 return has1 && has0;
             };
-            // fan-in: 扫 __text bl 计目标函数被多少不同函数调用
+            // fan-in: 扫 __text bl 计目标函数被多少**不同**函数调用(精确去重, 非仅连续去重)
+            //   v2.58.186: 旧版只记 lastCaller(连续相同去重), caller 交错出现会重复计数 → fan-in 虚高。
+            //   改小集合精确去重(容量 256, 溢出仍累加保证 ≥ 阈值判断正确)。
             uint16_t (^fanIn)(uint64_t) = ^uint16_t(uint64_t fn) {
-                uint16_t n = 0; uint64_t lastCaller = 0;
+                uint64_t seen[256]; int ns = 0; uint16_t total = 0;
                 for (uint64_t p = textVM; p + 4 <= textVM + textSize; p += 4) {
                     uint32_t w = *(const uint32_t *)((uintptr_t)p + (uintptr_t)slide);
                     if ((w & 0xFC000000) != 0x94000000) continue;    // BL
                     int32_t imm = w & 0x03FFFFFF; if (imm & (1<<25)) imm -= (1<<26);
                     if (textVM + (p - textVM) + ((int64_t)imm << 2) != (int64_t)fn) continue;
                     uint64_t c = ownerFn(p);
-                    if (c && c != lastCaller) { n++; lastCaller = c; if (n > 200) break; }
+                    if (!c) continue;
+                    BOOL dup = NO;
+                    for (int k = 0; k < ns; k++) if (seen[k] == c) { dup = YES; break; }
+                    if (dup) continue;
+                    if (ns < 256) seen[ns++] = c;
+                    if (total < 0xFFFF) total++;
+                    if (total > 400) break;   // 上限保护(基础库 helper 不会是档位门)
                 }
-                return n;
+                return total;
             };
             int nLadGate = 0;
             for (int b = 0; b < poolN; b++) {
