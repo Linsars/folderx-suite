@@ -2820,7 +2820,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
 //   病根(用户定案): 实时日志的运行时观测(app 自己 NSLog/print 的输出)从没被侦查/判型总闸
 //   利用 → 判型全靠静态瞎猜(mailnow 静态见 SwiftyStoreKit+appStoreReceiptURL → 误判收据型;
 //   而 app 运行时自己打印 "FlexCall: ...premium=0;no_ad=0" = 权益真相在服务端 WebView 桥)。
-//   静态 serverSide 判据还因大小写对不上漏判(kSrvPats 小写 loadsuccess vs 二进制驼峰 loadSuccess)。
+//   静态 serverSide 判据还因大小写对不上漏判(小写词表 vs 二进制驼峰实际串)。
 //   解法(零跟跑, 不占资源): 扫描按下时取 hostlog ring buffer 快照(= 按下之前 app 累积输出),
 //   离线分析一次其中的运行时权益信号。app 从启动到按扫描之间自 report 的一切都在缓冲里。
 //   信号 app-agnostic: 通用权益键值 + WebView JS 桥指示词(通用 WebKit 术语), 零 app 硬编码。
@@ -2843,7 +2843,7 @@ static MFRTSig mfReconScanHostLog(void) {
         "pro_status", "ispremium", "haspremium", "subscribed", "is_subscriber", "issubscriber",
         "unlocked", "purchased", "membership", "isvip", "hasvip", "premium_status" };
     // JS 桥指示词 —— 纯通用 WebKit 术语(任何 WKWebView↔JS 通信都会出现), 零 app 特定桥名。
-    //   (v2.58.189: 去掉 flexcall/loadsuccess/getappitemprice 等 mailnow 特有桥动作名 = app 硬编码)
+    //   (v2.58.189: 去掉 app 特有桥动作名, 只留通用 WebKit 术语 = 零 app 硬编码)
     static const char *kBridge[] = { "usercontentcontroller", "wkscriptmessage",
         "didreceivescriptmessage", "scriptmessagehandler", "wkwebview",
         "evaluatejavascript", "postmessage", "webkit.messagehandlers", "jscontext" };
@@ -3546,22 +3546,13 @@ NSDictionary *mfReconFingerprint(void) {
     BOOL serverSide = NO;
     RECON_P("verdict-enter");
     BOOL skLocal = (BOOL)strstr(skType.UTF8String ?: "", "SK");   // v2.58.7: 提升作用域, verdict 链要用
-    {
-        static NSArray *kSrvPats;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            kSrvPats = @[@"flexcall", @"loadsuccess", @"buyappitem", @"getappitemprice",
-                         @"requestbuyappitem", @"user_number", @"usernumber"];
-        });
-        int srvHits = 0;
-        for (NSString *pat in kSrvPats)
-            if (mfRecFind(p, n, pat.UTF8String)) srvHits++;
-        // SK 本地形态 + 无云验证 + JS 桥权益字段 → 服务器权益型
-        if (srvHits >= 2 && !cloud && !mach && skLocal) serverSide = YES;
-        // v2.58.188 (dbg_178): 运行时实锤 WebView 桥下发权益 → 直接判服务端权益型(不依赖静态串大小写/命中数)。
-        //   静态 kSrvPats 曾因大小写(loadsuccess vs loadSuccess)+串太少漏判 mailnow; 运行时快照是铁证。
-        if (gRtWebBridge && !cloud && !mach) serverSide = YES;
-    }
+    // v2.58.190 (dbg_178 定谳): 退役 kSrvPats 静态串判据。理由三条:
+    //   ① app 特定串(flexcall/getappitemprice = kuku.lu 桥协议名)→ 过拟合单靶 + 泄露公开仓库
+    //   ② 漏判死判据: 存小写形式, 二进制是驼峰形式 → 大小写对不上命中数凑不够 →
+    //      serverSide 从没对该 app 生效过, 却给"有服务端判据"的假安全感 = 误导型蜜罐
+    //   ③ 已被运行时快照 gRtWebBridge 完全取代且更准(不受大小写/命名影响)、通用(纯 WebKit 术语)。
+    //   serverSide 只认运行时铁证: 没开实时日志 → 无服务端兜底(诚实: 无运行时证据不假装能判)。
+    if (gRtWebBridge && !cloud && !mach) serverSide = YES;
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
