@@ -862,27 +862,34 @@ static NSDictionary *mfReconF8v2Scan(void) {
     {
         // v2.58.79: SKU 串在 __cstring(不是 __text!) — dbg_81 定谳:
         //   旧实现扫 __text → SKU串=0 → 块静默跳过。改用 LC 拿到的 __cstring 范围。
-        uint64_t skuVM[64]; int nSku2 = 0;
-        for (uint64_t o2 = 0; o2 + 8 < cstrSize && nSku2 < 64; o2++) {
+        // v2.58.187 健壮化(非本次路径过拟合修复): 旧实现 `hasUpper continue` + 必须含 '.' +
+        //   窄词表(pro/vip/premium/subscri) = 只认"纯小写反向 DNS"SKU(com.app.pro)。
+        //   CamelCase/下划线命名(Bazaart_Super_Yearly_v4)有大写 → 被 hasUpper 全滤 → sk2br 在
+        //   这类 app 上 SKU=0 瞎眼。改为: 标识符 + 含分隔符(. _ -) + tier 词(小写化子串, 广词域)。
+        uint64_t skuVM[128]; int nSku2 = 0;
+        for (uint64_t o2 = 0; o2 + 8 < cstrSize && nSku2 < 128; o2++) {
             if (bd[cstrFileOff + o2] != 0) continue;
             const char *sp = (const char *)(bd + cstrFileOff + o2 + 1);
-            size_t L = strnlen(sp, 65);
-            if (L < 5 || L > 64) continue;
-            if (!memchr(sp, '.', L)) continue;
-            int bad = 0, hasUpper = 0;
+            size_t L = strnlen(sp, 81);
+            if (L < 4 || L > 80) continue;
+            int bad = 0, hasSep = 0; char low2[82];
             for (size_t k = 0; k < L; k++) {
                 char c = sp[k];
-                if (c >= 'A' && c <= 'Z') { hasUpper = 1; break; }
-                if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) { bad = 1; break; }
+                if (!((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='.'||c=='_'||c=='-')) { bad = 1; break; }
+                if (c=='.'||c=='_'||c=='-') hasSep = 1;
+                low2[k] = (c>='A'&&c<='Z') ? (c+32) : c;
             }
-            if (bad || hasUpper) continue;
-            if (!memmem(sp, L, "pro", 3) && !memmem(sp, L, "vip", 3) &&
-                !memmem(sp, L, "premium", 7) && !memmem(sp, L, "subscri", 7)) continue;
+            if (bad || !hasSep) continue;
+            low2[L] = 0;
+            if (!strstr(low2,"pro") && !strstr(low2,"vip") && !strstr(low2,"premium") &&
+                !strstr(low2,"subscri") && !strstr(low2,"super") && !strstr(low2,"plus") &&
+                !strstr(low2,"unlimited") && !strstr(low2,"lifetime") && !strstr(low2,"ultimate") &&
+                !strstr(low2,"max") && !strstr(low2,"gold") && !strstr(low2,"member")) continue;
             skuVM[nSku2++] = cstrVM + o2 + 1;
         }
         if (nSku2) {
-            uint64_t refFn[16]; int nRefFn = 0;
-            for (uint64_t off = 0; off + 8 < textSize && nRefFn < 16; off += 4) {
+            uint64_t refFn[32]; int nRefFn = 0;
+            for (uint64_t off = 0; off + 8 < textSize && nRefFn < 32; off += 4) {
                 uint32_t w1 = *(const uint32_t *)(bd + textFileOff + off);
                 if ((w1 & 0x9F000000) != 0x90000000) continue;
                 uint32_t w2 = *(const uint32_t *)(bd + textFileOff + off + 4);
@@ -904,7 +911,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 if (!h2) continue;
                 BOOL dup2 = NO;
                 for (int k = 0; k < nRefFn; k++) if (refFn[k] == h2) { dup2 = YES; break; }
-                if (!dup2 && nRefFn < 16) refFn[nRefFn++] = h2;
+                if (!dup2 && nRefFn < 32) refFn[nRefFn++] = h2;
             }
             int nBr = 0;
             for (int f = 0; f < nRefFn; f++) {
@@ -1505,30 +1512,27 @@ static NSDictionary *mfReconF8v2Scan(void) {
     }
 
     // =====================================================================
-    // sk2ladder (v2.58.184): 多档梯子档位门 — "SKU 身份定档"型 app 的通用判定指纹。
+    // sk2ladder (v2.58.184 / v2.58.187 健壮化): 多档梯子档位门 — "SKU 身份定档"型 app 的通用判定指纹。
     //   动机(bazaart dbg_171 定谳): 侦查四层(语义打分/sk2plan 内联指纹/@objc 观测/收据检测)
     //   全部假设"存在一个 is-Pro 布尔门, patch 成 true 就解锁"。但 bazaart 是三档梯子
-    //   Free→Premium→Super, 档位靠"当前激活产品 SKU == 某组高档 SKU"的字符串比对决定,
-    //   不是布尔门。四层各自漏因:
-    //     ① 语义打分: 比的是产品 SKU 字面量(Bazaart_Super_Yearly_v4)非权益语义词 → score 低被淹
-    //     ② sk2plan: 抓内联 MOVZ/MOVK 拼 ASCII 计划名; 这里 SKU 是 immortal String 常量结构
-    //        (adrp+add 取结构体 → String.==), 指令形态不同 → 不命中
-    //     ③ @objc 观测: 这类判别是纯 Swift 自由函数, 无 @objc → 观测层看不见
-    //     ④ 收据检测: 收据注入满足"激活产品"→低档亮; 高档是架在低档之上的第二判别, 收据到不了
-    //   通用指纹(零 app 硬编码): 一个小函数(≤0x300)引用 ≥2 个"同一高档 tier"的 SKU 常量串,
-    //   返回 bool(cset/and w,#1/mov #0+#1), 被多点调用(fan-in≥3) → 这是"当前档位是不是 X 档"
-    //   的档位门。恒真它(mov w0,#1;ret) = 所有该档 UI 门都认为已购该档 → 解锁, 且不进会崩的
-    //   高档内购 VC(bazaart 超级 VC 强解包真实交易字段的崩溃随之消失)。
-    //   tier 词表分档: base(SKU 最多档=已由低档解锁基线)不做候选, 只锚定 upsell 高档。
+    //   Free→Premium→Super, 档位靠"当前激活产品 SKU == 某组高档 SKU"的字符串比对决定, 不是布尔门。
+    //   通用指纹(零 app 硬编码, 零命名假设): 一个小函数(≤0x300)引用 ≥2 个"同一 tier"的 SKU
+    //   常量串, 返回 bool(cset/and w,#1/mov #0+#1), 被多点调用(fan-in≥3) → 档位门。
+    //   ★恒真它(mov w0,#1;ret) = 所有该档 UI 门都认为已购该档 → 解锁, 且不进会崩的高档内购 VC。
+    //
+    //   v2.58.187 健壮化(用户定案: "任何情况都能打, 不是一换 app 就束手无策"):
+    //     [去过拟合①] 删"SKU 最多档=base, 不做候选"启发式。恒真任何档位门都只让 app 认为"已购该档"
+    //         = 解锁, 无副作用(低档门恒真=低档已解锁无害; 高档门恒真=解锁高档) → 不需猜哪档是 base,
+    //         强制 ALL 合格单档 bool 门。多档映射器(SKU→enum, 非 bool)靠 size≤0x300 + bool + 档数≤3 排除。
+    //     [去过拟合②] SKU 形态判据从"含周期词/‑vN/价格 dd_dd"(bazaart 命名过拟合)改为
+    //         "标识符 + 含分隔符(_ . -)"。产品 ID 是结构化标识符(com.app.tier / App_Tier_Period),
+    //         普通带 tier 词的英文串(如 "premium content")无分隔符被排除。命名无关, 换 app 不失效。
     // =====================================================================
     if (cstrVM && cstrSize) {
         // —— tier 关键词(小写 segment 精确匹配, 避免 "prof"/"process" 误伤) ——
         static const char *kTierW[] = {"premium","super","pro","plus","vip","ultimate",
             "unlimited","max","gold","platinum","elite","deluxe","lifetime","mega","prime","advanced","supporter"};
         const int kTierN = (int)(sizeof(kTierW)/sizeof(kTierW[0]));
-        static const char *kPeriodW[] = {"month","year","week","annual","quarter","lifetime",
-            "forever","perpetual","daily","biweekly","monthly","yearly","weekly"};
-        const int kPeriodN = (int)(sizeof(kPeriodW)/sizeof(kPeriodW[0]));
         // small-string segment 分词 tier 命中(下划线/点/连字符/驼峰边界切分近似: 逐词扫)
         // 实现: 把串小写化, 对每个 tier 词做"被分隔符或串首尾包围"的 segment 匹配。
         BOOL (^segHas)(const char *, const char *) = ^BOOL(const char *low, const char *w) {
@@ -1544,51 +1548,45 @@ static NSDictionary *mfReconF8v2Scan(void) {
             return NO;
         };
         // —— ① 扫 __cstring 收集"SKU 形态 + 带 tier 词"的常量串 (va → tierMask) ——
-        // SKU 形态: [A-Za-z0-9_.-], 6..70 长, 含周期词 或 _v<digit> 或 价格 dd_dd。
-        #define LAD_MAXSKU 512
-        static uint64_t skuVA[LAD_MAXSKU]; static uint32_t skuTier[LAD_MAXSKU]; static int skuLen[LAD_MAXSKU];
+        // v2.58.187 健壮化: SKU 形态 = 标识符([A-Za-z0-9_.-], 4..80 长) + **含分隔符(_ . -)**。
+        //   产品 ID 是结构化标识符(com.app.tier / App_Tier_Period), 分隔符是其结构本质;
+        //   普通带 tier 词的散文串("premium content"含空格已被字符集排除;"unlimited"无分隔符被排除)
+        //   → 命名无关, 不再假设"周期词/_vN/价格"这类 bazaart 专属命名习惯。
+        #define LAD_MAXSKU 1024
+        static uint64_t skuVA[LAD_MAXSKU]; static uint32_t skuTier[LAD_MAXSKU];
         int nLadSku = 0;
-        uint32_t tierTotal[32] = {0};   // 每 tier 命中 SKU 数(定 base 档)
         const uint8_t *cstrMem = (const uint8_t *)((uintptr_t)cstrVM + (uintptr_t)slide);
         for (uint64_t i = 0; i < cstrSize && nLadSku < LAD_MAXSKU; ) {
             const uint8_t *s = cstrMem + i;
-            uint64_t maxn = cstrSize - i; size_t len = strnlen((const char *)s, maxn < 80 ? maxn : 80);
-            if (len < 6 || len > 70) { i += (len ? len + 1 : 1); continue; }
-            char low[72]; int ok = 1;
+            uint64_t maxn = cstrSize - i; size_t len = strnlen((const char *)s, maxn < 96 ? maxn : 96);
+            if (len < 4 || len > 80) { i += (len ? len + 1 : 1); continue; }
+            char low[82]; int ok = 1; BOOL hasSep = NO;
             for (size_t k = 0; k < len; k++) {
                 char c = s[k];
                 if (!((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='_'||c=='.'||c=='-')) { ok = 0; break; }
+                if (c=='_'||c=='.'||c=='-') hasSep = YES;
                 low[k] = (c>='A'&&c<='Z') ? (c+32) : c;
             }
             low[len] = 0;
-            if (!ok) { i += len + 1; continue; }
-            // SKU 形态门
-            BOOL hasPeriod = NO;
-            for (int t = 0; t < kPeriodN; t++) if (strstr(low, kPeriodW[t])) { hasPeriod = YES; break; }
-            BOOL hasVer = NO; { const char *v = low; while ((v = strstr(v, "_v"))) { if (v[2]>='0'&&v[2]<='9') { hasVer = YES; break; } v += 2; } }
-            BOOL hasPrice = NO; for (size_t k = 0; k + 5 <= len; k++) if (low[k]>='0'&&low[k]<='9'&&low[k+1]>='0'&&low[k+1]<='9'&&low[k+2]=='_'&&low[k+3]>='0'&&low[k+3]<='9'&&low[k+4]>='0'&&low[k+4]<='9') { hasPrice = YES; break; }
-            if (!hasPeriod && !hasVer && !hasPrice) { i += len + 1; continue; }
+            if (!ok || !hasSep) { i += len + 1; continue; }   // 标识符 + 含分隔符 = 产品 ID 形态
             // tier 命中(segment 精确)
             uint32_t mask = 0;
             for (int t = 0; t < kTierN && t < 32; t++) if (segHas(low, kTierW[t])) mask |= (1u << t);
             if (mask) {
-                skuVA[nLadSku] = cstrVM + i; skuTier[nLadSku] = mask; skuLen[nLadSku] = (int)len;
-                for (int t = 0; t < kTierN && t < 32; t++) if (mask & (1u<<t)) tierTotal[t]++;
+                skuVA[nLadSku] = cstrVM + i; skuTier[nLadSku] = mask;
                 nLadSku++;
             }
             i += len + 1;
         }
         if (nLadSku >= 2) {
-            // SKU 地址区间(快速剪枝: val 落区间外直接跳过 512 内层扫描)
+            // SKU 地址区间(快速剪枝: val 落区间外直接跳过内层扫描)
             uint64_t skuMin = ~0ULL, skuMax = 0;
             for (int k = 0; k < nLadSku; k++) { if (skuVA[k] < skuMin) skuMin = skuVA[k]; if (skuVA[k] > skuMax) skuMax = skuVA[k]; }
-            // base 档 = SKU 数最多的 tier(它代表已解锁基线, 不做恒真候选; 只锚定 upsell 高档)
-            int baseT = -1; uint32_t baseN = 0;
-            for (int t = 0; t < kTierN && t < 32; t++) if (tierTotal[t] > baseN) { baseN = tierTotal[t]; baseT = t; }
-            // —— ② 扫 __text: adrp+add(±0/-0x20 Swift 串元) 落到 SKU 串 → 记 (fn → tier → 命中 SKU 计数) ——
-            // 复用近邻寄存器追踪(与 sk2plan planLitNear 同思路, 全局线性一遍)。
-            // fn 聚合: 用小哈希表(开链) fn→{tierCnt[32], baseCnt}
-            typedef struct LadFn { uint64_t fn; uint16_t cnt[32]; uint16_t baseCnt; struct LadFn *next; } LadFn;
+            // v2.58.187: 删除"SKU 最多档=base 不做候选"启发式。理由: 恒真任何档位门都只让 app 认为
+            //   "已购该档"= 解锁, 无害(低档门恒真=低档本就该有; 高档门恒真=解锁高档) → 无需猜 base 档,
+            //   强制 ALL 合格单档 bool 门。多档映射器(SKU→enum, 非 bool)靠 size/bool/档数≤3 排除。
+            // —— ② 扫 __text: adrp+add(±0/-0x20 Swift 串元) 落到 SKU 串 → 记 (fn → tier[32] 命中计数) ——
+            typedef struct LadFn { uint64_t fn; uint16_t cnt[32]; struct LadFn *next; } LadFn;
             #define LAD_HN 2048
             static LadFn *ladBk[LAD_HN];
             for (int b = 0; b < LAD_HN; b++) ladBk[b] = NULL;   // 复位(static 跨调用残留)
@@ -1598,7 +1596,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 uint32_t h = (uint32_t)((fn >> 4) * 2654435761u) & (LAD_HN - 1);
                 for (LadFn *e = ladBk[h]; e; e = e->next) if (e->fn == fn) return e;
                 if (poolN >= poolCap) return NULL;
-                LadFn *e = &pool[poolN++]; e->fn = fn; e->baseCnt = 0;
+                LadFn *e = &pool[poolN++]; e->fn = fn;
                 for (int t = 0; t < 32; t++) e->cnt[t] = 0;
                 e->next = ladBk[h]; ladBk[h] = e; return e;
             };
@@ -1625,7 +1623,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     uint32_t rn = (w >> 5) & 0x1F, sh = (w >> 22) & 1, a12 = (w >> 10) & 0xFFF;
                     if (regPC[rn] && p - regPC[rn] <= 24) {
                         uint64_t val = regPage[rn] + ((uint64_t)a12 << (sh ? 12 : 0));
-                        // 剪枝: val 或 val+0x20 必落 SKU 串地址区间, 否则跳过 512 内层扫描
+                        // 剪枝: val 或 val+0x20 必落 SKU 串地址区间, 否则跳过内层扫描
                         if ((val < skuMin || val > skuMax) && (val + 0x20 < skuMin || val + 0x20 > skuMax)) goto lad_next;
                         // 命中 SKU 串? (val 直指串 或 val+0x20 指串 — Swift 串元结构在串前 0x20)
                         for (int k = 0; k < nLadSku; k++) {
@@ -1635,10 +1633,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                                     LadFn *e = fnSlot(fn);
                                     if (e) {
                                         uint32_t m = skuTier[k];
-                                        for (int t = 0; t < 32; t++) if (m & (1u<<t)) {
-                                            if (t == baseT) { if (e->baseCnt < 0xFFFF) e->baseCnt++; }
-                                            else if (e->cnt[t] < 0xFFFF) e->cnt[t]++;
-                                        }
+                                        for (int t = 0; t < 32; t++) if (m & (1u<<t) && e->cnt[t] < 0xFFFF) e->cnt[t]++;
                                     }
                                 }
                                 break;
@@ -1648,7 +1643,9 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 }
                 lad_next:;   // v2.58.184: 剪枝跳转落点(跳过 SKU 内层扫描, 继续下条指令)
             }
-            // —— ③ 判档位门: upsell tier 命中 ≥2, 函数小(≤0x300), baseRef≤4, bool 返回, fan-in≥3 ——
+            // —— ③ 判档位门(v2.58.187 健壮版): 小函数(≤0x300) + bool 返回 + fan-in≥3
+            //     + 引用 tier 档数≤3(多档映射器往往枚举全部 SKU→非 bool, 已被 bool 门排除, 档数再兜底)
+            //     + 存在某单 tier 命中≥2(同档多 SKU 比对=档位判别本质)。恒真 ALL 合格门。
             // bool 返回自检: 函数体含 CSET/CSINC(wd,wzr,wzr) 或 (mov w,#1 且 mov w,#0) 或 and w,#1。
             BOOL (^isBoolFn)(uint64_t, uint64_t) = ^BOOL(uint64_t fn, uint64_t end) {
                 BOOL has1 = NO, has0 = NO;
@@ -1685,11 +1682,15 @@ static NSDictionary *mfReconF8v2Scan(void) {
             int nLadGate = 0;
             for (int b = 0; b < poolN; b++) {
                 LadFn *e = &pool[b];
-                // 选该函数命中最强的 upsell tier
-                int bestT = -1, bestCnt = 0;
-                for (int t = 0; t < kTierN && t < 32; t++) if (t != baseT && e->cnt[t] > bestCnt) { bestCnt = e->cnt[t]; bestT = t; }
-                if (bestT < 0 || bestCnt < 2) continue;
-                if (e->baseCnt > 4) continue;   // 多档映射大函数(把低档也全枚举了)排除
+                // v2.58.187: 无 base 档概念 — 选命中最强的单 tier(≥2 同档 SKU = 档位判别本质),
+                //   并统计该函数引用了几个不同 tier(多档映射器往往枚举全部档 → 档数多)。
+                int bestT = -1, bestCnt = 0, nTiers = 0;
+                for (int t = 0; t < kTierN && t < 32; t++) {
+                    if (e->cnt[t] > 0) nTiers++;
+                    if (e->cnt[t] > bestCnt) { bestCnt = e->cnt[t]; bestT = t; }
+                }
+                if (bestT < 0 || bestCnt < 2) continue;   // 同一 tier 至少 2 个 SKU 比对
+                if (nTiers > 3) continue;                 // 引用 >3 档 = SKU→enum 映射器(兜底, bool 门已排除大部分)
                 uint64_t fn = e->fn;
                 uint64_t end = fn; { // 函数尾: 下一个序言或 +0x300 上限
                     uint64_t lim = fn + 0x300; if (lim > textVM + textSize) lim = textVM + textSize;
@@ -1702,7 +1703,7 @@ static NSDictionary *mfReconF8v2Scan(void) {
                     if (!end) end = lim;
                 }
                 if (end - fn > 0x300) continue;              // 只收小函数(档位门是纯比较)
-                if (!isBoolFn(fn, end)) continue;
+                if (!isBoolFn(fn, end)) continue;            // bool 返回(排除 SKU→enum 映射器)
                 uint16_t fi = fnSlot ? fanIn(fn) : 0;
                 if (fi < 3) continue;                         // 多点收口(UI 门共用判别器)
                 // ★命中: 恒真档位门 (mov w0,#1; ret)
@@ -1721,8 +1722,8 @@ static NSDictionary *mfReconF8v2Scan(void) {
                 mfLog(@"[f8v2] ★sk2ladder 档位门 @%#llx tier=%s SKU命中=%d fan-in=%u (恒真→该档解锁)",
                       (unsigned long long)(fn - textVM), kTierW[bestT], bestCnt, fi);
             }
-            mfLog(@"[f8v2] sk2ladder: tier SKU 串=%d, base 档=%s, ★入库档位门=%d 个(恒真解锁高档, app-agnostic)",
-                  nLadSku, baseT >= 0 ? kTierW[baseT] : "?", nLadGate);
+            mfLog(@"[f8v2] sk2ladder: tier SKU 串=%d, ★入库档位门=%d 个(恒真解锁该档, app-agnostic 零命名假设)",
+                  nLadSku, nLadGate);
         } else {
             mfLog(@"[f8v2] sk2ladder: tier SKU 串=%d(<2) — 非多档梯子型, 跳过", nLadSku);
         }
