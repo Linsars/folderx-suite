@@ -2816,6 +2816,65 @@ static NSDictionary *mfReconF8v2Scan(void) {
     }
 }
 
+// v2.58.188 (dbg_178 mailnow 定谳): 运行时日志快照分析 — 给侦查扫描"运行时分析能力"。
+//   病根(用户定案): 实时日志的运行时观测(app 自己 NSLog/print 的输出)从没被侦查/判型总闸
+//   利用 → 判型全靠静态瞎猜(mailnow 静态见 SwiftyStoreKit+appStoreReceiptURL → 误判收据型;
+//   而 app 运行时自己打印 "FlexCall: ...premium=0;no_ad=0" = 权益真相在服务端 WebView 桥)。
+//   静态 serverSide 判据还因大小写对不上漏判(kSrvPats 小写 loadsuccess vs 二进制驼峰 loadSuccess)。
+//   解法(零跟跑, 不占资源): 扫描按下时取 hostlog ring buffer 快照(= 按下之前 app 累积输出),
+//   离线分析一次其中的运行时权益信号。app 从启动到按扫描之间自 report 的一切都在缓冲里。
+//   信号 app-agnostic: 通用权益键值 + WebView JS 桥指示词(通用 WebKit 术语), 零 app 硬编码。
+typedef struct {
+    long lines;          // 快照行数
+    BOOL webBridge;      // ★同行共现: WebView JS 桥在下发权益标志(桥指示词 + 权益键值 同一行)
+    int  entReadNo;      // 运行时读到"未解锁"态次数(premium=0/false 等 — app 自报当前权益)
+    int  entReadYes;     // 运行时读到"已解锁"态次数
+    char sample[120];    // webBridge 命中样本行(日志展示 + 详情页证据)
+} MFRTSig;
+
+static MFRTSig mfReconScanHostLog(void) {
+    MFRTSig s; memset(&s, 0, sizeof(s));
+    extern NSArray<NSString *> *mfHostLogSnapshot(void);
+    NSArray<NSString *> *snap = mfHostLogSnapshot();
+    if (![snap isKindOfClass:[NSArray class]] || !snap.count) return s;
+    s.lines = (long)snap.count;
+    // 权益键(通用词, 小写子串) — app 自报权益状态时常用的键名
+    static const char *kEntKeys[] = { "premium", "no_ad", "noad", "vip", "is_pro", "ispro",
+        "pro_status", "ispremium", "haspremium", "subscribed", "is_subscriber", "issubscriber",
+        "unlocked", "purchased", "membership", "isvip", "hasvip", "premium_status" };
+    // JS 桥指示词(通用 WebKit 桥术语 + 常见桥动作) — 出现即该行是原生↔网页通信
+    static const char *kBridge[] = { "usercontentcontroller", "wkscriptmessage",
+        "didreceivescriptmessage", "scriptmessagehandler", "jsbridge", "postmessage",
+        "flexcall", "loadsuccess", "getappitemprice", "message=", "jscall" };
+    const int nK = (int)(sizeof(kEntKeys)/sizeof(kEntKeys[0]));
+    const int nB = (int)(sizeof(kBridge)/sizeof(kBridge[0]));
+    for (NSString *rawLine in snap) {
+        if (![rawLine isKindOfClass:[NSString class]]) continue;
+        const char *L = [[rawLine lowercaseString] UTF8String];
+        if (!L) continue;
+        BOOL lineBridge = NO;
+        for (int b = 0; b < nB; b++) if (strstr(L, kBridge[b])) { lineBridge = YES; break; }
+        BOOL lineEntState = NO;
+        for (int k = 0; k < nK; k++) {
+            const char *pos = strstr(L, kEntKeys[k]);
+            if (!pos) continue;
+            const char *w = pos + strlen(kEntKeys[k]);
+            int adv = 0; while (adv < 6 && (*w=='='||*w==':'||*w=='"'||*w==' '||*w=='\'')) { w++; adv++; }
+            int st = -1;
+            if (*w=='0' || !strncmp(w,"false",5) || (*w=='n'&&*(w+1)=='o')) st = 0;
+            else if (*w=='1' || !strncmp(w,"true",4) || !strncmp(w,"yes",3)) st = 1;
+            if (st == 0) { s.entReadNo++; lineEntState = YES; }
+            else if (st == 1) { s.entReadYes++; lineEntState = YES; }
+        }
+        // ★同行共现 = 该行既是 JS 桥又带权益键值 → 服务端 WebView 桥在下发权益(精确, 低误报)
+        if (lineBridge && lineEntState) {
+            s.webBridge = YES;
+            if (!s.sample[0]) { const char *r = [rawLine UTF8String]; if (r) snprintf(s.sample, sizeof(s.sample), "%.115s", r); }
+        }
+    }
+    return s;
+}
+
 NSDictionary *mfReconFingerprint(void) {
     __block NSArray *stateKeys = @[];   // v2.58.35: 提升函数级 — lines 块内采集, verdict 判型/return 都要用
     // v2.58.120: 分段进度日志 — dbg_113 定谳: scripting 上侦查卡空白(recon 未跑完),
@@ -3182,15 +3241,25 @@ NSDictionary *mfReconFingerprint(void) {
     extern NSUInteger mfObsFlowClassCount(void);
     BOOL gObsReceipt = mfObsReceiptVerifierSeen();
     NSUInteger gObsFlow = mfObsFlowClassCount();
+    // v2.58.188 (dbg_178): 运行时日志快照 — 扫描按下时取 hostlog 缓冲(=按下前 app 自报输出),
+    //   离线分析。gRtWebBridge = 运行时实锤"WebView JS 桥在下发权益标志"(mailnow: app 自己
+    //   打印 FlexCall...premium=0;no_ad=0)。这是静态挖不到的服务端权益铁证 — 喂进判型总闸。
+    MFRTSig gRt = mfReconScanHostLog();
+    BOOL gRtWebBridge = gRt.webBridge;
+    if (gRt.lines)
+        mfLog(@"[recon-rt] 运行时日志快照 %ld 行: WebView桥权益=%d(样本「%s」) 读未解锁%d次 读已解锁%d次",
+              gRt.lines, gRtWebBridge, gRt.sample[0] ? gRt.sample : "-", gRt.entReadNo, gRt.entReadYes);
     // v2.58.179 (dbg_166 定谳, 撤销 178): 收据强锚**不再**进入库闸门。
     //   178 把 gRcptStrong 塞进 gBlockCodePts → verifyReceipt 型的 sk2 代码门被全压 → 废掉
     //   多链的第二条腿。bazaart 是多链: verifyReceipt(高级档 mock) + SK2 签名链(超级档 sk2 门),
     //   两条并存。收据型只对应"收据 mock 路线", 绝不代表"没有可 patch 的本地 sk2 链" —
     //   sk2 门照常入库(超级档就靠它)。闸门只留真正"本地 patch 结构性无效"的服务端/票据/观测型。
-    BOOL gBlockCodePts = srvTicket || srvSelfIap || gObsReceipt || (gObsFlow > 0);
+    // v2.58.188: gRtWebBridge(运行时 WebView 桥权益)加入闸门 — 服务端 WebView 型本地 patch 无意义,
+    //   一个点不入库(mailnow: 曾被误塞 SwiftyStoreKit 内部点 + sk2ladder/keychain 全错, 根因就是它没进闸)。
+    BOOL gBlockCodePts = srvTicket || srvSelfIap || gObsReceipt || (gObsFlow > 0) || gRtWebBridge;
     if (gBlockCodePts)
-        mfLog(@"[f8v2] ★判型总闸: 本地代码点闸门关闭(srvTicket=%d srvSelfIap=%d obs收据=%d obs购买流=%lu) — 框架/sk2/cands 点位不入库",
-              srvTicket, srvSelfIap, gObsReceipt, (unsigned long)gObsFlow);
+        mfLog(@"[f8v2] ★判型总闸: 本地代码点闸门关闭(srvTicket=%d srvSelfIap=%d obs收据=%d obs购买流=%lu rt桥=%d) — 框架/sk2/cands 点位不入库",
+              srvTicket, srvSelfIap, gObsReceipt, (unsigned long)gObsFlow, gRtWebBridge);
     NSMutableArray *entFuncs = [NSMutableArray array];
     // v2.58.74: 轮次开始 — 标记库中点位"本轮未见", merge 时置 seen, 结束剔除陈旧
     extern void mfAppPatchEntDumpsBeginRound(void);
@@ -3490,6 +3559,9 @@ NSDictionary *mfReconFingerprint(void) {
             if (mfRecFind(p, n, pat.UTF8String)) srvHits++;
         // SK 本地形态 + 无云验证 + JS 桥权益字段 → 服务器权益型
         if (srvHits >= 2 && !cloud && !mach && skLocal) serverSide = YES;
+        // v2.58.188 (dbg_178): 运行时实锤 WebView 桥下发权益 → 直接判服务端权益型(不依赖静态串大小写/命中数)。
+        //   静态 kSrvPats 曾因大小写(loadsuccess vs loadSuccess)+串太少漏判 mailnow; 运行时快照是铁证。
+        if (gRtWebBridge && !cloud && !mach) serverSide = YES;
     }
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
@@ -3585,6 +3657,8 @@ NSDictionary *mfReconFingerprint(void) {
     } else if (serverSide) {
         mfType = @"服务器权益型"; route = @"⛔ 权益在服务端会话, 本地解锁无效 — 无可用本地路线";
         [ev addObject:skLine]; [ev addObject:@"WebView 桥权益标志在场(FlexCall/loadSuccess 族)"];
+        if (gRtWebBridge && gRt.sample[0])
+            [ev addObject:[NSString stringWithFormat:@"运行时实锤(实时日志): WebView JS 桥下发权益「%s」", gRt.sample]];
     } else if (srvSelfIap) {
         mfType = @"自研服务端权益型"; route = @"⛔ 权益由自家后端下发, 本地解锁无效 — 无可用本地路线";
         [ev addObject:[NSString stringWithFormat:@"自研 IAP 端点 %d 条 + 无本地 SK 权益链 → 权益由后端下发", gEpHits]];
