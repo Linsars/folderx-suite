@@ -3253,12 +3253,17 @@ NSDictionary *mfReconFingerprint(void) {
     //   多链的第二条腿。bazaart 是多链: verifyReceipt(高级档 mock) + SK2 签名链(超级档 sk2 门),
     //   两条并存。收据型只对应"收据 mock 路线", 绝不代表"没有可 patch 的本地 sk2 链" —
     //   sk2 门照常入库(超级档就靠它)。闸门只留真正"本地 patch 结构性无效"的服务端/票据/观测型。
-    // v2.58.188: gRtWebBridge(运行时 WebView 桥权益)加入闸门 — 服务端 WebView 型本地 patch 无意义,
-    //   一个点不入库(mailnow: 曾被误塞 SwiftyStoreKit 内部点 + sk2ladder/keychain 全错, 根因就是它没进闸)。
-    BOOL gBlockCodePts = srvTicket || srvSelfIap || gObsReceipt || (gObsFlow > 0) || gRtWebBridge;
+    // v2.58.191 (dbg_179 用户纠偏"万一 pyide 那种弱服务器"): gRtWebBridge **不进**硬闸门。
+    //   理由: app 可能既有 WebView 桥、又有真本地门(多链, 如 bazaart verifyReceipt+sk2 / pyide tbz 本地门)。
+    //   桥信号硬 block 本地点 = 又一次一刀切, 会杀掉本地那条腿(179 收据型≠无本地链教训)。
+    //   桥信号只用于: 判 serverSide 型 + 提供 L3 桥改写路线; 本地代码点照常入库作候选第二腿, 用户可试。
+    //   真正的硬闸门只留结构性绝对无本地意义的(srvTicket JWT / srvSelfIap 自研后端 / obs 收据观测)。
+    BOOL gBlockCodePts = srvTicket || srvSelfIap || gObsReceipt || (gObsFlow > 0);
     if (gBlockCodePts)
-        mfLog(@"[f8v2] ★判型总闸: 本地代码点闸门关闭(srvTicket=%d srvSelfIap=%d obs收据=%d obs购买流=%lu rt桥=%d) — 框架/sk2/cands 点位不入库",
-              srvTicket, srvSelfIap, gObsReceipt, (unsigned long)gObsFlow, gRtWebBridge);
+        mfLog(@"[f8v2] ★判型总闸: 本地代码点闸门关闭(srvTicket=%d srvSelfIap=%d obs收据=%d obs购买流=%lu) — 框架/sk2/cands 点位不入库",
+              srvTicket, srvSelfIap, gObsReceipt, (unsigned long)gObsFlow);
+    if (gRtWebBridge)
+        mfLog(@"[f8v2] 运行时 WebView 桥权益在场(rt桥=1): 判服务端桥型+L3 改写路线, 但本地代码点仍入库作候选(不硬闸, 防误杀多链本地腿)");
     NSMutableArray *entFuncs = [NSMutableArray array];
     // v2.58.74: 轮次开始 — 标记库中点位"本轮未见", merge 时置 seen, 结束剔除陈旧
     extern void mfAppPatchEntDumpsBeginRound(void);
@@ -3575,7 +3580,7 @@ NSDictionary *mfReconFingerprint(void) {
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
     else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, 同族架构)";
     // v2.58.65: "SK2 事务流验证型"判型已废(用户定案: 实机三轮零作用=死代码)
-    else if (serverSide)    verdict = @"服务器权益型(SK+WebView 桥权益标志) — 权益在服务端会话, 本地解锁无意义, 跳过";
+    else if (serverSide)    verdict = @"服务端 WebView 桥型(部分本地可解: L3 桥改写关广告/解 native UI 门; 网页会员内容服务端渲染无解)";
     // v2.58.75: 服务端权威判定型 — 优先于代码点播报(bplayer 案: 35 个形态点是通用
     //   判空噪声, 全 ⚡ 不亮已实证; 判定链在自家后端, 本地 patch 无意义)
     else if (srvSelfIap)    verdict = @"自研服务端权益型(无本地 SK 权益链, /iap/* 端点下发) — 本地解锁无意义, 跳过";
@@ -3645,10 +3650,24 @@ NSDictionary *mfReconFingerprint(void) {
         mfType = @"本地许可服务器型"; route = @"实验模拟页: 开 EXCPROBE 应答器";
         [ev addObject:@"EXCPORTS: 本地许可服务器(mach 协议)注册在场"];
     } else if (serverSide) {
-        mfType = @"服务器权益型"; route = @"⛔ 权益在服务端会话, 本地解锁无效 — 无可用本地路线";
+        // v2.58.191 (dbg_179 用户纠偏"一刀切太过"+"万一 pyide 那种弱服务器"): 服务端 WebView 桥型 ≠ 完全无解。
+        //   服务端网页【内容】(会员功能按账户 session 渲染)本地无解, 但 native 侧读的桥消息
+        //   【本地可改写】→ L3 桥权益改写关广告 + 解 native 会员 UI 门。给出这条部分本地路线。
+        //   多链兜底: 若同时扫出本地代码门(pyide 弱服务器型 = 有本地 tbz 门 + 服务端遥测), 一并给出
+        //   本地 patch 路线 — 不因"检测到服务端"就掩盖本地那条真腿(179 收据型≠无本地链同款教训)。
+        mfType = @"服务端 WebView 桥型(部分本地可解)";
+        NSMutableString *rt = [NSMutableString stringWithString:@"实验模拟页 L3 WebView 桥权益改写(关广告/解 native UI 门)"];
+        if (nRealGate > 0) [rt appendFormat:@" · 另有本地 SK2 真门 %lu 个可 ⚡(疑弱服务端+本地门多链)", (unsigned long)nRealGate];
+        else if (gCodePtsInStore > 0) [rt appendFormat:@" · 另有本地代码门 %lu 个候选可 ⚡ 逐试", (unsigned long)gCodePtsInStore];
+        [rt appendString:@" · 网页会员内容=服务端渲染本地无解"];
+        route = rt;
         [ev addObject:skLine]; [ev addObject:@"WebView 桥权益标志在场(运行时观测: JS 桥下发权益键值)"];
         if (gRtWebBridge && gRt.sample[0])
             [ev addObject:[NSString stringWithFormat:@"运行时实锤(实时日志): WebView JS 桥下发权益「%s」", gRt.sample]];
+        if (gRt.entReadNo > 0)
+            [ev addObject:[NSString stringWithFormat:@"native 读桥权益未解锁 %d 次 → L3 可拦改(网页内容仍服务端控)", gRt.entReadNo]];
+        if (nRealGate > 0 || gCodePtsInStore > 0)
+            [ev addObject:[NSString stringWithFormat:@"⚠ 同时扫出本地代码门(真门 %lu · 入库 %lu) — 疑多链, 本地门也可试", (unsigned long)nRealGate, (unsigned long)gCodePtsInStore]];
     } else if (srvSelfIap) {
         mfType = @"自研服务端权益型"; route = @"⛔ 权益由自家后端下发, 本地解锁无效 — 无可用本地路线";
         [ev addObject:[NSString stringWithFormat:@"自研 IAP 端点 %d 条 + 无本地 SK 权益链 → 权益由后端下发", gEpHits]];

@@ -1549,6 +1549,9 @@ extern void mfL0SetOn(BOOL on);
 extern BOOL mfExcIsOn(void);        // v2.54.0: EXCPROBE 应答器开关状态
 extern long mfExcHits(void);        // 命中计数
 extern void mfExcSetOn(BOOL on);    // 写状态
+extern BOOL mfWebBridgeForgeIsOn(void);   // v2.58.191: L3 WebView JS 桥权益改写
+extern long mfWebBridgeForgeHits(void);
+extern void mfWebBridgeForgeSwitchChanged(UISwitch *sw);
 
 
 static UIView *mfSubSwitchRow(UIView *page, CGFloat y, NSString *title,
@@ -1612,6 +1615,11 @@ void mfShowLabPage(void) {
     mfSubSwitchRow(sv, 204, @"L1 收据伪造（收据验证型）", mfReceiptForgeIsOn(),
         @selector(mfReceiptForgeSwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 收据验证型 — appStoreReceiptURL/transactionReceipt · 命中 %ld", mfReceiptForgeHits()]);
+    // v2.58.191: L3 WebView JS 桥权益改写 — 服务端 WebView 壳型(mailnow dbg_179)。
+    //   服务端会员本地无解, 但 native 侧读的桥消息(premium/no_ad=0)可改写 → 关广告+解 native UI 门。
+    mfSubSwitchRow(sv, 264, @"L3 WebView 桥权益改写（服务端壳·关广告/解UI门）", mfWebBridgeForgeIsOn(),
+        @selector(mfWebBridgeForgeSwitchChanged:),
+        [NSString stringWithFormat:@"改 WKScriptMessage 桥消息权益键假值→真 · 命中 %ld · 重启 app 生效", mfWebBridgeForgeHits()]);
 
     // v2.58.157: 「运行时状态观测」独立开关已删除 —— 状态注入并入 patch 引擎判定点体系。
     //   侦查(sk2recipe)扫出配方 → 注册为 hookinj@ 判定点 → 用户在「🎯 判定点」列表 ⚡ 执行。
@@ -1624,7 +1632,7 @@ void mfShowLabPage(void) {
     // v2.56: patch 引擎(规则驱动: method swizzle / text vm_protect / keychain 授权豁免)
     //   ——学习自样本判定链的落地容器。规则格式: mfAppPatchRules JSON
     //   [{"bid":"com.scripting.ios","ver":"","patches":[{"kind":"keychain"}]}]
-    CGFloat apY = 264;   // v2.58.157: 状态观测独立开关删除, 收回 60px(判定点体系接管)
+    CGFloat apY = 324;   // v2.58.191: L3 开关新增 60px(204→264→AppPatch 起点 324)
     extern void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio);
     mfAppPatchSectionInLabPage(sv, &apY);
 
@@ -1737,6 +1745,7 @@ void mfShowLabPage(void) {
 - (void)mfObjCTxProbeTapped { mfObjCTxProbeTapped(); }
 - (void)mfSubInjectSwitchChanged:(UISwitch *)sw { mfSubInjectSwitchChanged(sw); }
 - (void)mfReceiptForgeSwitchChanged:(UISwitch *)sw { mfReceiptForgeSwitchChanged(sw); }
+- (void)mfWebBridgeForgeSwitchChanged:(UISwitch *)sw { mfWebBridgeForgeSwitchChanged(sw); }
 - (void)mfL0SwitchChanged:(UISwitch *)sw { mfL0SetOn(sw.on); }
 - (void)mfStateObsSwitchChanged:(UISwitch *)sw {
     // v2.58.157: 状态观测开关已废除, 保留空方法防旧引用崩溃(实际不再挂 UI)
@@ -2671,6 +2680,7 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
         mfObjCHookApplySilent();
         mfSubInjectAutoStart();
         mfReceiptForgeAutoStart();
+        { extern void mfWebBridgeForgeAutoStart(void); mfWebBridgeForgeAutoStart(); }   // v2.58.191: L3 WebView 桥改写冷启动恢复
 
         // 手势注册
         Class vcCls = NSClassFromString(@"UIViewController");
