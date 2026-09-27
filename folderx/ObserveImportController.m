@@ -50,7 +50,7 @@
                                                                   edit:nil];
             [arr addObject:empty];
         }
-        for (NSString *f in [files sortedArrayUsingSelector:@selector(compare)]) {
+        for (NSString *f in [files sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
             if (![f.pathExtension isEqualToString:@"dylib"]) continue;
             PSSpecifier *sp = [PSSpecifier preferenceSpecifierNamed:f
                                                              target:self
