@@ -2842,19 +2842,19 @@ static MFRTSig mfReconScanHostLog(void) {
     static const char *kEntKeys[] = { "premium", "no_ad", "noad", "vip", "is_pro", "ispro",
         "pro_status", "ispremium", "haspremium", "subscribed", "is_subscriber", "issubscriber",
         "unlocked", "purchased", "membership", "isvip", "hasvip", "premium_status" };
-    // JS 桥指示词(通用 WebKit 桥术语 + 常见桥动作) — 出现即该行是原生↔网页通信
+    // JS 桥指示词 —— 纯通用 WebKit 术语(任何 WKWebView↔JS 通信都会出现), 零 app 特定桥名。
+    //   (v2.58.189: 去掉 flexcall/loadsuccess/getappitemprice 等 mailnow 特有桥动作名 = app 硬编码)
     static const char *kBridge[] = { "usercontentcontroller", "wkscriptmessage",
-        "didreceivescriptmessage", "scriptmessagehandler", "jsbridge", "postmessage",
-        "flexcall", "loadsuccess", "getappitemprice", "message=", "jscall" };
+        "didreceivescriptmessage", "scriptmessagehandler", "wkwebview",
+        "evaluatejavascript", "postmessage", "webkit.messagehandlers", "jscontext" };
     const int nK = (int)(sizeof(kEntKeys)/sizeof(kEntKeys[0]));
     const int nB = (int)(sizeof(kBridge)/sizeof(kBridge[0]));
+    BOOL hasBridge = NO;
     for (NSString *rawLine in snap) {
         if (![rawLine isKindOfClass:[NSString class]]) continue;
         const char *L = [[rawLine lowercaseString] UTF8String];
         if (!L) continue;
-        BOOL lineBridge = NO;
-        for (int b = 0; b < nB; b++) if (strstr(L, kBridge[b])) { lineBridge = YES; break; }
-        BOOL lineEntState = NO;
+        if (!hasBridge) for (int b = 0; b < nB; b++) if (strstr(L, kBridge[b])) { hasBridge = YES; break; }
         for (int k = 0; k < nK; k++) {
             const char *pos = strstr(L, kEntKeys[k]);
             if (!pos) continue;
@@ -2863,15 +2863,14 @@ static MFRTSig mfReconScanHostLog(void) {
             int st = -1;
             if (*w=='0' || !strncmp(w,"false",5) || (*w=='n'&&*(w+1)=='o')) st = 0;
             else if (*w=='1' || !strncmp(w,"true",4) || !strncmp(w,"yes",3)) st = 1;
-            if (st == 0) { s.entReadNo++; lineEntState = YES; }
-            else if (st == 1) { s.entReadYes++; lineEntState = YES; }
-        }
-        // ★同行共现 = 该行既是 JS 桥又带权益键值 → 服务端 WebView 桥在下发权益(精确, 低误报)
-        if (lineBridge && lineEntState) {
-            s.webBridge = YES;
-            if (!s.sample[0]) { const char *r = [rawLine UTF8String]; if (r) snprintf(s.sample, sizeof(s.sample), "%.115s", r); }
+            if (st == 0) { s.entReadNo++; if (!s.sample[0]) { const char *r=[rawLine UTF8String]; if(r) snprintf(s.sample,sizeof(s.sample),"%.115s",r); } }
+            else if (st == 1) { s.entReadYes++; if (!s.sample[0]) { const char *r=[rawLine UTF8String]; if(r) snprintf(s.sample,sizeof(s.sample),"%.115s",r); } }
         }
     }
+    // ★快照级共现(非行级, 不依赖任何 app 特定桥名): 快照里既有通用 WebKit 桥, 又有"权益键=明确
+    //   布尔值"的运行时自报(app 自己打印当前权益态如 premium=0) → 服务端 WebView 桥下发权益型。
+    //   静态挖不到(app 运行时自 report 的桥消息); 通用锚(WebKit 术语 + 权益键=bool)零 app 硬编码。
+    s.webBridge = hasBridge && (s.entReadNo + s.entReadYes >= 1);
     return s;
 }
 
