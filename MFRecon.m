@@ -3646,7 +3646,7 @@ NSDictionary *mfReconFingerprint(void) {
         [ev addObject:@"EXCPORTS: 本地许可服务器(mach 协议)注册在场"];
     } else if (serverSide) {
         mfType = @"服务器权益型"; route = @"⛔ 权益在服务端会话, 本地解锁无效 — 无可用本地路线";
-        [ev addObject:skLine]; [ev addObject:@"WebView 桥权益标志在场(FlexCall/loadSuccess 族)"];
+        [ev addObject:skLine]; [ev addObject:@"WebView 桥权益标志在场(运行时观测: JS 桥下发权益键值)"];
         if (gRtWebBridge && gRt.sample[0])
             [ev addObject:[NSString stringWithFormat:@"运行时实锤(实时日志): WebView JS 桥下发权益「%s」", gRt.sample]];
     } else if (srvSelfIap) {
