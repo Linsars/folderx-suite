@@ -3656,11 +3656,13 @@ NSDictionary *mfReconFingerprint(void) {
         //   多链兜底: 若同时扫出本地代码门(pyide 弱服务器型 = 有本地 tbz 门 + 服务端遥测), 一并给出
         //   本地 patch 路线 — 不因"检测到服务端"就掩盖本地那条真腿(179 收据型≠无本地链同款教训)。
         mfType = @"服务端 WebView 桥型(部分本地可解)";
-        NSMutableString *rt = [NSMutableString stringWithString:@"实验模拟页 L3 WebView 桥权益改写(关广告/解 native UI 门)"];
+        NSMutableString *rt = [NSMutableString stringWithString:@"WebForge 引擎(抓改一体·已自动激活): 桥消息+网页 fetch/XHR 响应双改写"];
         if (nRealGate > 0) [rt appendFormat:@" · 另有本地 SK2 真门 %lu 个可 ⚡(疑弱服务端+本地门多链)", (unsigned long)nRealGate];
         else if (gCodePtsInStore > 0) [rt appendFormat:@" · 另有本地代码门 %lu 个候选可 ⚡ 逐试", (unsigned long)gCodePtsInStore];
-        [rt appendString:@" · 网页会员内容=服务端渲染本地无解"];
+        [rt appendString:@" · 看[webcap]实时日志→采纳 webrules 建议改包 · 网页纯内容服务端渲染仍无解"];
         route = rt;
+        // v2.58.195: 判出服务端/桥型 → 自动激活 WebForge(免手动开开关, 冷启动即注入观测+改包)
+        { extern void mfWebForgeAutoDispatch(void); mfWebForgeAutoDispatch(); }
         [ev addObject:skLine]; [ev addObject:@"WebView 桥权益标志在场(运行时观测: JS 桥下发权益键值)"];
         if (gRtWebBridge && gRt.sample[0])
             [ev addObject:[NSString stringWithFormat:@"运行时实锤(实时日志): WebView JS 桥下发权益「%s」", gRt.sample]];

@@ -1617,9 +1617,9 @@ void mfShowLabPage(void) {
         [NSString stringWithFormat:@"对应侦查: 收据验证型 — appStoreReceiptURL/transactionReceipt · 命中 %ld", mfReceiptForgeHits()]);
     // v2.58.191: L3 WebView JS 桥权益改写 — 服务端 WebView 壳型(mailnow dbg_179)。
     //   服务端会员本地无解, 但 native 侧读的桥消息(premium/no_ad=0)可改写 → 关广告+解 native UI 门。
-    mfSubSwitchRow(sv, 264, @"L3 WebView 桥权益改写（服务端壳·关广告/解UI门）", mfWebBridgeForgeIsOn(),
+    mfSubSwitchRow(sv, 264, @"WebForge WebView 权益引擎（抓改一体·判型自动激活）", mfWebBridgeForgeIsOn(),
         @selector(mfWebBridgeForgeSwitchChanged:),
-        [NSString stringWithFormat:@"改 WKScriptMessage 桥消息权益键假值→真 · 命中 %ld · 重启 app 生效", mfWebBridgeForgeHits()]);
+        [NSString stringWithFormat:@"网页 fetch/XHR+桥消息双改写 · 抓包并进网络分析 · 自动荐 webrules · 命中 %ld · 重启生效", mfWebBridgeForgeHits()]);
 
     // v2.58.157: 「运行时状态观测」独立开关已删除 —— 状态注入并入 patch 引擎判定点体系。
     //   侦查(sk2recipe)扫出配方 → 注册为 hookinj@ 判定点 → 用户在「🎯 判定点」列表 ⚡ 执行。

@@ -169,6 +169,28 @@ static void mfRecordCapture(MFNetRecord *rec) {
 }
 
 // ====== NSURLProtocol 拦截 ======
+// v2.58.195: WebForge 抓包并入网络分析记录 —— WKWebView 网页 fetch/XHR 走独立 Networking 进程,
+//   NSURLProtocol 抓不到; WebForge 注入 JS 解码后经 mfwebcap 桥回传, 这里补录成 MFNetRecord,
+//   让"网络分析"记录列表同时含 原生请求(NSURLProtocol) + 网页请求(WebForge), 一处看全部流量。
+void mfNetAddWebCapRecord(NSString *url, NSString *enc, id bodyJSON) {
+    @synchronized (g_capturedRecords) {
+        if (!g_capturedRecords) g_capturedRecords = [NSMutableArray new];
+        if (g_capturedRecords.count >= MF_MAX_RECORDS) [g_capturedRecords removeObjectAtIndex:0];
+        MFNetRecord *rec = [MFNetRecord new];
+        rec.url = url ?: @"?";
+        rec.method = @"WEB";                 // 标记来源=网页(区别于 GET/POST 原生)
+        rec.status = 200;
+        rec.mimeType = enc.length ? [NSString stringWithFormat:@"webforge/%@", enc] : @"webforge";
+        rec.timestamp = [NSDate date];
+        NSData *bd = bodyJSON ? [NSJSONSerialization dataWithJSONObject:bodyJSON options:0 error:nil] : nil;
+        rec.respBody = bd;
+        NSString *bs = bd ? [[NSString alloc] initWithData:bd encoding:NSUTF8StringEncoding] : nil;
+        if (bs.length > 200) bs = [bs substringToIndex:200];
+        rec.summary = [NSString stringWithFormat:@"WEB [%@] %@", enc ?: @"?", bs ?: @""];
+        [g_capturedRecords addObject:rec];
+    }
+}
+
 @interface MFURLProtocol : NSURLProtocol <NSURLSessionDataDelegate>
 @property (strong) NSURLSession *session;
 @property (strong) NSMutableData *data;
