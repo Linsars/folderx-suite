@@ -603,7 +603,7 @@ static void apEntDumpsLoad(void) {
                     if ([tombClean containsObject:bad]) { [tombClean removeObject:bad]; tombChanged = YES; }
                 if (tombChanged) {
                     mfWritePrefObj([NSString stringWithFormat:@"mfTombstones_%@", apCurBundleID()], tombClean.count ? tombClean : nil);
-                    apLog(@"[entdump] ♻️ 清历史墓碑污染(pythonide 单靶子残留) → 剩 %lu", (unsigned long)tombClean.count);
+                    apLog(@"[entdump] ♻️ 清历史墓碑污染(单靶子历史残留) → 剩 %lu", (unsigned long)tombClean.count);
                     tombs2 = tombClean;
                 }
                 NSMutableArray *clean2 = [NSMutableArray array];
