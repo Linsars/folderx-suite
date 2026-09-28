@@ -775,6 +775,96 @@ static BOOL mfObserveNeeded(NSString *bid) {
 }
 
 // 标本装载(dlopen 由我们掌控: 诊断模式先布钩再让 ctor 跑)
+
+// ==================== v2.58.193 Xray WebView 注入观测 ====================
+// 目标: 用 Xray 把第三方 WebView 注入标本(如 Rusku)挂到干净 app(如 PPS Pro/未解密商店包),
+//   捕获它通过 WKUserScript 注入的 JS 全文 + JS↔native 桥 handler 名 + 运行时 eval。
+// 为什么需要: 标本注入 JS 是静默的(addUserScript: 不打 stdout), 实时日志(hostlog 只抓
+//   stdout/stderr)看不到。本观测把注入内容翻译成 stdout 输出 → 实时日志可见。
+// 输出双通道: ① stdout(fprintf+fflush) → hostlog 实时可见 ② Documents/MinisFix/
+//   xray_webinject_<seq>.js 全文落盘(无 512 截断, 保真; 解密后 JS 可能上万字)。
+// ★门控铁律: 仅在 mfFixcrashStage(xray) 内装配 —— 该函数只在观察模块三层门控
+//   (mfObserveEnabled 总开关 + mfObserveAppList + 选中 mfObserve_* 标本)全过时才执行。
+//   无标本挂载 → 永不 hook WebKit → 零影响实时日志/IAPtools 本身功能。透传原实现, 非破坏。
+static IMP g_xrayOrigAddUserScript = NULL;
+static IMP g_xrayOrigAddHandler    = NULL;
+static IMP g_xrayOrigEvalJS        = NULL;
+static int g_xrayWebSeq = 0;
+
+// -[WKUserContentController addUserScript:] —— 标本注入的 JS 全文在此
+static void xray_addUserScript(id self, SEL _cmd, id script) {
+    @autoreleasepool {
+        @try {
+            NSString *src = ((id (*)(id, SEL))objc_msgSend)(script, sel_registerName("source"));
+            long t = ((long (*)(id, SEL))objc_msgSend)(script, sel_registerName("injectionTime"));
+            int seq = g_xrayWebSeq++;
+            fprintf(stdout, "[xray-webinject] #%d WKUserScript 注入 len=%lu injTime=%ld(0=DocStart,1=DocEnd)\n",
+                    seq, (unsigned long)src.length, t);
+            fflush(stdout);
+            if (src.length) {
+                // 全文落盘(无截断, 保真)
+                NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/MinisFix"];
+                [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                NSString *path = [NSString stringWithFormat:@"%@/xray_webinject_%d.js", dir, seq];
+                [src writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                // 逐行打 stdout(单行过长会被 pipe 截, 拆行保完整)
+                for (NSString *ln in [src componentsSeparatedByString:@"\n"])
+                    fprintf(stdout, "[xray-js#%d] %s\n", seq, [ln UTF8String] ?: "");
+                fflush(stdout);
+                mfXrayLog("[xray] webinject #%d len=%lu -> %s", seq, (unsigned long)src.length, [path UTF8String]);
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    ((void (*)(id, SEL, id))g_xrayOrigAddUserScript)(self, _cmd, script);
+}
+
+// -[WKUserContentController addScriptMessageHandler:name:] —— JS→native 桥协议名
+static void xray_addHandler(id self, SEL _cmd, id handler, id name) {
+    @autoreleasepool {
+        @try {
+            const char *n = name ? [[name description] UTF8String] : "?";
+            fprintf(stdout, "[xray-webinject] 桥 handler 注册 name=%s\n", n ?: "?");
+            fflush(stdout);
+            mfXrayLog("[xray] bridge handler name=%s", n ?: "?");
+        } @catch (__unused NSException *e) {}
+    }
+    ((void (*)(id, SEL, id, id))g_xrayOrigAddHandler)(self, _cmd, handler, name);
+}
+
+// -[WKWebView evaluateJavaScript:completionHandler:] —— 运行时动态 eval(桥出方向, 截断预览)
+static void xray_evalJS(id self, SEL _cmd, id js, id handler) {
+    @autoreleasepool {
+        @try {
+            NSString *s = [js description];
+            if (s.length > 300) s = [[s substringToIndex:300] stringByAppendingString:@"…"];
+            fprintf(stdout, "[xray-eval] %s\n", [s UTF8String] ?: "");
+            fflush(stdout);
+        } @catch (__unused NSException *e) {}
+    }
+    ((void (*)(id, SEL, id, id))g_xrayOrigEvalJS)(self, _cmd, js, handler);
+}
+
+static void mfXrayInstallWebObserver(void) {
+    Class WKUCC = objc_getClass("WKUserContentController");
+    if (!WKUCC) { mfXrayLog("[xray] WKUserContentController 缺失(app 无 WebKit) — web 观测跳过"); return; }
+    if (!g_xrayOrigAddUserScript) {
+        Method m = class_getInstanceMethod(WKUCC, sel_registerName("addUserScript:"));
+        if (m) { g_xrayOrigAddUserScript = method_setImplementation(m, (IMP)xray_addUserScript);
+                 mfXrayLog("[xray] addUserScript: 观测装配"); }
+    }
+    if (!g_xrayOrigAddHandler) {
+        Method m = class_getInstanceMethod(WKUCC, sel_registerName("addScriptMessageHandler:name:"));
+        if (m) { g_xrayOrigAddHandler = method_setImplementation(m, (IMP)xray_addHandler);
+                 mfXrayLog("[xray] addScriptMessageHandler:name: 观测装配"); }
+    }
+    Class WKWV = objc_getClass("WKWebView");
+    if (WKWV && !g_xrayOrigEvalJS) {
+        Method m = class_getInstanceMethod(WKWV, sel_registerName("evaluateJavaScript:completionHandler:"));
+        if (m) { g_xrayOrigEvalJS = method_setImplementation(m, (IMP)xray_evalJS);
+                 mfXrayLog("[xray] evaluateJavaScript: 观测装配"); }
+    }
+}
+
 static void mfFixcrashStage(BOOL xray, BOOL observeOn) {
     // 观察门控: 不满足三层门控直接 return, 不 dlopen/不注册 add_image/零日志
     if (!observeOn) return;
@@ -791,7 +881,10 @@ static void mfFixcrashStage(BOOL xray, BOOL observeOn) {
     // 标本清单过滤: mfObserve_<文件名> = YES 才装(方案 B 多选清单, 每个 dylib 一个开关)
     NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil] ?: @[];
     BOOL any = NO;
-    for (NSString *f in [files sortedArrayUsingSelector:@selector(compare)]) {
+    // v2.58.193: xray 模式下, dlopen 标本前先装 WebView 注入观测(捕获标本注入的 JS→stdout/落盘)。
+    //   仅 xray 开启时装, 无标本挂载则本函数根本不执行 → 零影响实时日志/IAPtools 功能。
+    if (xray) mfXrayInstallWebObserver();
+    for (NSString *f in [files sortedArrayUsingSelector:@selector(localizedStandardCompare:)]) {
         if (![f.pathExtension isEqualToString:@"dylib"]) continue;
         // 不装载任何: 该 dylib 没被勾选(mfObserve_<名> != YES) → skip
         NSString *key = [@"mfObserve_" stringByAppendingString:f];
