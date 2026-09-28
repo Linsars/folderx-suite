@@ -603,6 +603,11 @@ static void mfInstallNetworkCaptureOnce(void) {
 void mfInstallNetworkCapture(void) {
     mfInstallNetworkCaptureOnce();
     mfInstallWebSocketHooks();
+    // v2.58.196: WebForge 采集器随网络捕获一同启动(归网络分析家族) — swizzle WKWebView init
+    //   注入只读采集 JS, 抓 WKWebView 网页 fetch/XHR(NSURLProtocol 抓不到的独立进程请求)。
+    //   采集恒开(供判型总闸读 ring buffer 分析); 改包仅当有 on=YES 的 webinj@ 点位。
+    extern void mfWebCollectorInstall(void);
+    mfWebCollectorInstall();
 }
 
 // ====== 捕获列表页面（子页展示） ======

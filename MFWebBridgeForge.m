@@ -1,19 +1,20 @@
-// MFWebBridgeForge.m — WebForge WebView 权益引擎 (v2.58.195; 原 "L3 桥改写" 升级)
-// 【归属】IAPtools.dylib (IAP 域); ctor 自启动 + 判型总闸自动派发。
-// 【定位】WebView / 服务端权益型 app 的本地解 —— 网络分析(NSURLProtocol)只能拦 app 原生
-//   NSURLSession, 拦不到 WKWebView 网页内 JS 的 fetch/XHR(独立 Networking 进程)。WebForge
-//   在网页 JS 环境里补上这一层, 与网络分析互补: 原生请求→网络分析, 网页请求→WebForge。
-// 【两条腿】
-//   腿A(桥消息): swizzle -[WKScriptMessage body] — postMessage 桥型(mailnow FlexCall
-//     "premium=0;no_ad=0" 型), 桥消息流到 app 处理器前改权益键假值→真。
+// MFWebBridgeForge.m — WebView 采集器 + 规则注入执行器 (v2.58.196)
+// 【定位】WebView / 服务端权益型 app 的本地解 —— NSURLProtocol(网络分析)只拦 app 原生
+//   NSURLSession, 拦不到 WKWebView 网页内 JS 的 fetch/XHR(独立 Networking 进程)。本模块
+//   在网页 JS 环境补上这一层, 与网络分析互补。
+// 【职责边界(v2.58.196 重构, 用户铁令)】本模块 = 无脑执行器, 不含判型/生成:
+//   · 采集器(mfWebCollectorInstall): 随网络捕获启动就跑, swizzle WKWebView init, 注入
+//     只读 JS hook fetch/XHR → 响应解码回传 → 存 ring buffer(供 MFRecon 侦查读) + 并进
+//     网络分析记录。不分析、不生成、不改包。
+//   · 执行器(webinj@ 判定点驱动): 注入的同一段 JS 按"激活规则集"改包。规则集 = 判定点库里
+//     on=YES 的 webinj@ 点位的 recipe(唯一事实源 = 判定点库, 本模块不自存规则)。
+//   · 判型/生成规则 = MFRecon 的活(读 ring buffer 分析权益字段组 → 生成 webinj@ 点位)。
+//   · 激活/持久化/删除/编辑 = 实验模拟页判定点卡片(与 sk2vfy@/hookinj@ 同一 UI)。
+// 【机理】
+//   腿A(桥消息): swizzle -[WKScriptMessage body] — postMessage 桥型(mailnow FlexCall)。
 //   腿B(响应改写): swizzle -[WKWebView init...] → WKUserScript(DocStart)注入通用引擎,
-//     hook 网页 fetch/XHR 改接口响应(啪啪搜 /user/my 判 vip 型, 源自 Rusku 实证架构)。
-// 【抓改一体·app-agnostic】代码通用, app 特定的只有"规则数据"不是代码:
-//   · 抓: 注入 JS 解码每个响应 → mfwebcap 桥回传 → [webcap]实时日志 + 并进网络分析记录
-//   · 荐: 自动扫响应里"权益键=假值"字段 → 生成 webrules 建议(webrules_suggested_<bid>.json)
-//   · 改: webrules_<bid>.json 规则(点路径→值)自动改包, 编码自适应(明文/base64反转/base64)
-//   · 后门: webforge_<bid>.js 完全自定义 JS(高级, 编码/逻辑特殊时完整接管)
-// 【零 app 硬编码】权益键表通用; 桥类是标准 WebKit; app 专属逻辑全在外部数据文件, 不进包。
+//     hook fetch/XHR, 编码自适应(明文/base64反转/base64), 按 __MFR 规则改接口响应字段。
+// 【app-agnostic】JS 骨架固定零 app 硬编码; app 特定的只有 recipe 规则数据(在判定点库)。
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -22,12 +23,11 @@
 
 #define wbLog(fmt, ...) mfLog((fmt), ##__VA_ARGS__)
 
+// ============ 腿A: 桥消息改写(-[WKScriptMessage body]) ============
 static BOOL g_wbOn = NO;
-static long g_wbHits = 0;              // 改写次数
-static long g_wbSeen = 0;              // 见到权益桥消息次数
+static long g_wbHits = 0;
 static IMP  g_origBody = NULL;
 
-// 权益键(小写子串) — JS 桥下发权益态常用键名, 通用零 app 硬编码
 static const char *kWbEntKeys[] = {
     "premium", "no_ad", "noad", "vip", "is_pro", "ispro", "pro_status", "prostatus",
     "ispremium", "haspremium", "subscribed", "is_subscriber", "issubscriber",
@@ -35,7 +35,6 @@ static const char *kWbEntKeys[] = {
     "premium_status", "no_ads", "hide_ad", "hideads", "adfree", "ad_free", "is_paid", "ispaid",
 };
 static const int kWbEntKeyN = (int)(sizeof(kWbEntKeys)/sizeof(kWbEntKeys[0]));
-
 static BOOL wbKeyIsEnt(NSString *k) {
     if (![k isKindOfClass:[NSString class]] || !k.length) return NO;
     const char *c = [[k lowercaseString] UTF8String];
@@ -43,16 +42,12 @@ static BOOL wbKeyIsEnt(NSString *k) {
     for (int i = 0; i < kWbEntKeyN; i++) if (strstr(c, kWbEntKeys[i])) return YES;
     return NO;
 }
-
-// 字符串形态桥消息(k=v;k=v; 或 k:v&k:v) — 把权益键的假值改真值
 static NSString *wbRewriteString(NSString *s, BOOL *changed) {
     if (![s isKindOfClass:[NSString class]] || s.length < 3) return s;
-    // 只在整串含任一权益键时才拆分处理(省开销)
     BOOL maybe = NO;
     { const char *c = [[s lowercaseString] UTF8String];
       if (c) for (int i = 0; i < kWbEntKeyN; i++) if (strstr(c, kWbEntKeys[i])) { maybe = YES; break; } }
     if (!maybe) return s;
-    // 分隔符探测: ';' 优先(FlexCall), 否则 '&'
     NSString *sep = [s containsString:@";"] ? @";" : ([s containsString:@"&"] ? @"&" : nil);
     if (!sep) return s;
     NSArray *parts = [s componentsSeparatedByString:sep];
@@ -76,8 +71,6 @@ static NSString *wbRewriteString(NSString *s, BOOL *changed) {
     *changed = YES;
     return [out componentsJoinedByString:sep];
 }
-
-// 字典形态桥消息 — 递归改权益键的假值
 static id wbRewriteObject(id obj, BOOL *changed) {
     if ([obj isKindOfClass:[NSString class]]) return wbRewriteString(obj, changed);
     if ([obj isKindOfClass:[NSDictionary class]]) {
@@ -93,7 +86,7 @@ static id wbRewriteObject(id obj, BOOL *changed) {
                     }
                 }
             }
-            id nv = wbRewriteObject(v, changed);   // 递归(嵌套 dict/array)
+            id nv = wbRewriteObject(v, changed);
             if (nv) m[k] = nv;
         }
         return m;
@@ -105,15 +98,13 @@ static id wbRewriteObject(id obj, BOOL *changed) {
     }
     return obj;
 }
-
-// swizzled -[WKScriptMessage body]
 static id wb_body(id self, SEL _cmd) {
     id b = g_origBody ? ((id(*)(id,SEL))g_origBody)(self, _cmd) : nil;
     if (!g_wbOn || !b) return b;
     BOOL changed = NO;
     id nb = wbRewriteObject(b, &changed);
     if (changed) {
-        g_wbSeen++; g_wbHits++;
+        g_wbHits++;
         NSString *desc = [b isKindOfClass:[NSString class]] ? b : [b description];
         if (desc.length > 100) desc = [desc substringToIndex:100];
         wbLog(@"[wbforge] ★桥权益改写 #%ld: %@ → 真值", g_wbHits, desc);
@@ -122,119 +113,34 @@ static id wb_body(id self, SEL _cmd) {
     return b;
 }
 
-// ============ v2.58.195: L3 第二条腿 — WKUserScript 注入引擎(fetch/XHR 响应改写) ============
-// 【为何】L3 原只 swizzle -[WKScriptMessage body](postMessage 桥型, 如 mailnow FlexCall)。
-//   另一大类 WebView 壳(如啪啪搜)权益判定走网页内 fetch/XHR 拿接口响应(/user/my)判 vip,
-//   不经 WKScriptMessage 桥 → body swizzle 完全无效。这类要在网页 JS 环境里 hook
-//   fetch/XHR 改响应体 —— 用 WKUserScript(DocumentStart)注入(源自 Rusku 实证架构)。
-// 【注入内容优先级】外部 per-app 文件 > 外部全局文件 > 内置通用层:
-//   /var/jb/var/mobile/minisfix/webforge_<bid>.js  (针对性 JS, 放 app 专属解锁, 编码特殊/接口特定必走此)
-//   /var/jb/var/mobile/minisfix/webforge.js         (全局自定义)
-//   内置通用层(明文 JSON 响应扫权益键假值→真; base64/特殊编码型必须走外部文件)
-// 【app-agnostic】引擎零 app 硬编码; app 专属逻辑(接口路径/字段/编码)在外部 JS 文件, 不进包。
-static BOOL g_wfOn = NO;
-static BOOL g_wfCap = YES;              // 抓包上报(默认开: 先抓才知道改什么)
-static IMP g_wfOrigInitFrame = NULL;
-static IMP g_wfOrigInitCoder = NULL;
+// ============ 采集 ring buffer(供 MFRecon 侦查读)============
+static NSMutableArray *g_wcBuf = nil;         // 每条: @{@"u":url, @"e":编码, @"b":解码JSON}
+static long g_wfCapN = 0;
+#define WC_MAX 60
+// MFRecon 侦查时读: 返回采集到的响应快照(url + 解码后 JSON body)
+NSArray *mfWebCapBuffer(void) {
+    @synchronized (g_wcBuf ?: [NSNull null]) { return g_wcBuf ? [g_wcBuf copy] : @[]; }
+}
+
+// ============ 执行器状态 ============
+static BOOL g_wcInstalled = NO;               // WKWebView init swizzle 装了没
+static IMP  g_wfOrigInitFrame = NULL;
+static IMP  g_wfOrigInitCoder = NULL;
 static char kWFInjectedKey;
 static long g_wfInjected = 0;
-static long g_wfCapN = 0;
+static id   g_wfCapHandler = nil;
 
-// 抓包回传 handler(duck-typed WKScriptMessageHandler, 不硬链 WebKit):
-//   注入 JS 把每个响应解码后 postMessage 到 mfwebcap → 这里 ①打 [webcap] 实时日志
-//   ②并进网络分析记录列表 ③自动分析候选权益字段 → 生成 webrules 建议(落盘, 用户采纳即用)。
-@interface MFWebCapHandler : NSObject
-@end
-
-// 累积: url → 候选点路径集合(值为假的权益键)。跨消息累积, 落盘 webrules_suggested_<bid>.json
-static NSMutableDictionary *g_wfSuggest = nil;
-
-// 递归找"权益键 && 值为假(0/false/空/no)"的点路径 → 收进 out(如 "data.vip")
-static void mfWFHarvest(id obj, NSString *prefix, NSMutableArray *out) {
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        for (NSString *k in [(NSDictionary *)obj allKeys]) {
-            id v = ((NSDictionary *)obj)[k];
-            NSString *path = prefix.length ? [NSString stringWithFormat:@"%@.%@", prefix, k] : k;
-            BOOL isFalse = NO;
-            if ([v isKindOfClass:[NSNumber class]]) isFalse = ![v boolValue];
-            else if ([v isKindOfClass:[NSString class]]) {
-                NSString *t = [[v lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                isFalse = [t isEqualToString:@"0"]||[t isEqualToString:@"false"]||[t isEqualToString:@"no"]||!t.length;
-            }
-            if (wbKeyIsEnt(k) && isFalse && ![v isKindOfClass:[NSDictionary class]] && ![v isKindOfClass:[NSArray class]])
-                [out addObject:path];
-            else
-                mfWFHarvest(v, path, out);   // 递归嵌套
-        }
-    } else if ([obj isKindOfClass:[NSArray class]]) {
-        NSArray *a = obj;
-        for (NSUInteger i = 0; i < a.count && i < 20; i++)
-            mfWFHarvest(a[i], [NSString stringWithFormat:@"%@.%lu", prefix, (unsigned long)i], out);
-    }
+// 激活规则集 = 判定点库里 on=YES 的 webinj@ 点位 recipe(唯一事实源, 本模块不自存)。
+// MFAppPatch 暴露 mfActiveWebinjRecipes() 返回 [{u:..,set:{..}}, ...]。
+static NSString *mfWFActiveRulesJSON(void) {
+    extern NSArray *mfActiveWebinjRecipes(void);
+    NSArray *rules = mfActiveWebinjRecipes();
+    if (![rules isKindOfClass:[NSArray class]]) rules = @[];
+    NSData *d = [NSJSONSerialization dataWithJSONObject:rules options:0 error:nil];
+    return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"[]";
 }
 
-// 把累积的候选写成可直接用的 webrules 建议文件(值统一给"真值": 数字→1, 也附 expdate 远期样例)
-static void mfWFWriteSuggest(void) {
-    if (!g_wfSuggest.count) return;
-    NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"app";
-    NSMutableArray *rules = [NSMutableArray array];
-    for (NSString *u in g_wfSuggest) {
-        NSArray *paths = [(NSSet *)g_wfSuggest[u] allObjects];
-        if (!paths.count) continue;
-        NSMutableDictionary *set = [NSMutableDictionary dictionary];
-        for (NSString *p in paths) set[p] = @1;   // 权益键假值→1(用户可自行改成 true/字符串)
-        [rules addObject:@{@"u": u, @"set": set}];
-    }
-    NSData *d = [NSJSONSerialization dataWithJSONObject:rules options:NSJSONWritingPrettyPrinted error:nil];
-    if (!d) return;
-    NSString *path = [NSString stringWithFormat:@"/var/jb/var/mobile/minisfix/webrules_suggested_%@.json", bid];
-    [d writeToFile:path atomically:YES];
-    wbLog(@"[webforge] 📝 已更新规则建议 %lu 条 → %@ (采纳: 改名为 webrules_%@.json)", (unsigned long)rules.count, path, bid);
-}
-
-@implementation MFWebCapHandler
-- (void)userContentController:(id)ucc didReceiveScriptMessage:(id)msg {
-    @try {
-        id b = ((id(*)(id,SEL))objc_msgSend)(msg, sel_registerName("body"));
-        NSString *s = [b isKindOfClass:[NSString class]] ? (NSString *)b : [b description];
-        g_wfCapN++;
-        // ① 实时日志
-        NSString *disp = s.length > 2000 ? [s substringToIndex:2000] : s;
-        wbLog(@"[webcap] #%ld %@", g_wfCapN, disp);
-        // 解析 {u,e,b}
-        NSData *jd = [s dataUsingEncoding:NSUTF8StringEncoding];
-        NSDictionary *env = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
-        if (![env isKindOfClass:[NSDictionary class]]) return;
-        NSString *url = env[@"u"]; id body = env[@"b"];
-        // ② 并进网络分析记录(与原生请求同列表, 一处看全部流量)
-        extern void mfNetAddWebCapRecord(NSString *url, NSString *enc, id bodyJSON);
-        mfNetAddWebCapRecord(url ?: @"?", env[@"e"], body);
-        // ③ 自动生成规则候选
-        NSMutableArray *cand = [NSMutableArray array];
-        mfWFHarvest(body, @"", cand);
-        if (cand.count && url.length) {
-            if (!g_wfSuggest) g_wfSuggest = [NSMutableDictionary dictionary];
-            NSMutableSet *set = g_wfSuggest[url] ?: [NSMutableSet set];
-            NSUInteger before = set.count;
-            [set addObjectsFromArray:cand];
-            g_wfSuggest[url] = set;
-            if (set.count > before) {   // 有新候选才落盘 + 提示
-                wbLog(@"[webforge] 🎯 %@ 发现权益候选字段: %@", url, [cand componentsJoinedByString:@","]);
-                mfWFWriteSuggest();
-            }
-        }
-    } @catch (__unused NSException *e) {}
-}
-@end
-static id g_wfCapHandler = nil;
-
-// ============ 通用注入引擎(app-agnostic): 抓包 + 规则驱动改包 ============
-// 一份 JS 通吃所有 WebView / 服务器权益型 app。app 特定的只有"规则数据"(webrules_<bid>.json),
-// 不是代码 —— 这才是"服务器权益型不再是死区"的通解: 抓响应 → 写规则 → 自动改, 零 JS。
-//   · 编码自适应: 明文 JSON / base64 整串反转(atob 型) / 直接 base64 —— decode + 对称 encode
-//   · 抓包: 每个响应解码后经 mfwebcap 桥回传 → [webcap] 进实时日志(看 app 传什么/哪个字段是权益)
-//   · 改包: 按规则表(window.__MFR)对匹配 url 的响应 JSON 改字段(点路径 data.vip), 重编码塞回
-//   · 规则格式: [{"u":"/user/my","set":{"data.vip":1,"data.expdate":"2999"}}] —— 纯数据零 JS
+// 通用引擎 JS(固定, 零 app 硬编码): 采集(始终) + 按 __MFR 规则改包
 static NSString *mfWFBuiltinJS(void) {
     return
     @"(function(){'use strict';"
@@ -258,27 +164,48 @@ static NSString *mfWFBuiltinJS(void) {
     @"})();";
 }
 
-// 注入源: 完全自定义 JS(webforge_<bid>.js / webforge.js, 高级用户完整控制)
-//        > 通用引擎 + 外部规则数据(webrules_<bid>.json / webrules.json, 只写 {url,字段,值})
+// 完整自定义 JS 后门(webforge_<bid>.js / webforge.js) — 编码/逻辑特殊时完整接管
 static NSString *mfWFScript(void) {
     NSString *dir = @"/var/jb/var/mobile/minisfix";
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    // 1) 完全自定义 JS 后门(高级: 编码特殊/逻辑复杂时完整接管)
     NSString *custom = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:[NSString stringWithFormat:@"webforge_%@.js", bid]] encoding:NSUTF8StringEncoding error:nil];
     if (!custom.length) custom = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"webforge.js"] encoding:NSUTF8StringEncoding error:nil];
     if (custom.length) { wbLog(@"[webforge] 用自定义 JS (%lu B)", (unsigned long)custom.length); return custom; }
-    // 2) 通用引擎 + 外部规则数据(常规路径: 用户只写规则, 不碰 JS/编码)
-    NSString *rules = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:[NSString stringWithFormat:@"webrules_%@.json", bid]] encoding:NSUTF8StringEncoding error:nil];
-    if (!rules.length) rules = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:@"webrules.json"] encoding:NSUTF8StringEncoding error:nil];
-    if (!rules.length) rules = @"[]";
-    NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@"/var/jb/var/mobile/Library/Preferences/com.linsars.minisfix.plist"] ?: @{};
-    g_wfCap = pf[@"mfWebForgeCap"] ? [pf[@"mfWebForgeCap"] boolValue] : YES;
-    NSString *header = [NSString stringWithFormat:@"window.__MFR=%@;window.__MFCAP=%@;", rules, g_wfCap ? @"true" : @"false"];
-    wbLog(@"[webforge] 通用引擎 + 规则 %lu B cap=%d", (unsigned long)rules.length, g_wfCap);
+    NSString *rules = mfWFActiveRulesJSON();
+    NSString *header = [NSString stringWithFormat:@"window.__MFR=%@;window.__MFCAP=true;", rules];
+    wbLog(@"[webforge] 引擎 header: 激活规则 %@", rules.length > 200 ? [rules substringToIndex:200] : rules);
     return [header stringByAppendingString:mfWFBuiltinJS()];
 }
 
-// 往一个 WKWebViewConfiguration 的 userContentController 注入 WKUserScript(DocStart) + 抓包 handler
+// ============ 采集回传 handler ============
+@interface MFWebCapHandler : NSObject
+@end
+@implementation MFWebCapHandler
+- (void)userContentController:(id)ucc didReceiveScriptMessage:(id)msg {
+    @try {
+        id b = ((id(*)(id,SEL))objc_msgSend)(msg, sel_registerName("body"));
+        NSString *s = [b isKindOfClass:[NSString class]] ? (NSString *)b : [b description];
+        g_wfCapN++;
+        NSString *disp = s.length > 1500 ? [s substringToIndex:1500] : s;
+        wbLog(@"[webcap] #%ld %@", g_wfCapN, disp);   // ① 实时日志
+        NSData *jd = [s dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *env = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
+        if (![env isKindOfClass:[NSDictionary class]]) return;
+        // ② 并进网络分析记录(与原生请求同列表)
+        extern void mfNetAddWebCapRecord(NSString *url, NSString *enc, id bodyJSON);
+        mfNetAddWebCapRecord(env[@"u"] ?: @"?", env[@"e"], env[@"b"]);
+        // ③ 存 ring buffer(供 MFRecon 侦查读, 做权益字段组分析 → 生成 webinj@)
+        @synchronized (g_wcBuf ?: [NSNull null]) {
+            if (!g_wcBuf) g_wcBuf = [NSMutableArray new];
+            if (g_wcBuf.count >= WC_MAX) [g_wcBuf removeObjectAtIndex:0];
+            [g_wcBuf addObject:env];
+        }
+        // 本模块不 harvest/不生成规则(那是 MFRecon 侦查层职责)
+    } @catch (__unused NSException *e) {}
+}
+@end
+
+// 往 config 的 userContentController 注入采集+改包 JS + 采集桥
 static void mfWFInject(id cfg) {
     if (!cfg) return;
     id ucc = ((id(*)(id,SEL))objc_msgSend)(cfg, sel_registerName("userContentController"));
@@ -289,85 +216,57 @@ static void mfWFInject(id cfg) {
         ((void(*)(id,SEL,id))objc_msgSend)(cfg, sel_registerName("setUserContentController:"), ucc);
     }
     if (objc_getAssociatedObject(ucc, &kWFInjectedKey)) return;   // 防同一 ucc 重复注入
-    // 抓包桥 mfwebcap: 注入 JS 把解码后响应 postMessage 回来 → [webcap] 进实时日志
-    if (g_wfCap) {
-        if (!g_wfCapHandler) g_wfCapHandler = [MFWebCapHandler new];
-        @try { ((void(*)(id,SEL,id,id))objc_msgSend)(ucc, sel_registerName("addScriptMessageHandler:name:"), g_wfCapHandler, @"mfwebcap"); }
-        @catch (__unused NSException *e) {}   // 重复 name 会抛, 忽略
-    }
+    if (!g_wfCapHandler) g_wfCapHandler = [MFWebCapHandler new];
+    @try { ((void(*)(id,SEL,id,id))objc_msgSend)(ucc, sel_registerName("addScriptMessageHandler:name:"), g_wfCapHandler, @"mfwebcap"); }
+    @catch (__unused NSException *e) {}
     Class US = objc_getClass("WKUserScript");
     if (!US) return;
     NSString *js = mfWFScript();
     id us = ((id(*)(id,SEL))objc_msgSend)((id)US, sel_registerName("alloc"));
-    // initWithSource:(NSString*) injectionTime:(NSInteger 0=DocStart) forMainFrameOnly:(BOOL NO=含子frame)
     us = ((id(*)(id,SEL,id,NSInteger,BOOL))objc_msgSend)(us, sel_registerName("initWithSource:injectionTime:forMainFrameOnly:"), js, (NSInteger)0, (BOOL)NO);
     if (!us) return;
     ((void(*)(id,SEL,id))objc_msgSend)(ucc, sel_registerName("addUserScript:"), us);
     objc_setAssociatedObject(ucc, &kWFInjectedKey, @YES, OBJC_ASSOCIATION_RETAIN);
     g_wfInjected++;
-    wbLog(@"[webforge] ★注入 #%ld: %lu B → webview(DocStart) cap=%d", g_wfInjected, (unsigned long)js.length, g_wfCap);
+    wbLog(@"[webforge] ★注入 #%ld: %lu B → webview(DocStart)", g_wfInjected, (unsigned long)js.length);
 }
-
-// swizzled -[WKWebView initWithFrame:configuration:] — 创建前往 config 注入
 static id wf_initFrame(id self, SEL _cmd, CGRect frame, id cfg) {
-    if (g_wfOn) { @try { mfWFInject(cfg); } @catch (__unused NSException *e) {} }
+    @try { mfWFInject(cfg); } @catch (__unused NSException *e) {}
     return ((id(*)(id,SEL,CGRect,id))g_wfOrigInitFrame)(self, _cmd, frame, cfg);
 }
-// swizzled -[WKWebView initWithCoder:] — storyboard 路径, init 后取 configuration 注入
 static id wf_initCoder(id self, SEL _cmd, id coder) {
     id r = ((id(*)(id,SEL,id))g_wfOrigInitCoder)(self, _cmd, coder);
-    if (g_wfOn && r) { @try { id cfg = ((id(*)(id,SEL))objc_msgSend)(r, sel_registerName("configuration")); mfWFInject(cfg); } @catch (__unused NSException *e) {} }
+    @try { id cfg = ((id(*)(id,SEL))objc_msgSend)(r, sel_registerName("configuration")); mfWFInject(cfg); } @catch (__unused NSException *e) {}
     return r;
 }
 
-static void mfWFInstall(void) {
-    if (g_wfOrigInitFrame || g_wfOrigInitCoder) return;   // 幂等
+// ============ 对外 API ============
+// 采集器安装: swizzle WKWebView init(幂等) + 桥消息改写(腿A)。随网络捕获/判定点激活调用。
+// 采集始终工作(注入 JS 恒 hook fetch/XHR 回传); 改包按激活规则集(空规则=纯采集)。
+void mfWebCollectorInstall(void) {
+    if (g_wcInstalled) return;
     Class WV = objc_getClass("WKWebView");
-    if (!WV) { wbLog(@"[webforge] WKWebView 类缺失(app 无 WebView) — 注入引擎跳过"); return; }
+    if (!WV) { wbLog(@"[webforge] WKWebView 缺失(app 无 WebView) — 采集器跳过"); return; }
     Method mF = class_getInstanceMethod(WV, sel_registerName("initWithFrame:configuration:"));
-    if (mF) { g_wfOrigInitFrame = method_setImplementation(mF, (IMP)wf_initFrame); wbLog(@"[webforge] initWithFrame:configuration: swizzled"); }
+    if (mF) { g_wfOrigInitFrame = method_setImplementation(mF, (IMP)wf_initFrame); }
     Method mC = class_getInstanceMethod(WV, sel_registerName("initWithCoder:"));
-    if (mC) { g_wfOrigInitCoder = method_setImplementation(mC, (IMP)wf_initCoder); wbLog(@"[webforge] initWithCoder: swizzled"); }
+    if (mC) { g_wfOrigInitCoder = method_setImplementation(mC, (IMP)wf_initCoder); }
+    // 腿A: 桥消息改写(仅当有激活的桥型 webinj@ 时才真改, 平时透传)
+    Class WK = objc_getClass("WKScriptMessage");
+    if (WK && !g_origBody) {
+        Method m = class_getInstanceMethod(WK, @selector(body));
+        if (m) { g_origBody = method_setImplementation(m, (IMP)wb_body); g_wbOn = YES; }
+    }
+    g_wcInstalled = YES;
+    wbLog(@"[webforge] 采集器已装(WKWebView init swizzled) — 采集恒开, 改包按激活规则");
 }
 
-void mfWebBridgeForgeEnable(void) {
-    mfWFInstall();          // v2.58.195: 装 WKUserScript 注入引擎(fetch/XHR 响应改写)
-    g_wfOn = YES;
-    if (g_wbOn) return;
-    if (!g_origBody) {
-        Class WK = objc_getClass("WKScriptMessage");
-        if (!WK) { wbLog(@"[wbforge] WKScriptMessage 类缺失(app 无 WebView?) — 跳过"); return; }
-        Method m = class_getInstanceMethod(WK, @selector(body));
-        if (!m) { wbLog(@"[wbforge] -[WKScriptMessage body] 方法缺失 — 跳过"); return; }
-        g_origBody = method_setImplementation(m, (IMP)wb_body);
-        wbLog(@"[wbforge] hook 装配: -[WKScriptMessage body] swizzled");
-    }
-    g_wbOn = YES;
-    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"mfWebBridgeForgeEnabled"];
-    wbLog(@"[wbforge] ON");
+// webinj@ 判定点 ⚡ 激活时调用(单点/批量/冷启动重打共用): 确保采集器已装。
+//   规则集从判定点库动态读(mfActiveWebinjRecipes), 无需在此传 recipe。
+void mfWebForgeActivate(void) {
+    mfWebCollectorInstall();
+    wbLog(@"[webforge] ⚡ webinj@ 激活 — 采集器就位, 下次 webview 注入按激活规则改包(重启 app 生效)");
 }
-void mfWebBridgeForgeDisable(void) {
-    g_wbOn = NO;   // swizzle 保留(透传原实现), 只关改写
-    g_wfOn = NO;   // v2.58.195: 关注入引擎(swizzle 保留, g_wfOn 门控下不再注入)
-    [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"mfWebBridgeForgeEnabled"];
-    wbLog(@"[wbforge] OFF");
-}
-void mfWebBridgeForgeSwitchChanged(UISwitch *sw) {
-    if (sw.on) { mfWebBridgeForgeEnable(); mfToast(@"🌐 WebForge 引擎已开 · 抓改一体 · 重启 app 生效"); }
-    else { mfWebBridgeForgeDisable(); mfToast(@"⏹️ WebForge 引擎已关"); }
-}
-void mfWebBridgeForgeAutoStart(void) {
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"mfWebBridgeForgeEnabled"]) return;
-    mfWebBridgeForgeEnable();
-    wbLog(@"[wbforge] AutoStart ON");
-}
-// v2.58.195: 判型总闸判出服务端/WebView 桥型时调用 — 自动激活 WebForge(免用户手动开开关)。
-//   幂等: 已开则只补装(mfWFInstall 内部有幂等门); 持久化, 下次冷启动 AutoStart 自动恢复。
-//   门控铁律: 只在判型确证服务端/桥型时被调, 非该型 app 永不激活, 零影响其它 app。
-void mfWebForgeAutoDispatch(void) {
-    if (g_wfOn && g_wbOn) return;   // 已全激活
-    mfWebBridgeForgeEnable();
-    wbLog(@"[webforge] ⚡ 判型总闸自动派发: 服务端/WebView 桥型 → WebForge 已激活(抓改一体)");
-}
-long mfWebBridgeForgeHits(void) { return g_wbHits + g_wfInjected; }
-BOOL mfWebBridgeForgeIsOn(void) { return g_wbOn || g_wfOn; }
+
+long mfWebForgeInjectCount(void) { return g_wfInjected; }
+long mfWebForgeCapCount(void) { return g_wfCapN; }

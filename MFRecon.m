@@ -2874,6 +2874,98 @@ static MFRTSig mfReconScanHostLog(void) {
     return s;
 }
 
+// ============ v2.58.196: webinj@ 判定点生成器(判型总闸的活)============
+// 职责: 判出服务端/WebView 桥型后, 读采集器 ring buffer(mfWebCapBuffer), 分析每个接口响应的
+//   **权益字段组**(不是单个布尔), 生成完整改写规则 → 注册成 webinj@ 判定点入库。
+// 权益字段组分析(181 实锤: 只改 vip 不够, 要连 exp/expdate/today_left 一整套):
+//   · 解锁键(vip/premium/is_pro/...): 假值 → 1
+//   · 过期布尔(exp/expired/is_expire): true → false(反向 — 值真代表已过期)
+//   · 过期日期(expdate/expire_at/vip_expire/expire_time): → 远期 "2099-12-31"
+//   · 限次/配额(today_left/today_max/quota/remain/free_count/limit): → 999999
+// 数组防误伤: 不对 list/items 等数组元素生成路径(那是数据表非权益状态, 181 viplist.list[] 教训)。
+// 每个有权益字段的接口 = 一个 webinj@ 点位, sym=webinj@<url>; 默认 off, 用户 ⚡ 激活。
+static NSString *mfWJLowerC(NSString *k) { return [k lowercaseString]; }
+static int mfWJClassify(NSString *key) {
+    // 返回: 1=解锁键 2=过期布尔 3=过期日期 4=限次配额 0=非权益
+    NSString *k = mfWJLowerC(key);
+    const char *c = k.UTF8String; if (!c) return 0;
+    // 4 限次/配额(优先, 名字可能含 vip 如 vip_count)
+    const char *qk[] = {"today_left","today_max","quota","remain","free_count","freecount","limit","daily","count_left","times_left"};
+    for (int i=0;i<(int)(sizeof(qk)/sizeof(qk[0]));i++) if (strstr(c,qk[i])) return 4;
+    // 2 过期布尔
+    if (strstr(c,"expired")||[k isEqualToString:@"exp"]||strstr(c,"is_expire")||strstr(c,"isexpire")) return 2;
+    // 3 过期日期
+    const char *dk[] = {"expdate","expire_at","expireat","vip_expire","expire_time","expiretime","expire_date","expiredate","vip_end","end_time","validthru","valid_until"};
+    for (int i=0;i<(int)(sizeof(dk)/sizeof(dk[0]));i++) if (strstr(c,dk[i])) return 3;
+    // 1 解锁键
+    const char *uk[] = {"vip","premium","is_pro","ispro","is_vip","isvip","subscrib","member","unlock","purchas","no_ad","noad","adfree","ad_free","is_paid","ispaid","level","grade"};
+    for (int i=0;i<(int)(sizeof(uk)/sizeof(uk[0]));i++) if (strstr(c,uk[i])) return 1;
+    return 0;
+}
+// 递归遍历 JSON, 收集权益字段的点路径 → set 目标值。数组不下钻(防 list[] 误伤)。
+static void mfWJHarvest(id obj, NSString *prefix, NSMutableDictionary *set) {
+    if (![obj isKindOfClass:[NSDictionary class]]) return;   // 只钻字典, 数组跳过
+    for (NSString *k in [(NSDictionary *)obj allKeys]) {
+        id v = ((NSDictionary *)obj)[k];
+        NSString *path = prefix.length ? [NSString stringWithFormat:@"%@.%@", prefix, k] : k;
+        int cls = mfWJClassify(k);
+        BOOL isScalar = ![v isKindOfClass:[NSDictionary class]] && ![v isKindOfClass:[NSArray class]];
+        if (cls && isScalar) {
+            switch (cls) {
+                case 1: {   // 解锁键: 假值→1(真值不动, 防覆盖已解锁的等级数字)
+                    BOOL isFalse = ([v isKindOfClass:[NSNumber class]] && ![v boolValue]);
+                    if ([v isKindOfClass:[NSString class]]) { NSString *t=[[v lowercaseString] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]]; isFalse = ([t isEqualToString:@"0"]||[t isEqualToString:@"false"]||[t isEqualToString:@"no"]||!t.length); }
+                    if (isFalse) set[path] = @1;
+                    break; }
+                case 2: set[path] = @NO; break;                        // 过期布尔→false
+                case 3: set[path] = @"2099-12-31"; break;              // 过期日期→远期
+                case 4: set[path] = @999999; break;                    // 限次→大数
+            }
+        } else if ([v isKindOfClass:[NSDictionary class]]) {
+            mfWJHarvest(v, path, set);   // 只递归字典
+        }
+    }
+}
+// 生成 webinj@ 点位并入库, 返回生成数。app-agnostic: 全从运行时采集数据推导, 零 app 硬编码。
+static int mfReconGenWebinjPoints(void) {
+    extern NSArray *mfWebCapBuffer(void);
+    NSArray *buf = mfWebCapBuffer();
+    if (![buf isKindOfClass:[NSArray class]] || !buf.count) {
+        mfLog(@"[webinj-gen] 采集缓冲空(未浏览会员页?) — 无接口可分析, 0 点");
+        return 0;
+    }
+    NSString *mainPath = [[NSBundle mainBundle] executablePath];
+    NSString *img = mainPath ? [mainPath lastPathComponent] : @"main";
+    // 按 url 去重(同接口多次响应取字段并集)
+    NSMutableDictionary<NSString *, NSMutableDictionary *> *byURL = [NSMutableDictionary dictionary];
+    for (NSDictionary *env in buf) {
+        if (![env isKindOfClass:[NSDictionary class]]) continue;
+        NSString *u = env[@"u"]; id body = env[@"b"];
+        if (![u isKindOfClass:[NSString class]] || !u.length) continue;
+        NSMutableDictionary *set = byURL[u] ?: [NSMutableDictionary dictionary];
+        mfWJHarvest(body, @"", set);          // 权益字段组分析
+        if (set.count) byURL[u] = set;
+    }
+    int n = 0;
+    for (NSString *u in byURL) {
+        NSDictionary *set = byURL[u];
+        if (!set.count) continue;
+        NSString *sym = [NSString stringWithFormat:@"webinj@%@", u];
+        NSDictionary *pt = @{
+            @"img": img, @"sym": sym, @"shape": @"webinj", @"kind": @"webforge",
+            @"vmaddr": @0, @"slide": @0, @"score": @(90), @"on": @NO,
+            @"note": [NSString stringWithFormat:@"WebView 规则注入: %@ 改 %lu 字段", u, (unsigned long)set.count],
+            @"recipe": @{ @"u": u, @"set": set },
+        };
+        extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
+        mfAppPatchEntDumpsMerge(@[pt]);
+        n++;
+        mfLog(@"[webinj-gen] ✅ 注册 %@ (改 %lu 字段: %@)", sym, (unsigned long)set.count, [set.allKeys componentsJoinedByString:@","]);
+    }
+    mfLog(@"[webinj-gen] 生成 %d 个 webinj@ 判定点(默认 off, 判定点列表 ⚡ 激活)", n);
+    return n;
+}
+
 NSDictionary *mfReconFingerprint(void) {
     __block NSArray *stateKeys = @[];   // v2.58.35: 提升函数级 — lines 块内采集, verdict 判型/return 都要用
     // v2.58.120: 分段进度日志 — dbg_113 定谳: scripting 上侦查卡空白(recon 未跑完),
@@ -3656,13 +3748,16 @@ NSDictionary *mfReconFingerprint(void) {
         //   多链兜底: 若同时扫出本地代码门(pyide 弱服务器型 = 有本地 tbz 门 + 服务端遥测), 一并给出
         //   本地 patch 路线 — 不因"检测到服务端"就掩盖本地那条真腿(179 收据型≠无本地链同款教训)。
         mfType = @"服务端 WebView 桥型(部分本地可解)";
-        NSMutableString *rt = [NSMutableString stringWithString:@"WebForge 引擎(抓改一体·已自动激活): 桥消息+网页 fetch/XHR 响应双改写"];
+        NSMutableString *rt = [NSMutableString stringWithString:@"WebForge: 判定点列表 🌐webinj@ 点 ⚡ 注入改包(桥消息+网页 fetch/XHR 响应)"];
         if (nRealGate > 0) [rt appendFormat:@" · 另有本地 SK2 真门 %lu 个可 ⚡(疑弱服务端+本地门多链)", (unsigned long)nRealGate];
         else if (gCodePtsInStore > 0) [rt appendFormat:@" · 另有本地代码门 %lu 个候选可 ⚡ 逐试", (unsigned long)gCodePtsInStore];
-        [rt appendString:@" · 看[webcap]实时日志→采纳 webrules 建议改包 · 网页纯内容服务端渲染仍无解"];
+        [rt appendString:@" · 网页纯内容服务端渲染仍无解"];
         route = rt;
-        // v2.58.195: 判出服务端/桥型 → 自动激活 WebForge(免手动开开关, 冷启动即注入观测+改包)
-        { extern void mfWebForgeAutoDispatch(void); mfWebForgeAutoDispatch(); }
+        // v2.58.196: 分析采集缓冲的权益字段组 → 生成 webinj@ 判定点入库(实验模拟页 ⚡ 执行)
+        //   职责: 判型总闸(本处)读采集器 ring buffer, 分析权益字段组, 生成规则并注册点位。
+        //   实验模拟页只显示点位 + ⚡; 采集/改包由 WebForge 执行器。三层各司其职。
+        int nWebinj = mfReconGenWebinjPoints();
+        if (nWebinj > 0) [ev addObject:[NSString stringWithFormat:@"🌐 已生成 %d 个 webinj@ 注入点(判定点列表 ⚡ 激活)", nWebinj]];
         [ev addObject:skLine]; [ev addObject:@"WebView 桥权益标志在场(运行时观测: JS 桥下发权益键值)"];
         if (gRtWebBridge && gRt.sample[0])
             [ev addObject:[NSString stringWithFormat:@"运行时实锤(实时日志): WebView JS 桥下发权益「%s」", gRt.sample]];

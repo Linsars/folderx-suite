@@ -1549,9 +1549,8 @@ extern void mfL0SetOn(BOOL on);
 extern BOOL mfExcIsOn(void);        // v2.54.0: EXCPROBE 应答器开关状态
 extern long mfExcHits(void);        // 命中计数
 extern void mfExcSetOn(BOOL on);    // 写状态
-extern BOOL mfWebBridgeForgeIsOn(void);   // v2.58.191: L3 WebView JS 桥权益改写
-extern long mfWebBridgeForgeHits(void);
-extern void mfWebBridgeForgeSwitchChanged(UISwitch *sw);
+// v2.58.196: L3 独立开关退役 — WebForge 走判定点体系(webinj@ 点位, 与 sk2vfy@/hookinj@ 同 UI)。
+//   采集器随判定点 ⚡ 激活; 抓包/生成规则 = 判型总闸+采集器职责, 实验模拟页只显示点位+解锁。
 
 
 static UIView *mfSubSwitchRow(UIView *page, CGFloat y, NSString *title,
@@ -1615,11 +1614,8 @@ void mfShowLabPage(void) {
     mfSubSwitchRow(sv, 204, @"L1 收据伪造（收据验证型）", mfReceiptForgeIsOn(),
         @selector(mfReceiptForgeSwitchChanged:),
         [NSString stringWithFormat:@"对应侦查: 收据验证型 — appStoreReceiptURL/transactionReceipt · 命中 %ld", mfReceiptForgeHits()]);
-    // v2.58.191: L3 WebView JS 桥权益改写 — 服务端 WebView 壳型(mailnow dbg_179)。
-    //   服务端会员本地无解, 但 native 侧读的桥消息(premium/no_ad=0)可改写 → 关广告+解 native UI 门。
-    mfSubSwitchRow(sv, 264, @"WebForge WebView 权益引擎（抓改一体·判型自动激活）", mfWebBridgeForgeIsOn(),
-        @selector(mfWebBridgeForgeSwitchChanged:),
-        [NSString stringWithFormat:@"网页 fetch/XHR+桥消息双改写 · 抓包并进网络分析 · 自动荐 webrules · 命中 %ld · 重启生效", mfWebBridgeForgeHits()]);
+    // v2.58.196: L3 独立开关退役 — WebView/服务端桥型走判定点体系(判型总闸生成 webinj@ 点位,
+    //   判定点列表 🌐 点 ⚡ 激活/编辑/持久化), 与 sk2vfy@/hookinj@ 同一 UI。不再单独开关。
 
     // v2.58.157: 「运行时状态观测」独立开关已删除 —— 状态注入并入 patch 引擎判定点体系。
     //   侦查(sk2recipe)扫出配方 → 注册为 hookinj@ 判定点 → 用户在「🎯 判定点」列表 ⚡ 执行。
@@ -1632,7 +1628,7 @@ void mfShowLabPage(void) {
     // v2.56: patch 引擎(规则驱动: method swizzle / text vm_protect / keychain 授权豁免)
     //   ——学习自样本判定链的落地容器。规则格式: mfAppPatchRules JSON
     //   [{"bid":"com.scripting.ios","ver":"","patches":[{"kind":"keychain"}]}]
-    CGFloat apY = 324;   // v2.58.191: L3 开关新增 60px(204→264→AppPatch 起点 324)
+    CGFloat apY = 264;   // v2.58.196: L3 开关退役, AppPatch 起点回落(204→264)
     extern void mfAppPatchSectionInLabPage(UIView *page, CGFloat *yio);
     mfAppPatchSectionInLabPage(sv, &apY);
 
@@ -1745,7 +1741,7 @@ void mfShowLabPage(void) {
 - (void)mfObjCTxProbeTapped { mfObjCTxProbeTapped(); }
 - (void)mfSubInjectSwitchChanged:(UISwitch *)sw { mfSubInjectSwitchChanged(sw); }
 - (void)mfReceiptForgeSwitchChanged:(UISwitch *)sw { mfReceiptForgeSwitchChanged(sw); }
-- (void)mfWebBridgeForgeSwitchChanged:(UISwitch *)sw { mfWebBridgeForgeSwitchChanged(sw); }
+// v2.58.196: mfWebBridgeForgeSwitchChanged 退役(L3 独立开关删除, WebForge 走 webinj@ 判定点)
 - (void)mfL0SwitchChanged:(UISwitch *)sw { mfL0SetOn(sw.on); }
 - (void)mfStateObsSwitchChanged:(UISwitch *)sw {
     // v2.58.157: 状态观测开关已废除, 保留空方法防旧引用崩溃(实际不再挂 UI)
@@ -2680,7 +2676,10 @@ __attribute__((constructor)) static void MinisFixCtor(void) {
         mfObjCHookApplySilent();
         mfSubInjectAutoStart();
         mfReceiptForgeAutoStart();
-        { extern void mfWebBridgeForgeAutoStart(void); mfWebBridgeForgeAutoStart(); }   // v2.58.191: L3 WebView 桥改写冷启动恢复
+        // v2.58.196: WebForge 采集器不在此无差别装(会波及所有 app) — 只搭两条已有门控:
+        //   ① 网络捕获开启(per-app, 下方 mfCaptureEnabled_<bid> 冷启恢复 → mfInstallNetworkCapture 内装)
+        //   ② webinj@ 点位持久化(判定点 Boot apEntDumpsApply 的 webinj@ 分支 → mfWebForgeActivate 装)
+        //   两门都不满足 = 该 app 零注入零影响(与 hostlog 按 app gate 同律)。
 
         // 手势注册
         Class vcCls = NSClassFromString(@"UIViewController");

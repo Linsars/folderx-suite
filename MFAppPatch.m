@@ -683,6 +683,7 @@ void mfAppPatchEntDumpsEndRound(void) {
         //   有效点, 不该被侦查轮次当陈旧清掉。dbg_131 manual 踩过一次, dbg_144 hookinj 同款复现。
         BOOL isFixed = [m[@"shape"] isEqualToString:@"manual"] || [m[@"sym"] hasPrefix:@"manual@"]
                      || [m[@"shape"] isEqualToString:@"hookinj"] || [m[@"sym"] hasPrefix:@"hookinj@"]
+                     || [m[@"sym"] hasPrefix:@"webinj@"]      // v2.58.196: WebView 规则注入点(recipe 驱动, 判型钦定, 同豁免)
                      || [m[@"shape"] isEqualToString:@"discforce"] || [m[@"sym"] hasPrefix:@"discforce@"]   // v2.58.161: 方案B点同豁免
                      || [m[@"shape"] isEqualToString:@"sk2ladder"] || [m[@"sym"] hasPrefix:@"sk2ladder@"];   // v2.58.184: 梯子档位门判型钦定, 同豁免
         if (!seen && !on && !isFixed) {
@@ -751,6 +752,25 @@ void mfAppPatchEntDumpSetOn(NSString *sym, BOOL on) {
     apEntDumpsLoad();
     for (NSMutableDictionary *m in g_entDumps)
         if ([m[@"sym"] isEqualToString:sym]) { m[@"on"] = @(on); break; }
+    apEntDumpsSave();
+}
+// v2.58.196: WebForge 执行器读"激活规则集" = 库里 on=YES 的 webinj@ 点位 recipe(唯一事实源)。
+NSArray *mfActiveWebinjRecipes(void) {
+    apEntDumpsLoad();
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *m in g_entDumps) {
+        if (![m[@"sym"] hasPrefix:@"webinj@"] || ![m[@"on"] boolValue]) continue;
+        NSDictionary *rc = m[@"recipe"];
+        if ([rc isKindOfClass:[NSDictionary class]] && [rc[@"u"] length] && [rc[@"set"] isKindOfClass:[NSDictionary class]])
+            [out addObject:@{ @"u": rc[@"u"], @"set": rc[@"set"] }];
+    }
+    return out;
+}
+// v2.58.196: 改 webinj@ 点位的 recipe(编辑规则用) — 覆写整条 recipe 字典。
+void mfAppPatchEntSetRecipe(NSString *sym, NSDictionary *recipe) {
+    apEntDumpsLoad();
+    for (NSMutableDictionary *m in g_entDumps)
+        if ([m[@"sym"] isEqualToString:sym]) { m[@"recipe"] = recipe; break; }
     apEntDumpsSave();
 }
 // v2.58.12: 删除点位 — 左划删除用; 同 sym 去重口径单条删除(扫描 merge 端 img+sym 去重)
@@ -873,7 +893,12 @@ void apEntDumpsApply(void) {
             else
                 apLog(@"[entdump] ⛔ %@ 状态注入配方无效/hook 失败", d[@"sym"]);
             continue;   // 非字节 patch, 跳过后续 vm_protect 字节写入逻辑
-        } else if ([d[@"sym"] hasPrefix:@"discforce@"]) {
+        } else if ([d[@"sym"] hasPrefix:@"webinj@"]) {
+            // v2.58.196: WebView 规则注入点 — 冷启动重打 = 确保采集器就位(规则集从库动态读)。
+            extern void mfWebForgeActivate(void);
+            mfWebForgeActivate();
+            apLog(@"[entdump] ✅ %@ WebView 规则注入激活(冷启动重打, 采集器就位)", d[@"sym"]);
+            continue;   // 非字节 patch
             // v2.58.161 方案B: disc 授权 bool 强制 — and wRt,#1 → movz wRt,#1(4字节), 走标准 vm_protect 字节 patch。
             //   令 resilient codegen 宿主用自己的运行时偏移构造 active(disc 恒 1)。old/new 自带, 走下方校验+patch。
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length]) newBytes = apHexToBytes(d[@"new"]);
@@ -1159,6 +1184,7 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
 - (void)mfAPKeychainStub;
 - (void)mfAPEntDelete:(NSString *)sym;   // v2.58.12: 左划删除 — 假点位手动清理解
+- (void)mfAPEntEditWebinj:(NSString *)sym;   // v2.58.196: webinj@ 规则编辑(改 recipe.set)
 - (void)mfAPBatchPatchAll:(UIButton *)btn;    // v2.58.119: 一键 patch 全部
 - (void)mfAPBatchRevertAll:(UIButton *)btn;   // v2.58.119: 一键回滚并删除释放全部
 @end
@@ -1274,6 +1300,14 @@ static UITextView *g_apEditor = nil;
     } else if ([shape isEqualToString:@"discforce"]) {
         st.text = on ? @"💉✓ 状态注入·B — 冷启动自动重打" : @"💉 状态注入·B(disc强制active) — 左划⚡";
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemPurpleColor];
+    } else if ([sym hasPrefix:@"webinj@"]) {
+        // v2.58.196: WebView 规则注入点 — 显示接口 URL + 改写字段数
+        NSDictionary *rc = d[@"recipe"];
+        NSString *u = [rc isKindOfClass:[NSDictionary class]] ? (rc[@"u"] ?: @"?") : @"?";
+        NSUInteger nset = [rc[@"set"] isKindOfClass:[NSDictionary class]] ? [rc[@"set"] count] : 0;
+        st.text = on ? [NSString stringWithFormat:@"🌐✓ 网页注入 %@(改%lu字段) — 冷启重打", u, (unsigned long)nset]
+                     : [NSString stringWithFormat:@"🌐 网页规则注入 %@(改%lu字段) — 左划⚡/编辑", u, (unsigned long)nset];
+        st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemBlueColor];
     } else if ([shape isEqualToString:@"bool"]) {
         st.text = on ? @"💾✓ Bool判定 — 冷启动自动重打" : @"✓ Bool判定 — 左划⚡(即持久)";
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemTealColor];
@@ -1306,6 +1340,16 @@ static UITextView *g_apEditor = nil;
             done(YES);
         }];
     persist.backgroundColor = on ? [UIColor systemGrayColor] : [UIColor systemGreenColor];
+    // v2.58.196: webinj@ 点追加「编辑规则」— 改 recipe.set 的键值(其它 kind 无此操作)
+    if ([sym hasPrefix:@"webinj@"]) {
+        UIContextualAction *edit = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal
+            title:@"编辑" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
+                [(id)g_mfCtrl mfAPEntEditWebinj:sym];
+                done(YES);
+            }];
+        edit.backgroundColor = [UIColor systemBlueColor];
+        return [UISwipeActionsConfiguration configurationWithActions:@[patch, persist, edit]];
+    }
     return [UISwipeActionsConfiguration configurationWithActions:@[patch, persist]];
 }
 // v2.58.12: 左划删除(trailing=⚡patch/💾持久, leading=删除 — 分开防误触)
@@ -1414,6 +1458,15 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
             NSDictionary *rc = d[@"recipe"];
             if ([rc isKindOfClass:[NSDictionary class]] && mfProbeInstallRecipe(rc)) { mfAppPatchEntDumpSetOn(sym, YES); ok++; }
             else { fail++; apLog(@"[entdump] 批量 状态注入失败 %@", sym); }
+            continue;
+        }
+        if ([sym hasPrefix:@"webinj@"]) {
+            // v2.58.196: WebView 规则注入点 — 非字节 patch, 激活采集器 + 置 on(规则集从库动态读)
+            NSDictionary *rc = d[@"recipe"];
+            if ([rc isKindOfClass:[NSDictionary class]] && [rc[@"u"] length]) {
+                extern void mfWebForgeActivate(void);
+                mfWebForgeActivate(); mfAppPatchEntDumpSetOn(sym, YES); ok++;
+            } else { fail++; apLog(@"[entdump] 批量 webinj 缺 recipe %@", sym); }
             continue;
         }
         NSData *nb = apEntNewBytesFor(d, nil);
@@ -1702,6 +1755,20 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
                 mfToast(@"⛔ 状态注入配方无效或 hook 失败");
             }
             return;   // 非字节 patch
+        } else if ([sym hasPrefix:@"webinj@"]) {
+            // v2.58.196: WebView 规则注入点 — 非字节 patch, 激活采集器+注入引擎(按 recipe 规则改包)。
+            //   recipe = {u:接口URL, set:{点路径:值}}; 规则集从判定点库动态读(on=YES 的 webinj@ 全集)。
+            //   ⚡ 只需确保采集器就位 + 置 on 持久化; 实际改包在下次 webview 注入时按激活规则集执行。
+            NSDictionary *rc = d[@"recipe"];
+            if (![rc isKindOfClass:[NSDictionary class]] || ![rc[@"u"] length]) {
+                mfToast(@"⛔ webinj 点缺 recipe(u/set)"); apLog(@"[entdump] ⛔ %@ webinj 缺 recipe", sym); return;
+            }
+            extern void mfWebForgeActivate(void);
+            mfWebForgeActivate();
+            mfAppPatchEntDumpSetOn(sym, YES);   // ⚡即持久化, 冷启动重打(采集器 AutoStart 复用)
+            apLog(@"[entdump] ⚡ %@ WebView 规则注入已激活 + 持久化 (u=%@)", sym, rc[@"u"]);
+            mfToast(@"⚡ WebView 规则注入已激活 · 重启 app 生效");
+            return;   // 非字节 patch
         } else if ([sym hasPrefix:@"discforce@"]) {
             // v2.58.161 方案B: disc 授权 bool 强制 and→movz#1(4字节), 走下方标准 vm_protect + old 校验路径。
             if ([d[@"new"] isKindOfClass:[NSString class]] && [d[@"new"] length]) newBytes = apHexToBytes(d[@"new"]);
@@ -1751,6 +1818,36 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
     extern void mfAppPatchEntDumpDelete(NSString *);
     mfAppPatchEntDumpDelete(sym);
     mfToast(@"✂ 已删除点位");
+}
+// v2.58.196: webinj@ 规则编辑 — 弹框改 recipe.set(JSON: {"点路径":值}), 保存后重新⚡生效。
+- (void)mfAPEntEditWebinj:(NSString *)sym {
+    NSDictionary *cur = nil;
+    for (NSDictionary *m in mfAppPatchEntDumps())
+        if ([m[@"sym"] isEqualToString:sym]) { cur = m; break; }
+    NSDictionary *rc = cur[@"recipe"];
+    NSString *u = [rc isKindOfClass:[NSDictionary class]] ? (rc[@"u"] ?: @"?") : @"?";
+    NSDictionary *setD = [rc[@"set"] isKindOfClass:[NSDictionary class]] ? rc[@"set"] : @{};
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:setD options:NSJSONWritingPrettyPrinted error:nil];
+    NSString *setStr = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{}";
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"编辑网页注入规则"
+        message:[NSString stringWithFormat:@"接口 %@\n改写字段 JSON(键=点路径, 值=目标值):", u]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [al addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = setStr; tf.font = [UIFont fontWithName:@"Menlo" size:11];
+    }];
+    [al addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSString *txt = al.textFields.firstObject.text ?: @"{}";
+        NSData *nd = [txt dataUsingEncoding:NSUTF8StringEncoding];
+        NSDictionary *newSet = nd ? [NSJSONSerialization JSONObjectWithData:nd options:0 error:nil] : nil;
+        if (![newSet isKindOfClass:[NSDictionary class]]) { mfToast(@"⛔ JSON 格式错, 未保存"); return; }
+        extern void mfAppPatchEntSetRecipe(NSString *, NSDictionary *);
+        mfAppPatchEntSetRecipe(sym, @{ @"u": u, @"set": newSet });
+        [(id)g_mfCtrl mfAPEntPatchNow:sym];   // 重新激活(采集器就位 + 规则集刷新)
+        mfToast(@"✅ 规则已存 · 重启 app 生效");
+    }]];
+    [al addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    UIViewController *top = mfTopVC();
+    if (top) [top presentViewController:al animated:YES completion:nil];
 }
 @end
 
