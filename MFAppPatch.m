@@ -1819,7 +1819,7 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
     mfAppPatchEntDumpDelete(sym);
     mfToast(@"✂ 已删除点位");
 }
-// v2.58.196: webinj@ 规则编辑 — 弹框改 recipe.set(JSON: {"点路径":值}), 保存后重新⚡生效。
+// v2.58.196/197: webinj@ 规则编辑 — 插件风格输入弹层(替代系统 UIAlertController textField)。
 - (void)mfAPEntEditWebinj:(NSString *)sym {
     NSDictionary *cur = nil;
     for (NSDictionary *m in mfAppPatchEntDumps())
@@ -1829,25 +1829,17 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
     NSDictionary *setD = [rc[@"set"] isKindOfClass:[NSDictionary class]] ? rc[@"set"] : @{};
     NSData *jd = [NSJSONSerialization dataWithJSONObject:setD options:NSJSONWritingPrettyPrinted error:nil];
     NSString *setStr = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{}";
-    UIAlertController *al = [UIAlertController alertControllerWithTitle:@"编辑网页注入规则"
-        message:[NSString stringWithFormat:@"接口 %@\n改写字段 JSON(键=点路径, 值=目标值):", u]
-        preferredStyle:UIAlertControllerStyleAlert];
-    [al addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = setStr; tf.font = [UIFont fontWithName:@"Menlo" size:11];
-    }];
-    [al addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSString *txt = al.textFields.firstObject.text ?: @"{}";
-        NSData *nd = [txt dataUsingEncoding:NSUTF8StringEncoding];
+    mfInputSheet([NSString stringWithFormat:@"编辑注入规则 %@", u],
+                 @"改写字段 JSON（键=点路径 如 data.vip，值=目标值）:",
+                 setStr, YES, ^(NSString *txt) {
+        NSData *nd = [(txt ?: @"{}") dataUsingEncoding:NSUTF8StringEncoding];
         NSDictionary *newSet = nd ? [NSJSONSerialization JSONObjectWithData:nd options:0 error:nil] : nil;
         if (![newSet isKindOfClass:[NSDictionary class]]) { mfToast(@"⛔ JSON 格式错, 未保存"); return; }
         extern void mfAppPatchEntSetRecipe(NSString *, NSDictionary *);
         mfAppPatchEntSetRecipe(sym, @{ @"u": u, @"set": newSet });
         [(id)g_mfCtrl mfAPEntPatchNow:sym];   // 重新激活(采集器就位 + 规则集刷新)
         mfToast(@"✅ 规则已存 · 重启 app 生效");
-    }]];
-    [al addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    UIViewController *top = mfTopVC();
-    if (top) [top presentViewController:al animated:YES completion:nil];
+    });
 }
 @end
 

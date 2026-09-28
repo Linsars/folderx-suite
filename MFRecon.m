@@ -2852,6 +2852,15 @@ static MFRTSig mfReconScanHostLog(void) {
     BOOL hasBridge = NO;
     for (NSString *rawLine in snap) {
         if (![rawLine isKindOfClass:[NSString class]]) continue;
+        // v2.58.197: ★排除插件自身输出行 — hostlog 管道同时捕获我们自己 mfLog 的 [MF] 行
+        //   (含 [webcap]{vip:0}/[webforge]WKWebView 等), 若计入 = 拿自己的日志当 app 桥证据(自证污染)。
+        //   真机日志唯一裁判铁律: 只认 app 自报, 剔除所有 [MF]/[webcap]/[webforge]/[wbforge]/[webinj 行。
+        if ([rawLine rangeOfString:@"[MF]"].location != NSNotFound
+            || [rawLine rangeOfString:@"[webcap]"].location != NSNotFound
+            || [rawLine rangeOfString:@"[webforge]"].location != NSNotFound
+            || [rawLine rangeOfString:@"[wbforge]"].location != NSNotFound
+            || [rawLine rangeOfString:@"[webinj"].location != NSNotFound
+            || [rawLine rangeOfString:@"[webchg]"].location != NSNotFound) continue;
         const char *L = [[rawLine lowercaseString] UTF8String];
         if (!L) continue;
         if (!hasBridge) for (int b = 0; b < nB; b++) if (strstr(L, kBridge[b])) { hasBridge = YES; break; }
@@ -2936,26 +2945,30 @@ static int mfReconGenWebinjPoints(void) {
     }
     NSString *mainPath = [[NSBundle mainBundle] executablePath];
     NSString *img = mainPath ? [mainPath lastPathComponent] : @"main";
-    // 按 url 去重(同接口多次响应取字段并集)
+    // 按 url 去重(同接口多次响应取字段并集 + 存最近一次整条 body 快照供编辑参考)
     NSMutableDictionary<NSString *, NSMutableDictionary *> *byURL = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString *, id> *bodyByURL = [NSMutableDictionary dictionary];
     for (NSDictionary *env in buf) {
         if (![env isKindOfClass:[NSDictionary class]]) continue;
         NSString *u = env[@"u"]; id body = env[@"b"];
         if (![u isKindOfClass:[NSString class]] || !u.length) continue;
         NSMutableDictionary *set = byURL[u] ?: [NSMutableDictionary dictionary];
         mfWJHarvest(body, @"", set);          // 权益字段组分析
-        if (set.count) byURL[u] = set;
+        if (set.count) { byURL[u] = set; if (body) bodyByURL[u] = body; }
     }
     int n = 0;
     for (NSString *u in byURL) {
         NSDictionary *set = byURL[u];
         if (!set.count) continue;
         NSString *sym = [NSString stringWithFormat:@"webinj@%@", u];
+        // recipe: set=改写覆盖层(自动分析出的权益字段组); sample=整条原始 body 快照(编辑时看完整结构)
+        NSMutableDictionary *recipe = [@{ @"u": u, @"set": set } mutableCopy];
+        if (bodyByURL[u]) recipe[@"sample"] = bodyByURL[u];   // 用户要的"整条传过去"参考
         NSDictionary *pt = @{
             @"img": img, @"sym": sym, @"shape": @"webinj", @"kind": @"webforge",
             @"vmaddr": @0, @"slide": @0, @"score": @(90), @"on": @NO,
             @"note": [NSString stringWithFormat:@"WebView 规则注入: %@ 改 %lu 字段", u, (unsigned long)set.count],
-            @"recipe": @{ @"u": u, @"set": set },
+            @"recipe": recipe,
         };
         extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
         mfAppPatchEntDumpsMerge(@[pt]);

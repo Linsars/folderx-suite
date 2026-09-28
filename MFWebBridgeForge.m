@@ -141,6 +141,10 @@ static NSString *mfWFActiveRulesJSON(void) {
 }
 
 // 通用引擎 JS(固定, 零 app 硬编码): 采集(始终) + 按 __MFR 规则改包
+// v2.58.197: ★修 fetch 头 bug(Rusku 对比实证): 重建 Response 必须删 content-length/
+//   content-encoding/content-type —— 原头是加密体长度+gzip, 新 body 是重编码明文串, 头不删
+//   → 客户端按旧 length 截断 / 按 gzip 解非 gzip → 响应损坏丢弃改包(=改了不生效根因)。
+//   + 改包后经 mfwebcap 回传 {chg,k} → [webchg] 日志(验证改包真落地)。
 static NSString *mfWFBuiltinJS(void) {
     return
     @"(function(){'use strict';"
@@ -156,10 +160,11 @@ static NSString *mfWFBuiltinJS(void) {
     @"return null;}"
     @"function enc(j,e){if(e=='rb64')return rev(b2b(new TextEncoder().encode(asc(j))));if(e=='b64')return b2b(new TextEncoder().encode(asc(j)));return JSON.stringify(j);}"
     @"function sp(o,path,v){var k=(''+path).split('.'),c=o;for(var i=0;i<k.length-1;i++){if(typeof c[k[i]]!='object'||c[k[i]]==null)c[k[i]]={};c=c[k[i]];}c[k[k.length-1]]=v;}"
-    @"function cap(u,d){if(!C)return;try{webkit.messageHandlers.mfwebcap.postMessage(JSON.stringify({u:u,e:d.e,b:d.j}).slice(0,4000));}catch(e){}}"
-    @"function app(u,j){var h=false;for(var i=0;i<R.length;i++){var r=R[i];if((''+u).indexOf(r.u)<0)continue;if(r.set)for(var p in r.set){sp(j,p,r.set[p]);h=true;}}return h;}"
-    @"function proc(u,t){var d;try{d=dec(t);}catch(e){d=null;}if(!d)return null;cap(u,d);var h=app(u,d.j);if(!h)return null;try{return enc(d.j,d.e);}catch(e){return null;}}"
-    @"try{if(window.fetch){var of=window.fetch.bind(window);window.fetch=function(){var a=arguments,u=typeof a[0]=='string'?a[0]:((a[0]&&a[0].url)||'');return of.apply(window,a).then(function(r){try{return r.clone().text().then(function(t){var n=proc(u,t);if(n==null)return r;return new Response(n,{status:r.status,statusText:r.statusText,headers:r.headers});}).catch(function(){return r;});}catch(e){return r;}});};}}catch(e){}"
+    @"function post(o){if(!C)return;try{webkit.messageHandlers.mfwebcap.postMessage(JSON.stringify(o).slice(0,4000));}catch(e){}}"
+    @"function app(u,j){var ks=[];for(var i=0;i<R.length;i++){var r=R[i];if((''+u).indexOf(r.u)<0)continue;if(r.set)for(var p in r.set){sp(j,p,r.set[p]);ks.push(p);}}return ks;}"
+    @"function mkh(r){var h=new Headers();try{r.headers.forEach(function(v,k){var lk=k.toLowerCase();if(lk=='content-length'||lk=='content-encoding'||lk=='content-type')return;h.set(k,v);});}catch(e){}h.set('Content-Type','text/html;charset=utf-8');return h;}"
+    @"function proc(u,t){var d;try{d=dec(t);}catch(e){d=null;}if(!d)return null;post({u:u,e:d.e,b:d.j});var ks=app(u,d.j);if(!ks.length)return null;post({chg:u,k:ks});try{return enc(d.j,d.e);}catch(e){return null;}}"
+    @"try{if(window.fetch){var of=window.fetch.bind(window);window.fetch=function(){var a=arguments,u=typeof a[0]=='string'?a[0]:((a[0]&&a[0].url)||'');return of.apply(window,a).then(function(r){try{return r.clone().text().then(function(t){var n=proc(u,t);if(n==null)return r;return new Response(n,{status:r.status,statusText:r.statusText,headers:mkh(r)});}).catch(function(){return r;});}catch(e){return r;}});};}}catch(e){}"
     @"try{var NX=window.XMLHttpRequest;if(NX){var W=function(){var x=new NX(),u='';var no=x.open;x.open=function(m,url){u=''+url;return no.apply(x,arguments);};try{x.addEventListener('readystatechange',function(){try{if(x.readyState==4){var n=proc(u,x.responseText);if(n!=null){Object.defineProperty(x,'responseText',{configurable:true,get:function(){return n;}});Object.defineProperty(x,'response',{configurable:true,get:function(){return n;}});}}}catch(e){}},true);}catch(e){}return x;};W.prototype=NX.prototype;window.XMLHttpRequest=W;}}catch(e){}"
     @"})();";
 }
@@ -185,12 +190,18 @@ static NSString *mfWFScript(void) {
     @try {
         id b = ((id(*)(id,SEL))objc_msgSend)(msg, sel_registerName("body"));
         NSString *s = [b isKindOfClass:[NSString class]] ? (NSString *)b : [b description];
-        g_wfCapN++;
-        NSString *disp = s.length > 1500 ? [s substringToIndex:1500] : s;
-        wbLog(@"[webcap] #%ld %@", g_wfCapN, disp);   // ① 实时日志
         NSData *jd = [s dataUsingEncoding:NSUTF8StringEncoding];
         NSDictionary *env = jd ? [NSJSONSerialization JSONObjectWithData:jd options:0 error:nil] : nil;
         if (![env isKindOfClass:[NSDictionary class]]) return;
+        // v2.58.197: 改包后验证信封 {chg:url, k:[字段]} — 证明改包真落地(不再靠猜)
+        if (env[@"chg"]) {
+            wbLog(@"[webchg] ★改包生效 %@ 改字段: %@", env[@"chg"], [env[@"k"] componentsJoinedByString:@","]);
+            return;
+        }
+        // 采集信封 {u,e,b}
+        g_wfCapN++;
+        NSString *disp = s.length > 1500 ? [s substringToIndex:1500] : s;
+        wbLog(@"[webcap] #%ld %@", g_wfCapN, disp);   // ① 实时日志
         // ② 并进网络分析记录(与原生请求同列表)
         extern void mfNetAddWebCapRecord(NSString *url, NSString *enc, id bodyJSON);
         mfNetAddWebCapRecord(env[@"u"] ?: @"?", env[@"e"], env[@"b"]);

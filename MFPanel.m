@@ -188,6 +188,125 @@ void mfSetCardHeight(CGFloat h) {
     mfLog(@"card height -> %.0f (bottom sheet)", h);
 }
 
+// ====== v2.58.197: 插件风格确认/输入弹层(替代系统 UIAlertController) ======
+// 在面板 overlay 上盖一层半透明遮罩 + 圆角卡片, 按钮用插件配色。无面板时回落 keyWindow。
+static void mfDismissSheet(UIView *dim) {
+    [UIView animateWithDuration:0.18 animations:^{ dim.alpha = 0; }
+                     completion:^(BOOL f) { [dim removeFromSuperview]; }];
+}
+static UIView *mfBuildSheetHost(void) {
+    // 宿主: 面板 overlay 优先(风格一致), 否则 keyWindow
+    if (g_mfPanelOverlay && g_mfPanelOverlay.window) return g_mfPanelOverlay;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) if (w.isKeyWindow) return w;
+    return nil;
+}
+void mfConfirmSheet(NSString *title, NSString *message, NSString *confirmTitle, BOOL destructive, void(^onConfirm)(void)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *host = mfBuildSheetHost();
+        if (!host) return;
+        CGRect hb = host.bounds;
+        UIView *dim = [[UIView alloc] initWithFrame:hb];
+        dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5];
+        dim.alpha = 0;
+        CGFloat cw = MIN(300, hb.size.width - 60);
+        UIVisualEffectView *card = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+        card.frame = CGRectMake((hb.size.width - cw)/2, 0, cw, 0);
+        card.layer.cornerRadius = 16; card.layer.masksToBounds = YES;
+        UIView *cc = card.contentView;
+        CGFloat y = 20;
+        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(16, y, cw-32, 24)];
+        t.text = title; t.font = [UIFont boldSystemFontOfSize:17]; t.textAlignment = NSTextAlignmentCenter; t.textColor = [UIColor labelColor];
+        [cc addSubview:t]; y += 30;
+        if (message.length) {
+            UILabel *m = [[UILabel alloc] initWithFrame:CGRectMake(16, y, cw-32, 0)];
+            m.text = message; m.font = [UIFont systemFontOfSize:13]; m.textColor = [UIColor secondaryLabelColor];
+            m.numberOfLines = 0; m.textAlignment = NSTextAlignmentCenter;
+            CGSize sz = [m sizeThatFits:CGSizeMake(cw-32, 200)];
+            m.frame = CGRectMake(16, y, cw-32, sz.height);
+            [cc addSubview:m]; y += sz.height + 8;
+        }
+        y += 8;
+        CGFloat bw = (cw - 16*2 - 10) / 2;
+        UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
+        cancel.frame = CGRectMake(16, y, bw, 40);
+        [cancel setTitle:@"取消" forState:UIControlStateNormal];
+        cancel.titleLabel.font = [UIFont systemFontOfSize:15];
+        cancel.backgroundColor = [UIColor tertiarySystemFillColor];
+        cancel.layer.cornerRadius = 10;
+        [cc addSubview:cancel];
+        UIButton *ok = [UIButton buttonWithType:UIButtonTypeSystem];
+        ok.frame = CGRectMake(16 + bw + 10, y, bw, 40);
+        [ok setTitle:(confirmTitle ?: @"确定") forState:UIControlStateNormal];
+        ok.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+        [ok setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        ok.backgroundColor = destructive ? [UIColor systemRedColor] : [UIColor systemBlueColor];
+        ok.layer.cornerRadius = 10;
+        [cc addSubview:ok]; y += 40 + 20;
+        card.frame = CGRectMake((hb.size.width - cw)/2, (hb.size.height - y)/2, cw, y);
+        [dim addSubview:card];
+        [host addSubview:dim];
+        [UIView animateWithDuration:0.18 animations:^{ dim.alpha = 1; }];
+        // 事件: block 存 associated object, 用 UIAction 无需 target
+        [cancel addAction:[UIAction actionWithHandler:^(UIAction *a){ mfDismissSheet(dim); }] forControlEvents:UIControlEventTouchUpInside];
+        [ok addAction:[UIAction actionWithHandler:^(UIAction *a){ mfDismissSheet(dim); if (onConfirm) onConfirm(); }] forControlEvents:UIControlEventTouchUpInside];
+    });
+}
+void mfInputSheet(NSString *title, NSString *message, NSString *initial, BOOL multiline, void(^onSave)(NSString *text)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIView *host = mfBuildSheetHost();
+        if (!host) return;
+        CGRect hb = host.bounds;
+        UIView *dim = [[UIView alloc] initWithFrame:hb];
+        dim.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5]; dim.alpha = 0;
+        CGFloat cw = MIN(340, hb.size.width - 40);
+        UIVisualEffectView *card = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+        card.layer.cornerRadius = 16; card.layer.masksToBounds = YES;
+        UIView *cc = card.contentView;
+        CGFloat y = 18;
+        UILabel *t = [[UILabel alloc] initWithFrame:CGRectMake(16, y, cw-32, 24)];
+        t.text = title; t.font = [UIFont boldSystemFontOfSize:16]; t.textAlignment = NSTextAlignmentCenter; t.textColor = [UIColor labelColor];
+        [cc addSubview:t]; y += 30;
+        if (message.length) {
+            UILabel *m = [[UILabel alloc] initWithFrame:CGRectMake(16, y, cw-32, 0)];
+            m.text = message; m.font = [UIFont systemFontOfSize:12]; m.textColor = [UIColor secondaryLabelColor];
+            m.numberOfLines = 0;
+            CGSize sz = [m sizeThatFits:CGSizeMake(cw-32, 120)];
+            m.frame = CGRectMake(16, y, cw-32, sz.height);
+            [cc addSubview:m]; y += sz.height + 8;
+        }
+        CGFloat fieldH = multiline ? 120 : 40;
+        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(16, y, cw-32, fieldH)];
+        tv.text = initial ?: @"";
+        tv.font = [UIFont fontWithName:@"Menlo" size:12] ?: [UIFont systemFontOfSize:13];
+        tv.backgroundColor = [UIColor tertiarySystemFillColor];
+        tv.textColor = [UIColor labelColor];
+        tv.layer.cornerRadius = 8;
+        tv.autocorrectionType = UITextAutocorrectionTypeNo;
+        tv.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        mfAttachKbBar(tv);
+        [cc addSubview:tv]; y += fieldH + 12;
+        CGFloat bw = (cw - 16*2 - 10) / 2;
+        UIButton *cancel = [UIButton buttonWithType:UIButtonTypeSystem];
+        cancel.frame = CGRectMake(16, y, bw, 40);
+        [cancel setTitle:@"取消" forState:UIControlStateNormal];
+        cancel.backgroundColor = [UIColor tertiarySystemFillColor]; cancel.layer.cornerRadius = 10;
+        [cc addSubview:cancel];
+        UIButton *ok = [UIButton buttonWithType:UIButtonTypeSystem];
+        ok.frame = CGRectMake(16 + bw + 10, y, bw, 40);
+        [ok setTitle:@"保存" forState:UIControlStateNormal];
+        ok.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+        [ok setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+        ok.backgroundColor = [UIColor systemBlueColor]; ok.layer.cornerRadius = 10;
+        [cc addSubview:ok]; y += 40 + 18;
+        card.frame = CGRectMake((hb.size.width - cw)/2, (hb.size.height - y)/2 - 60, cw, y);
+        [dim addSubview:card];
+        [host addSubview:dim];
+        [UIView animateWithDuration:0.18 animations:^{ dim.alpha = 1; }];
+        [cancel addAction:[UIAction actionWithHandler:^(UIAction *a){ [tv resignFirstResponder]; mfDismissSheet(dim); }] forControlEvents:UIControlEventTouchUpInside];
+        [ok addAction:[UIAction actionWithHandler:^(UIAction *a){ NSString *txt = tv.text ?: @""; [tv resignFirstResponder]; mfDismissSheet(dim); if (onSave) onSave(txt); }] forControlEvents:UIControlEventTouchUpInside];
+    });
+}
+
 void mfPushPage(UIView *page) {
     if (!g_mfPages) g_mfPages = [[NSMutableArray alloc] init];
     // 隐藏主页和所有已存在子页
@@ -2024,16 +2143,12 @@ void mfShowLabPage(void) {
 - (void)mfDeleteRuleTapped:(UIButton *)btn {
     NSInteger idx = [objc_getAssociatedObject(btn, "idx") integerValue];
     if (idx < 0 || idx >= (NSInteger)g_rewriteRules.count) return;
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"删除规则"
-        message:[NSString stringWithFormat:@"确定删除这条规则？\n%@", ((MFRewriteRule *)g_rewriteRules[idx]).pattern]
-        preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+    // v2.58.197: 插件风格确认弹层(替代系统 UIAlertController — 割裂 bug)
+    NSString *pat = ((MFRewriteRule *)g_rewriteRules[idx]).pattern;
+    mfConfirmSheet(@"删除规则", [NSString stringWithFormat:@"确定删除这条规则？\n%@", pat], @"删除", YES, ^{
         mfRemoveRule(idx);
         mfPopPage(); mfShowNetworkModifyPage();
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    UIViewController *vc = g_mfPanelRootVC;
-    if (vc) [vc presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 // 保存规则（旧版编辑页，兼容保留）
@@ -2048,9 +2163,7 @@ void mfShowLabPage(void) {
 
     NSString *pattern = [patField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (pattern.length == 0) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示" message:@"请填写匹配的 URL" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [g_mfPanelRootVC presentViewController:alert animated:YES completion:nil];
+        mfToast(@"⚠️ 请填写匹配的 URL");   // v2.58.197: 统一插件风格提示(替代系统弹窗)
         return;
     }
     NSString *matchType = matchSeg.selectedSegmentIndex == 1 ? @"url" : (matchSeg.selectedSegmentIndex == 2 ? @"regex" : @"contain");
@@ -2090,9 +2203,7 @@ void mfShowLabPage(void) {
 
     NSString *pattern = [patField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (pattern.length == 0) {
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"提示" message:@"请填写匹配的 URL" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [g_mfPanelRootVC presentViewController:alert animated:YES completion:nil];
+        mfToast(@"⚠️ 请填写匹配的 URL");   // v2.58.197: 统一插件风格提示(替代系统弹窗)
         return;
     }
     NSString *matchType = matchSeg.selectedSegmentIndex == 1 ? @"url" : (matchSeg.selectedSegmentIndex == 2 ? @"regex" : @"contain");

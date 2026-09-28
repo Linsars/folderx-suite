@@ -1185,15 +1185,11 @@ void mfShowNetworkModifyPage(void) {
     // 删除
     UIContextualAction *del = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
         title:@"删除" handler:^(UIContextualAction *a, UIView *v, void (^done)(BOOL)) {
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"删除规则"
-                message:[NSString stringWithFormat:@"确定删除这条规则？\n%@", rule.pattern]
-                preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            // v2.58.197: 插件风格确认弹层(替代系统 UIAlertController — 割裂 bug)
+            mfConfirmSheet(@"删除规则", [NSString stringWithFormat:@"确定删除这条规则？\n%@", rule.pattern], @"删除", YES, ^{
                 mfRemoveRule(idx);
                 mfToast(@"🗑️ 已删除");
-            }]];
-            [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-            [g_mfPanelRootVC presentViewController:alert animated:YES completion:nil];
+            });
             done(YES);
         }];
     del.backgroundColor = [UIColor systemRedColor];

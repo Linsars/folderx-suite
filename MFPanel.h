@@ -23,6 +23,10 @@ void mfSetWantH(CGFloat h);        // v2.58.46: 自适应卡高——mfMakePage 
 
 // ====== 轻提示 ======
 void mfToast(NSString *msg);
+// v2.58.197: 插件风格确认/输入弹层(替代系统 UIAlertController, 统一 UI 风格)
+//   在面板 overlay 内弹卡片(圆角/毛玻璃/插件按钮), 无面板时回落 keyWindow。
+void mfConfirmSheet(NSString *title, NSString *message, NSString *confirmTitle, BOOL destructive, void(^onConfirm)(void));
+void mfInputSheet(NSString *title, NSString *message, NSString *initial, BOOL multiline, void(^onSave)(NSString *text));
 
 // ====== 日志 ======
 void mfLog(NSString *fmt, ...);
