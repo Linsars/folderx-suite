@@ -3662,7 +3662,15 @@ NSDictionary *mfReconFingerprint(void) {
     //      serverSide 从没对该 app 生效过, 却给"有服务端判据"的假安全感 = 误导型蜜罐
     //   ③ 已被运行时快照 gRtWebBridge 完全取代且更准(不受大小写/命名影响)、通用(纯 WebKit 术语)。
     //   serverSide 只认运行时铁证: 没开实时日志 → 无服务端兜底(诚实: 无运行时证据不假装能判)。
-    if (gRtWebBridge && !cloud && !mach) serverSide = YES;
+    // v2.58.198: webview 型第二信号源 — 采集器 ring buffer 非空(抓到网页 fetch/XHR API 响应)。
+    //   根因(dbg_183): gRtWebBridge 只认 hostlog 里的 WKScriptMessage 桥词(mailnow FlexCall 型),
+    //   但另一大类 webview app(啪啪搜)走 fetch/XHR 拿接口判权益, 根本不打桥日志 → gRtWebBridge=0
+    //   判不出 → webinj@ 点位不生成。采集器实际抓到了网页 API 响应(ring buffer 有数据)=铁证是
+    //   webview 型(NSURLProtocol 抓不到、只有网页 JS 层能采到的请求)。二源并取, 补上 fetch/XHR 型。
+    extern NSArray *mfWebCapBuffer(void);
+    NSArray *gWebCap = mfWebCapBuffer();
+    BOOL gWebApiCaptured = ([gWebCap isKindOfClass:[NSArray class]] && gWebCap.count > 0);
+    if ((gRtWebBridge || gWebApiCaptured) && !cloud && !mach) serverSide = YES;
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
         if ([f[@"shape"] isEqualToString:@"sk2pro"] || [f[@"shape"] isEqualToString:@"sk2get"]
@@ -3685,7 +3693,7 @@ NSDictionary *mfReconFingerprint(void) {
     else if (cloud)         verdict = [NSString stringWithFormat:@"%@ 云端订阅验证 — mock 回包 + ⚡F10 深槽装载点 双因子解锁", cloudBrands.allObjects.firstObject];
     else if (mach)          verdict = @"本地许可服务器(异常端口 MIG, 同族架构)";
     // v2.58.65: "SK2 事务流验证型"判型已废(用户定案: 实机三轮零作用=死代码)
-    else if (serverSide)    verdict = @"服务端 WebView 桥型(部分本地可解: L3 桥改写关广告/解 native UI 门; 网页会员内容服务端渲染无解)";
+    else if (serverSide)    verdict = @"网页接口权益型(WebView fetch/XHR·可本地改包: WebForge 注入改响应字段; 视频等资源若服务端二次验则边界)";
     // v2.58.75: 服务端权威判定型 — 优先于代码点播报(bplayer 案: 35 个形态点是通用
     //   判空噪声, 全 ⚡ 不亮已实证; 判定链在自家后端, 本地 patch 无意义)
     else if (srvSelfIap)    verdict = @"自研服务端权益型(无本地 SK 权益链, /iap/* 端点下发) — 本地解锁无意义, 跳过";
@@ -3755,27 +3763,27 @@ NSDictionary *mfReconFingerprint(void) {
         mfType = @"本地许可服务器型"; route = @"实验模拟页: 开 EXCPROBE 应答器";
         [ev addObject:@"EXCPORTS: 本地许可服务器(mach 协议)注册在场"];
     } else if (serverSide) {
-        // v2.58.191 (dbg_179 用户纠偏"一刀切太过"+"万一 pyide 那种弱服务器"): 服务端 WebView 桥型 ≠ 完全无解。
-        //   服务端网页【内容】(会员功能按账户 session 渲染)本地无解, 但 native 侧读的桥消息
-        //   【本地可改写】→ L3 桥权益改写关广告 + 解 native 会员 UI 门。给出这条部分本地路线。
-        //   多链兜底: 若同时扫出本地代码门(pyide 弱服务器型 = 有本地 tbz 门 + 服务端遥测), 一并给出
-        //   本地 patch 路线 — 不因"检测到服务端"就掩盖本地那条真腿(179 收据型≠无本地链同款教训)。
-        mfType = @"服务端 WebView 桥型(部分本地可解)";
-        NSMutableString *rt = [NSMutableString stringWithString:@"WebForge: 判定点列表 🌐webinj@ 点 ⚡ 注入改包(桥消息+网页 fetch/XHR 响应)"];
+        // v2.58.198 (dbg_183 定谳): webview 型二源判定(桥词 或 采集器抓到网页 API 响应)。
+        //   fetch/XHR 型(啪啪搜)不打桥日志, 靠 ring buffer 非空识别; 桥型(mailnow)靠 gRtWebBridge。
+        //   共同路线: WebForge 注入改包(webinj@ 点位)。多链兜底: 有本地代码门一并给出。
+        mfType = @"网页接口权益型(WebView fetch/XHR·部分本地可解)";
+        NSMutableString *rt = [NSMutableString stringWithString:@"WebForge: 判定点列表 🌐webinj@ 点 ⚡ 注入改包(网页 fetch/XHR 响应字段 + 桥消息)"];
         if (nRealGate > 0) [rt appendFormat:@" · 另有本地 SK2 真门 %lu 个可 ⚡(疑弱服务端+本地门多链)", (unsigned long)nRealGate];
         else if (gCodePtsInStore > 0) [rt appendFormat:@" · 另有本地代码门 %lu 个候选可 ⚡ 逐试", (unsigned long)gCodePtsInStore];
-        [rt appendString:@" · 网页纯内容服务端渲染仍无解"];
+        [rt appendString:@" · 资源(视频等)若服务端按账号二次验则为边界"];
         route = rt;
         // v2.58.196: 分析采集缓冲的权益字段组 → 生成 webinj@ 判定点入库(实验模拟页 ⚡ 执行)
         //   职责: 判型总闸(本处)读采集器 ring buffer, 分析权益字段组, 生成规则并注册点位。
         //   实验模拟页只显示点位 + ⚡; 采集/改包由 WebForge 执行器。三层各司其职。
         int nWebinj = mfReconGenWebinjPoints();
         if (nWebinj > 0) [ev addObject:[NSString stringWithFormat:@"🌐 已生成 %d 个 webinj@ 注入点(判定点列表 ⚡ 激活)", nWebinj]];
-        [ev addObject:skLine]; [ev addObject:@"WebView 桥权益标志在场(运行时观测: JS 桥下发权益键值)"];
+        [ev addObject:skLine];
+        if (gWebApiCaptured)
+            [ev addObject:[NSString stringWithFormat:@"采集器实锤: 抓到 %lu 条网页 fetch/XHR API 响应(NSURLProtocol 抓不到的网页请求)", (unsigned long)gWebCap.count]];
         if (gRtWebBridge && gRt.sample[0])
             [ev addObject:[NSString stringWithFormat:@"运行时实锤(实时日志): WebView JS 桥下发权益「%s」", gRt.sample]];
         if (gRt.entReadNo > 0)
-            [ev addObject:[NSString stringWithFormat:@"native 读桥权益未解锁 %d 次 → L3 可拦改(网页内容仍服务端控)", gRt.entReadNo]];
+            [ev addObject:[NSString stringWithFormat:@"native 读桥权益未解锁 %d 次 → 可拦改", gRt.entReadNo]];
         if (nRealGate > 0 || gCodePtsInStore > 0)
             [ev addObject:[NSString stringWithFormat:@"⚠ 同时扫出本地代码门(真门 %lu · 入库 %lu) — 疑多链, 本地门也可试", (unsigned long)nRealGate, (unsigned long)gCodePtsInStore]];
     } else if (srvSelfIap) {
