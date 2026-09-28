@@ -2935,6 +2935,28 @@ static void mfWJHarvest(id obj, NSString *prefix, NSMutableDictionary *set) {
         }
     }
 }
+// 请求身份键探测(通用, 反过拟合): 从采集到的响应 body 里找"身份类"键名(登录态凭证),
+//   这类站把权益/次数限制绑在带身份的请求上, 抹掉身份键走匿名请求 → 服务端不按 uid 裁决。
+//   不硬编码 "token" 单值 —— 认通用身份键族(token/uid/sign/session/auth/ticket...),
+//   且只在"该键确实在响应里出现过(=站点在用它当身份)"时才建议抹, 避免瞎抹无关参数。
+static BOOL mfWJIsIdentityKey(NSString *key) {
+    NSString *k = [key lowercaseString]; const char *c = k.UTF8String; if (!c) return NO;
+    const char *idk[] = {"token","uid","userid","user_id","sign","signature","session","sessionid",
+        "auth","authorization","ticket","access_key","accesskey","secret","credential"};
+    for (int i=0;i<(int)(sizeof(idk)/sizeof(idk[0]));i++) if (strstr(c,idk[i])) return YES;
+    return NO;
+}
+// 递归收集响应里出现的身份键名(短名, 非点路径 — 请求参数是平铺的)。
+static void mfWJHarvestIdentity(id obj, NSMutableSet *idKeys) {
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        for (NSString *k in [(NSDictionary *)obj allKeys]) {
+            if (mfWJIsIdentityKey(k)) [idKeys addObject:k];
+            mfWJHarvestIdentity(((NSDictionary *)obj)[k], idKeys);
+        }
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *a = obj; for (NSUInteger i=0;i<a.count && i<10;i++) mfWJHarvestIdentity(a[i], idKeys);
+    }
+}
 // 生成 webinj@ 点位并入库, 返回生成数。app-agnostic: 全从运行时采集数据推导, 零 app 硬编码。
 static int mfReconGenWebinjPoints(void) {
     extern NSArray *mfWebCapBuffer(void);
@@ -2948,14 +2970,19 @@ static int mfReconGenWebinjPoints(void) {
     // 按 url 去重(同接口多次响应取字段并集 + 存最近一次整条 body 快照供编辑参考)
     NSMutableDictionary<NSString *, NSMutableDictionary *> *byURL = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSString *, id> *bodyByURL = [NSMutableDictionary dictionary];
+    NSMutableSet *idKeysAll = [NSMutableSet set];   // 全站响应里出现过的身份键(供 req.stripKeys)
     for (NSDictionary *env in buf) {
         if (![env isKindOfClass:[NSDictionary class]]) continue;
         NSString *u = env[@"u"]; id body = env[@"b"];
         if (![u isKindOfClass:[NSString class]] || !u.length) continue;
+        mfWJHarvestIdentity(body, idKeysAll);
         NSMutableDictionary *set = byURL[u] ?: [NSMutableDictionary dictionary];
         mfWJHarvest(body, @"", set);          // 权益字段组分析
         if (set.count) { byURL[u] = set; if (body) bodyByURL[u] = body; }
     }
+    // 资源接口特征(通用, 非 app 特定路径): 播放/下载/内容类接口才建议抹身份走匿名。
+    //   反过拟合: 不写死 "/java/show"; 认通用资源动词子串。命中才带 req.stripKeys。
+    NSArray *resourceHints = @[@"show",@"play",@"vod",@"video",@"media",@"stream",@"detail",@"content",@"watch",@"download"];
     int n = 0;
     for (NSString *u in byURL) {
         NSDictionary *set = byURL[u];
@@ -2964,16 +2991,23 @@ static int mfReconGenWebinjPoints(void) {
         // recipe: set=改写覆盖层(自动分析出的权益字段组); sample=整条原始 body 快照(编辑时看完整结构)
         NSMutableDictionary *recipe = [@{ @"u": u, @"set": set } mutableCopy];
         if (bodyByURL[u]) recipe[@"sample"] = bodyByURL[u];   // 用户要的"整条传过去"参考
+        // req.stripKeys: 仅资源类接口 + 站点确实在用身份键时才建议(Rusku stripToken 通用化)。
+        //   条件双保险防过拟合: ① url 含通用资源动词 ② 响应里出现过身份键。默认 off, 用户可编辑删。
+        NSString *ul = [u lowercaseString];
+        BOOL isResource = NO; for (NSString *h in resourceHints) if ([ul containsString:h]) { isResource = YES; break; }
+        if (isResource && idKeysAll.count) recipe[@"req"] = @{ @"stripKeys": [idKeysAll allObjects] };
+        NSString *note = [NSString stringWithFormat:@"WebView 规则注入: %@ 改 %lu 字段%@", u, (unsigned long)set.count,
+                          recipe[@"req"] ? @" +匿名请求(抹身份键)" : @""];
         NSDictionary *pt = @{
             @"img": img, @"sym": sym, @"shape": @"webinj", @"kind": @"webforge",
             @"vmaddr": @0, @"slide": @0, @"score": @(90), @"on": @NO,
-            @"note": [NSString stringWithFormat:@"WebView 规则注入: %@ 改 %lu 字段", u, (unsigned long)set.count],
-            @"recipe": recipe,
+            @"note": note, @"recipe": recipe,
         };
         extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
         mfAppPatchEntDumpsMerge(@[pt]);
         n++;
-        mfLog(@"[webinj-gen] ✅ 注册 %@ (改 %lu 字段: %@)", sym, (unsigned long)set.count, [set.allKeys componentsJoinedByString:@","]);
+        mfLog(@"[webinj-gen] ✅ 注册 %@ (改 %lu 字段: %@%@)", sym, (unsigned long)set.count, [set.allKeys componentsJoinedByString:@","],
+              recipe[@"req"] ? [@" · req抹: " stringByAppendingString:[[idKeysAll allObjects] componentsJoinedByString:@","]] : @"");
     }
     mfLog(@"[webinj-gen] 生成 %d 个 webinj@ 判定点(默认 off, 判定点列表 ⚡ 激活)", n);
     return n;

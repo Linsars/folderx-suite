@@ -761,8 +761,14 @@ NSArray *mfActiveWebinjRecipes(void) {
     for (NSDictionary *m in g_entDumps) {
         if (![m[@"sym"] hasPrefix:@"webinj@"] || ![m[@"on"] boolValue]) continue;
         NSDictionary *rc = m[@"recipe"];
-        if ([rc isKindOfClass:[NSDictionary class]] && [rc[@"u"] length] && [rc[@"set"] isKindOfClass:[NSDictionary class]])
-            [out addObject:@{ @"u": rc[@"u"], @"set": rc[@"set"] }];
+        if (![rc isKindOfClass:[NSDictionary class]] || ![rc[@"u"] length]) continue;
+        // v2.58.199: 透传 set(响应改写) + req(请求抹参数) + ls(localStorage), 三能力都要传给 JS。
+        //   至少有一个能力字段才纳入(纯 sample 快照无动作的不激活)。
+        NSMutableDictionary *r = [NSMutableDictionary dictionaryWithObject:rc[@"u"] forKey:@"u"];
+        if ([rc[@"set"] isKindOfClass:[NSDictionary class]] && [rc[@"set"] count]) r[@"set"] = rc[@"set"];
+        if ([rc[@"req"] isKindOfClass:[NSDictionary class]]) r[@"req"] = rc[@"req"];
+        if ([rc[@"ls"] isKindOfClass:[NSDictionary class]] && [rc[@"ls"] count]) r[@"ls"] = rc[@"ls"];
+        if (r[@"set"] || r[@"req"] || r[@"ls"]) [out addObject:r];
     }
     return out;
 }
@@ -1301,12 +1307,14 @@ static UITextView *g_apEditor = nil;
         st.text = on ? @"💉✓ 状态注入·B — 冷启动自动重打" : @"💉 状态注入·B(disc强制active) — 左划⚡";
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemPurpleColor];
     } else if ([sym hasPrefix:@"webinj@"]) {
-        // v2.58.196: WebView 规则注入点 — 显示接口 URL + 改写字段数
+        // v2.58.196/199: WebView 规则注入点 — 显示接口 URL + 改写字段数 + 是否带请求改写
         NSDictionary *rc = d[@"recipe"];
         NSString *u = [rc isKindOfClass:[NSDictionary class]] ? (rc[@"u"] ?: @"?") : @"?";
         NSUInteger nset = [rc[@"set"] isKindOfClass:[NSDictionary class]] ? [rc[@"set"] count] : 0;
-        st.text = on ? [NSString stringWithFormat:@"🌐✓ 网页注入 %@(改%lu字段) — 冷启重打", u, (unsigned long)nset]
-                     : [NSString stringWithFormat:@"🌐 网页规则注入 %@(改%lu字段) — 左划⚡/编辑", u, (unsigned long)nset];
+        BOOL hasReq = [rc[@"req"] isKindOfClass:[NSDictionary class]];
+        NSString *tag = hasReq ? @"改响应+匿名请求" : @"改响应";
+        st.text = on ? [NSString stringWithFormat:@"🌐✓ 网页注入 %@(%@ %lu字段) — 冷启重打", u, tag, (unsigned long)nset]
+                     : [NSString stringWithFormat:@"🌐 网页规则注入 %@(%@ %lu字段) — 左划⚡/编辑", u, tag, (unsigned long)nset];
         st.textColor = on ? [UIColor systemGreenColor] : [UIColor systemBlueColor];
     } else if ([shape isEqualToString:@"bool"]) {
         st.text = on ? @"💾✓ Bool判定 — 冷启动自动重打" : @"✓ Bool判定 — 左划⚡(即持久)";
@@ -1819,24 +1827,26 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
     mfAppPatchEntDumpDelete(sym);
     mfToast(@"✂ 已删除点位");
 }
-// v2.58.196/197: webinj@ 规则编辑 — 插件风格输入弹层(替代系统 UIAlertController textField)。
+// v2.58.196/199: webinj@ 规则编辑 — 插件风格输入弹层, 编辑整条 recipe(set 响应改写 + req 请求改写 + ls localStorage)。
 - (void)mfAPEntEditWebinj:(NSString *)sym {
     NSDictionary *cur = nil;
     for (NSDictionary *m in mfAppPatchEntDumps())
         if ([m[@"sym"] isEqualToString:sym]) { cur = m; break; }
-    NSDictionary *rc = cur[@"recipe"];
-    NSString *u = [rc isKindOfClass:[NSDictionary class]] ? (rc[@"u"] ?: @"?") : @"?";
-    NSDictionary *setD = [rc[@"set"] isKindOfClass:[NSDictionary class]] ? rc[@"set"] : @{};
-    NSData *jd = [NSJSONSerialization dataWithJSONObject:setD options:NSJSONWritingPrettyPrinted error:nil];
-    NSString *setStr = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{}";
+    NSDictionary *rc = [cur[@"recipe"] isKindOfClass:[NSDictionary class]] ? cur[@"recipe"] : @{};
+    NSString *u = rc[@"u"] ?: @"?";
+    // 编辑整条 recipe(去掉 sample 快照, 太长; 保留 set/req/ls 可改)
+    NSMutableDictionary *editable = [rc mutableCopy];
+    [editable removeObjectForKey:@"sample"];
+    NSData *jd = [NSJSONSerialization dataWithJSONObject:editable options:NSJSONWritingPrettyPrinted error:nil];
+    NSString *rcStr = jd ? [[NSString alloc] initWithData:jd encoding:NSUTF8StringEncoding] : @"{}";
     mfInputSheet([NSString stringWithFormat:@"编辑注入规则 %@", u],
-                 @"改写字段 JSON（键=点路径 如 data.vip，值=目标值）:",
-                 setStr, YES, ^(NSString *txt) {
+                 @"整条规则 JSON:\nset=改响应字段(点路径) · req.stripKeys=请求抹参数 · ls=localStorage",
+                 rcStr, YES, ^(NSString *txt) {
         NSData *nd = [(txt ?: @"{}") dataUsingEncoding:NSUTF8StringEncoding];
-        NSDictionary *newSet = nd ? [NSJSONSerialization JSONObjectWithData:nd options:0 error:nil] : nil;
-        if (![newSet isKindOfClass:[NSDictionary class]]) { mfToast(@"⛔ JSON 格式错, 未保存"); return; }
+        NSDictionary *newRc = nd ? [NSJSONSerialization JSONObjectWithData:nd options:0 error:nil] : nil;
+        if (![newRc isKindOfClass:[NSDictionary class]] || ![newRc[@"u"] length]) { mfToast(@"⛔ JSON 格式错(需含 u 字段), 未保存"); return; }
         extern void mfAppPatchEntSetRecipe(NSString *, NSDictionary *);
-        mfAppPatchEntSetRecipe(sym, @{ @"u": u, @"set": newSet });
+        mfAppPatchEntSetRecipe(sym, newRc);
         [(id)g_mfCtrl mfAPEntPatchNow:sym];   // 重新激活(采集器就位 + 规则集刷新)
         mfToast(@"✅ 规则已存 · 重启 app 生效");
     });
