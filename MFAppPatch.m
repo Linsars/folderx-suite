@@ -768,7 +768,8 @@ NSArray *mfActiveWebinjRecipes(void) {
         if ([rc[@"set"] isKindOfClass:[NSDictionary class]] && [rc[@"set"] count]) r[@"set"] = rc[@"set"];
         if ([rc[@"req"] isKindOfClass:[NSDictionary class]]) r[@"req"] = rc[@"req"];
         if ([rc[@"ls"] isKindOfClass:[NSDictionary class]] && [rc[@"ls"] count]) r[@"ls"] = rc[@"ls"];
-        if (r[@"set"] || r[@"req"] || r[@"ls"]) [out addObject:r];
+        if ([rc[@"bridge"] boolValue]) r[@"bridge"] = @YES;   // v2.58.200: 腿A 桥改写点位(webinj@bridge)
+        if (r[@"set"] || r[@"req"] || r[@"ls"] || r[@"bridge"]) [out addObject:r];
     }
     return out;
 }

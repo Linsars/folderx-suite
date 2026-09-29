@@ -2958,15 +2958,30 @@ static void mfWJHarvestIdentity(id obj, NSMutableSet *idKeys) {
     }
 }
 // 生成 webinj@ 点位并入库, 返回生成数。app-agnostic: 全从运行时采集数据推导, 零 app 硬编码。
-static int mfReconGenWebinjPoints(void) {
+// v2.58.200: 桥型证据(gRtWebBridge)也生成点位 — webinj@bridge。腿A(桥消息改写)从此只认
+//   这个点位(⚡ 激活才改包), 不再随采集器恒开 — 196"删 L3 独立开关并入判定点体系"的落地补完。
+static int mfReconGenWebinjPoints(BOOL bridgeEv) {
     extern NSArray *mfWebCapBuffer(void);
-    NSArray *buf = mfWebCapBuffer();
-    if (![buf isKindOfClass:[NSArray class]] || !buf.count) {
-        mfLog(@"[webinj-gen] 采集缓冲空(未浏览会员页?) — 无接口可分析, 0 点");
-        return 0;
-    }
     NSString *mainPath = [[NSBundle mainBundle] executablePath];
     NSString *img = mainPath ? [mainPath lastPathComponent] : @"main";
+    int n = 0;
+    if (bridgeEv) {
+        NSDictionary *bpt = @{
+            @"img": img, @"sym": @"webinj@bridge", @"shape": @"webinj", @"kind": @"webforge",
+            @"vmaddr": @0, @"slide": @0, @"score": @(90), @"on": @NO,
+            @"note": @"WebView 桥消息权益改写(WKScriptMessage body: 权益键假→真, 通用键族)",
+            @"recipe": @{ @"u": @"__bridge", @"bridge": @YES },
+        };
+        extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
+        mfAppPatchEntDumpsMerge(@[bpt]);
+        n++;
+        mfLog(@"[webinj-gen] ✅ 注册 webinj@bridge (桥消息权益改写, ⚡ 激活后生效)");
+    }
+    NSArray *buf = mfWebCapBuffer();
+    if (![buf isKindOfClass:[NSArray class]] || !buf.count) {
+        mfLog(@"[webinj-gen] 采集缓冲空(未浏览网页?) — 无接口可分析");
+        return n;
+    }
     // 按 url 去重(同接口多次响应取字段并集 + 存最近一次整条 body 快照供编辑参考)
     NSMutableDictionary<NSString *, NSMutableDictionary *> *byURL = [NSMutableDictionary dictionary];
     NSMutableDictionary<NSString *, id> *bodyByURL = [NSMutableDictionary dictionary];
@@ -2983,7 +2998,6 @@ static int mfReconGenWebinjPoints(void) {
     // 资源接口特征(通用, 非 app 特定路径): 播放/下载/内容类接口才建议抹身份走匿名。
     //   反过拟合: 不写死 "/java/show"; 认通用资源动词子串。命中才带 req.stripKeys。
     NSArray *resourceHints = @[@"show",@"play",@"vod",@"video",@"media",@"stream",@"detail",@"content",@"watch",@"download"];
-    int n = 0;
     for (NSString *u in byURL) {
         NSDictionary *set = byURL[u];
         if (!set.count) continue;
@@ -3395,14 +3409,14 @@ NSDictionary *mfReconFingerprint(void) {
     // v2.58.191 (dbg_179 用户纠偏"万一 pyide 那种弱服务器"): gRtWebBridge **不进**硬闸门。
     //   理由: app 可能既有 WebView 桥、又有真本地门(多链, 如 bazaart verifyReceipt+sk2 / pyide tbz 本地门)。
     //   桥信号硬 block 本地点 = 又一次一刀切, 会杀掉本地那条腿(179 收据型≠无本地链教训)。
-    //   桥信号只用于: 判 serverSide 型 + 提供 L3 桥改写路线; 本地代码点照常入库作候选第二腿, 用户可试。
+    //   桥信号只用于: 判 serverSide 型 + 生成 webinj@bridge 桥改写点位(200: 腿A挂判定点门, 原恒开退役); 本地代码点照常入库作候选第二腿, 用户可试。
     //   真正的硬闸门只留结构性绝对无本地意义的(srvTicket JWT / srvSelfIap 自研后端 / obs 收据观测)。
     BOOL gBlockCodePts = srvTicket || srvSelfIap || gObsReceipt || (gObsFlow > 0);
     if (gBlockCodePts)
         mfLog(@"[f8v2] ★判型总闸: 本地代码点闸门关闭(srvTicket=%d srvSelfIap=%d obs收据=%d obs购买流=%lu) — 框架/sk2/cands 点位不入库",
               srvTicket, srvSelfIap, gObsReceipt, (unsigned long)gObsFlow);
     if (gRtWebBridge)
-        mfLog(@"[f8v2] 运行时 WebView 桥权益在场(rt桥=1): 判服务端桥型+L3 改写路线, 但本地代码点仍入库作候选(不硬闸, 防误杀多链本地腿)");
+        mfLog(@"[f8v2] 运行时 WebView 桥权益在场(rt桥=1): 判服务端桥型+桥改写点位 webinj@bridge(⚡ 激活生效), 但本地代码点仍入库作候选(不硬闸, 防误杀多链本地腿)");
     NSMutableArray *entFuncs = [NSMutableArray array];
     // v2.58.74: 轮次开始 — 标记库中点位"本轮未见", merge 时置 seen, 结束剔除陈旧
     extern void mfAppPatchEntDumpsBeginRound(void);
@@ -3701,9 +3715,20 @@ NSDictionary *mfReconFingerprint(void) {
     //   但另一大类 webview app(啪啪搜)走 fetch/XHR 拿接口判权益, 根本不打桥日志 → gRtWebBridge=0
     //   判不出 → webinj@ 点位不生成。采集器实际抓到了网页 API 响应(ring buffer 有数据)=铁证是
     //   webview 型(NSURLProtocol 抓不到、只有网页 JS 层能采到的请求)。二源并取, 补上 fetch/XHR 型。
+    // v2.58.200 (dbg_186): "非空"收紧为"含权益字段组" — 非空会被纯流量记录满足(靶子 ring buffer
+    //   里只有广告 SDK 配置 1 条、零权益字段也非空)。判型源必须是权益 API 证据, 不是"有流量"。
     extern NSArray *mfWebCapBuffer(void);
     NSArray *gWebCap = mfWebCapBuffer();
-    BOOL gWebApiCaptured = ([gWebCap isKindOfClass:[NSArray class]] && gWebCap.count > 0);
+    BOOL gWebApiCaptured = NO;
+    NSUInteger gWebCapEntN = 0;
+    if ([gWebCap isKindOfClass:[NSArray class]]) {
+        for (NSDictionary *mfcEnv in gWebCap) {
+            if (![mfcEnv isKindOfClass:[NSDictionary class]]) continue;
+            NSMutableDictionary *mfProbe = [NSMutableDictionary dictionary];
+            mfWJHarvest(mfcEnv[@"b"], @"", mfProbe);   // 含权益字段才算 webview 权益证据
+            if (mfProbe.count) { gWebCapEntN++; gWebApiCaptured = YES; }
+        }
+    }
     if ((gRtWebBridge || gWebApiCaptured) && !cloud && !mach) serverSide = YES;
     NSUInteger nCodePts = 0;
     for (NSDictionary *f in sk2pts)
@@ -3798,7 +3823,7 @@ NSDictionary *mfReconFingerprint(void) {
         [ev addObject:@"EXCPORTS: 本地许可服务器(mach 协议)注册在场"];
     } else if (serverSide) {
         // v2.58.198 (dbg_183 定谳): webview 型二源判定(桥词 或 采集器抓到网页 API 响应)。
-        //   fetch/XHR 型(啪啪搜)不打桥日志, 靠 ring buffer 非空识别; 桥型(mailnow)靠 gRtWebBridge。
+        //   fetch/XHR 型不打桥日志, 靠 ring buffer 含权益字段识别(200 收紧); 桥型靠 gRtWebBridge。
         //   共同路线: WebForge 注入改包(webinj@ 点位)。多链兜底: 有本地代码门一并给出。
         mfType = @"网页接口权益型(WebView fetch/XHR·部分本地可解)";
         NSMutableString *rt = [NSMutableString stringWithString:@"WebForge: 判定点列表 🌐webinj@ 点 ⚡ 注入改包(网页 fetch/XHR 响应字段 + 桥消息)"];
@@ -3809,11 +3834,11 @@ NSDictionary *mfReconFingerprint(void) {
         // v2.58.196: 分析采集缓冲的权益字段组 → 生成 webinj@ 判定点入库(实验模拟页 ⚡ 执行)
         //   职责: 判型总闸(本处)读采集器 ring buffer, 分析权益字段组, 生成规则并注册点位。
         //   实验模拟页只显示点位 + ⚡; 采集/改包由 WebForge 执行器。三层各司其职。
-        int nWebinj = mfReconGenWebinjPoints();
+        int nWebinj = mfReconGenWebinjPoints(gRtWebBridge);
         if (nWebinj > 0) [ev addObject:[NSString stringWithFormat:@"🌐 已生成 %d 个 webinj@ 注入点(判定点列表 ⚡ 激活)", nWebinj]];
         [ev addObject:skLine];
         if (gWebApiCaptured)
-            [ev addObject:[NSString stringWithFormat:@"采集器实锤: 抓到 %lu 条网页 fetch/XHR API 响应(NSURLProtocol 抓不到的网页请求)", (unsigned long)gWebCap.count]];
+            [ev addObject:[NSString stringWithFormat:@"采集器实锤: 抓到 %lu 条网页 fetch/XHR API 响应, 其中 %lu 条含权益字段(NSURLProtocol 抓不到的网页请求)", (unsigned long)gWebCap.count, (unsigned long)gWebCapEntN]];
         if (gRtWebBridge && gRt.sample[0])
             [ev addObject:[NSString stringWithFormat:@"运行时实锤(实时日志): WebView JS 桥下发权益「%s」", gRt.sample]];
         if (gRt.entReadNo > 0)

@@ -11,7 +11,7 @@
 //   · 判型/生成规则 = MFRecon 的活(读 ring buffer 分析权益字段组 → 生成 webinj@ 点位)。
 //   · 激活/持久化/删除/编辑 = 实验模拟页判定点卡片(与 sk2vfy@/hookinj@ 同一 UI)。
 // 【机理】
-//   腿A(桥消息): swizzle -[WKScriptMessage body] — postMessage 桥型(mailnow FlexCall)。
+//   腿A(桥消息): swizzle -[WKScriptMessage body] — postMessage 桥型。200: 门=webinj@bridge 点位激活, 不再恒开。
 //   腿B(响应改写): swizzle -[WKWebView init...] → WKUserScript(DocStart)注入通用引擎,
 //     hook fetch/XHR, 编码自适应(明文/base64反转/base64), 按 __MFR 规则改接口响应字段。
 // 【app-agnostic】JS 骨架固定零 app 硬编码; app 特定的只有 recipe 规则数据(在判定点库)。
@@ -98,9 +98,17 @@ static id wbRewriteObject(id obj, BOOL *changed) {
     }
     return obj;
 }
+// v2.58.200: 腿A 门 — 桥改写不再随采集器恒开(196"删 L3 并入判定点"落地补完, dbg_186 纠)。
+//   只在判定点库存在激活的 webinj@bridge 点位(⚡)时改写; 动态读, 激活/失活即时生效。
+static BOOL mfWFbridgeActive(void) {
+    extern NSArray *mfActiveWebinjRecipes(void);
+    for (NSDictionary *r in mfActiveWebinjRecipes())
+        if ([r[@"bridge"] boolValue]) return YES;
+    return NO;
+}
 static id wb_body(id self, SEL _cmd) {
     id b = g_origBody ? ((id(*)(id,SEL))g_origBody)(self, _cmd) : nil;
-    if (!g_wbOn || !b) return b;
+    if (!g_wbOn || !b || !mfWFbridgeActive()) return b;
     BOOL changed = NO;
     id nb = wbRewriteObject(b, &changed);
     if (changed) {
@@ -136,6 +144,10 @@ static NSString *mfWFActiveRulesJSON(void) {
     extern NSArray *mfActiveWebinjRecipes(void);
     NSArray *rules = mfActiveWebinjRecipes();
     if (![rules isKindOfClass:[NSArray class]]) rules = @[];
+    // v2.58.200: 桥点位(bridge=1)不进 URL 规则表 — 它不是接口改写规则, 腿A在 wb_body 消费。
+    NSMutableArray *mfcUrlRules = [NSMutableArray array];
+    for (NSDictionary *r in rules) if (![r[@"bridge"] boolValue]) [mfcUrlRules addObject:r];
+    rules = mfcUrlRules;
     NSData *d = [NSJSONSerialization dataWithJSONObject:rules options:0 error:nil];
     return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : @"[]";
 }
