@@ -2973,9 +2973,13 @@ static int mfReconGenWebinjPoints(BOOL bridgeEv) {
             @"recipe": @{ @"u": @"__bridge", @"bridge": @YES },
         };
         extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
-        mfAppPatchEntDumpsMerge(@[bpt]);
-        n++;
-        mfLog(@"[webinj-gen] ✅ 注册 webinj@bridge (桥消息权益改写, ⚡ 激活后生效)");
+        // v2.58.201: 看 merge 实际返回 — 被墓碑拒绝时旧版仍打"✅注册"= 虚报(dbg 真机 ⚰+✅ 连打)
+        if (mfAppPatchEntDumpsMerge(@[bpt])) {
+            n++;
+            mfLog(@"[webinj-gen] ✅ 注册 webinj@bridge (桥消息权益改写, ⚡ 激活后生效)");
+        } else {
+            mfLog(@"[webinj-gen] ⚰ webinj@bridge 被墓碑挡回(已删不复活) — ♻ 清墓碑后重扫入库");
+        }
     }
     NSArray *buf = mfWebCapBuffer();
     if (![buf isKindOfClass:[NSArray class]] || !buf.count) {
@@ -3018,7 +3022,10 @@ static int mfReconGenWebinjPoints(BOOL bridgeEv) {
             @"note": note, @"recipe": recipe,
         };
         extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
-        mfAppPatchEntDumpsMerge(@[pt]);
+        if (!mfAppPatchEntDumpsMerge(@[pt])) {   // v2.58.201: 墓碑拒绝不虚报
+            mfLog(@"[webinj-gen] ⚰ %@ 被墓碑挡回(已删不复活) — ♻ 清墓碑后重扫入库", sym);
+            continue;
+        }
         n++;
         mfLog(@"[webinj-gen] ✅ 注册 %@ (改 %lu 字段: %@%@)", sym, (unsigned long)set.count, [set.allKeys componentsJoinedByString:@","],
               recipe[@"req"] ? [@" · req抹: " stringByAppendingString:[[idKeysAll allObjects] componentsJoinedByString:@","]] : @"");

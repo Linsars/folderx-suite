@@ -6,6 +6,9 @@
 //   · 采集器(mfWebCollectorInstall): 随网络捕获启动就跑, swizzle WKWebView init, 注入
 //     只读 JS hook fetch/XHR → 响应解码回传 → 存 ring buffer(供 MFRecon 侦查读) + 并进
 //     网络分析记录。不分析、不生成、不改包。
+//   · 页面样本(v2.58.201): DocEnd 引擎回传 document.outerHTML → Documents/MinisFix/page_*.html
+//     — 主文档是抓包盲区(NSURLProtocol/fetch/XHR 三层都看不见), 判定常烘进 HTML(config_domain 案),
+//     落盘给实验层直接定位门, 不再依赖用户 Surge 肉眼翻。
 //   · 执行器(webinj@ 判定点驱动): 注入的同一段 JS 按"激活规则集"改包。规则集 = 判定点库里
 //     on=YES 的 webinj@ 点位的 recipe(唯一事实源 = 判定点库, 本模块不自存规则)。
 //   · 判型/生成规则 = MFRecon 的活(读 ring buffer 分析权益字段组 → 生成 webinj@ 点位)。
@@ -137,6 +140,8 @@ static IMP  g_wfOrigInitCoder = NULL;
 static char kWFInjectedKey;
 static long g_wfInjected = 0;
 static id   g_wfCapHandler = nil;
+static long g_wfPgN = 0;               // v2.58.201: 页面样本计数(page_*.html 落盘)
+static NSMutableSet *g_wfPgSeen = nil;  // v2.58.201: 本进程已写页去重
 
 // 激活规则集 = 判定点库里 on=YES 的 webinj@ 点位 recipe(唯一事实源, 本模块不自存)。
 // MFAppPatch 暴露 mfActiveWebinjRecipes() 返回 [{u:..,set:{..}}, ...]。
@@ -177,6 +182,8 @@ static NSString *mfWFBuiltinJS(void) {
     @"function enc(j,e){if(e=='rb64')return rev(b2b(new TextEncoder().encode(asc(j))));if(e=='b64')return b2b(new TextEncoder().encode(asc(j)));return JSON.stringify(j);}"
     @"function sp(o,path,v){var k=(''+path).split('.'),c=o;for(var i=0;i<k.length-1;i++){if(typeof c[k[i]]!='object'||c[k[i]]==null)c[k[i]]={};c=c[k[i]];}c[k[k.length-1]]=v;}"
     @"function post(o){if(!C)return;try{webkit.messageHandlers.mfwebcap.postMessage(JSON.stringify(o).slice(0,4000));}catch(e){}}"
+    @"function postp(o){if(!C)return;try{webkit.messageHandlers.mfwebcap.postMessage(JSON.stringify(o).slice(0,1000000));}catch(e){}}"
+    @"try{document.addEventListener('DOMContentLoaded',function(){try{var h='';try{h=document.documentElement.outerHTML;}catch(e){}if(h&&h.length>200)postp({pg:location.href,h:h});}catch(e){}},{once:true});}catch(e){}"
     @"function app(u,j){var ks=[];for(var i=0;i<R.length;i++){var r=R[i];if((''+u).indexOf(r.u)<0)continue;if(r.set)for(var p in r.set){sp(j,p,r.set[p]);ks.push(p);}}return ks;}"
     @"function reqKeys(u){for(var i=0;i<R.length;i++){var r=R[i];if((''+u).indexOf(r.u)>=0&&r.req&&r.req.stripKeys)return r.req.stripKeys;}return null;}"
     @"function strip(u,body){var ks=reqKeys(u);if(!ks||body==null)return body;try{"
@@ -223,6 +230,38 @@ static NSString *mfWFScript(void) {
         }
         if (env[@"rq"]) {
             wbLog(@"[webrq] ★请求改写生效 %@ 抹参数: %@", env[@"rq"], [env[@"k"] componentsJoinedByString:@","]);
+            return;
+        }
+        // v2.58.201: 页面样本信封 {pg:url, h:html} — 主文档 HTML 落盘(抓包盲区补洞)
+        if (env[@"pg"]) {
+            NSString *html = [env[@"h"] isKindOfClass:[NSString class]] ? env[@"h"] : nil;
+            NSString *url = [env[@"pg"] isKindOfClass:[NSString class]] ? env[@"pg"] : @"?";
+            if (html.length > 200) {
+                if (!g_wfPgSeen) g_wfPgSeen = [NSMutableSet set];
+                // 文件名 = URL 末段清洗(去 query/防路径穿越/非法字符 → '_'), 每进程每页首载写一次
+                NSString *name = nil;
+                @try { NSURL *pu = [NSURL URLWithString:url]; name = pu.path.lastPathComponent; } @catch (__unused NSException *e) {}
+                if (!name.length) name = @"page.html";
+                NSMutableString *sb = [NSMutableString string];
+                for (NSUInteger i = 0; i < name.length && i < 60; i++) {
+                    unichar c = [name characterAtIndex:i];
+                    BOOL okc = (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='.'||c=='-'||c=='_';
+                    [sb appendFormat:@"%C", okc ? c : '_'];
+                }
+                name = sb.length >= 3 ? [sb copy] : @"page.html";
+                if ([g_wfPgSeen containsObject:name]) return;
+                [g_wfPgSeen addObject:name];
+                @try {
+                    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/MinisFix"];
+                    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                    g_wfPgN++;
+                    NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"page_%03ld_%@", (long)g_wfPgN, name]];
+                    NSError *werr = nil;
+                    if ([html writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&werr])
+                        wbLog(@"[webcap] ★页面样本 #%ld %luB %@ → Documents/MinisFix/%@", (long)g_wfPgN, (unsigned long)html.length, url, path.lastPathComponent);
+                    else wbLog(@"[webcap] ✗页面样本写盘失败 %@", werr.localizedDescription ?: @"-");
+                } @catch (__unused NSException *e) {}
+            }
             return;
         }
         // 采集信封 {u,e,b}
