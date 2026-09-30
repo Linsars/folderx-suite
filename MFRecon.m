@@ -2979,7 +2979,7 @@ static int mfReconGenDomPoints(void) {
     NSMutableArray *pgf = [NSMutableArray array];
     for (NSString *f in files) if ([f hasPrefix:@"page_"]) [pgf addObject:f];
     if (!pgf.count) return 0;   // 无样本(未浏览过网页) — 静默, 不是错误
-    [pgf sortUsingSelector:@selector(compare)];
+    [pgf sortUsingSelector:@selector(compare:)];
     if (pgf.count > 12) [pgf removeObjectsInRange:NSMakeRange(12, pgf.count - 12)];
     static NSArray *payw; static NSSet *stopw;
     static dispatch_once_t onceW;
@@ -3891,7 +3891,7 @@ NSDictionary *mfReconFingerprint(void) {
     else if (skLocal)       verdict = [NSString stringWithFormat:@"纯 StoreKit 本地校验型(%@ · %@)", skType, validator];
     else                    verdict = @"未发现订阅验证 SDK";
     if (cloudBrands.count > 1) {
-        NSString *names = [[cloudBrands.allObjects sortedArrayUsingSelector:@selector(compare)] componentsJoinedByString:@"/"];
+        NSString *names = [[cloudBrands.allObjects sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@"/"];
         verdict = [verdict stringByReplacingOccurrencesOfString:cloudBrands.allObjects.firstObject
                                                      withString:[NSString stringWithFormat:@"%@(疑似多 SDK)", names]];
     }
