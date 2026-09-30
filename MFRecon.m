@@ -2973,6 +2973,19 @@ static NSString *mfWJpgFirst(NSString *pat, NSString *s) {
     NSRange r = [m rangeAtIndex:1];
     return r.location == NSNotFound ? nil : [s substringWithRange:r];
 }
+// v2.58.205: 全匹配版 — 开门函数查找必须大小写不敏感(小写 token "owndomain" 对驼峰
+//   "openOwnDomainWizard")。204 真机铁证: 大小写敏感导致只摘到 killclick("只拦跳转")。
+static NSArray<NSString *> *mfWJpgAll(NSString *pat, NSString *s) {
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+    if (!re) return @[];
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSTextCheckingResult *m in [re matchesInString:s options:0 range:NSMakeRange(0, s.length)])
+        if (m.numberOfRanges >= 2) {
+            NSRange r = [m rangeAtIndex:1];
+            if (r.location != NSNotFound) [out addObject:[s substringWithRange:r]];
+        }
+    return out;
+}
 static int mfReconGenDomPoints(void) {
     NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/MinisFix"];
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
@@ -3029,9 +3042,9 @@ static int mfReconGenDomPoints(void) {
             for (NSString *t in [sel.lowercaseString componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"#.-_[]'\""]])
                 if (t.length >= 4 && ![stopw containsObject:t]) [toks addObject:t];
             NSMutableSet *hit = [NSMutableSet set];
-            for (NSString *t in toks) {
-                NSString *g = mfWJpgFirst([NSString stringWithFormat:@"function\\s+(open[A-Za-z0-9_]*%@[A-Za-z0-9_]*)\\s*\\(", [NSRegularExpression escapedPatternForString:t]], html);
-                if (g.length) [hit addObject:g];
+            for (NSString *t in toks) {   // v2.58.205: 全函数名列表 + lowercase contains(大小写不敏感, 修204"只拦跳转")
+                for (NSString *f2 in mfWJpgAll(@"function\\s+(open[A-Za-z0-9_]+)\\s*\\(", html))
+                    if ([f2.lowercaseString containsString:t]) [hit addObject:f2];
             }
             NSString *call = nil;
             if (hit.count == 1) {
@@ -3040,8 +3053,12 @@ static int mfReconGenDomPoints(void) {
                 call = [args stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]].length
                      ? [fnm stringByAppendingString:@"('')"] : [fnm stringByAppendingString:@"()"];
             }
-            NSMutableArray *dom = [NSMutableArray arrayWithObject:@{ @"k": @"killclick", @"sel": sel }];
+            // v2.58.205: 同选择器只发一条 op — 引擎 killclick 的 stopImmediatePropagation 会吞掉
+            //   同节点其它监听器, 双 op(killclick+clickjs)会让 clickjs 永不执行; clickjs 自身
+            //   含拦截(preventDefault+stopPropagation), 单条即完整; 无开门函数才退化为 killclick。
+            NSMutableArray *dom = [NSMutableArray array];
             if (call) [dom addObject:@{ @"k": @"clickjs", @"sel": sel, @"v": call }];
+            else [dom addObject:@{ @"k": @"killclick", @"sel": sel }];
             NSDictionary *pt = @{ @"img": img, @"sym": [NSString stringWithFormat:@"webinj@dom:%@", sel],
                 @"shape": @"webinj", @"kind": @"webforge", @"vmaddr": @0, @"slide": @0, @"score": @92, @"on": @NO,
                 @"note": [NSString stringWithFormat:@"页面付费门 %@ → %@ (%@)", sel, call ?: @"killclick", u],
