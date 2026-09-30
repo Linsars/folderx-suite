@@ -171,8 +171,8 @@ static NSString *mfWFBuiltinJS(void) {
     @"var R=window.__MFR||[];var C=window.__MFCAP;"
     @"try{for(var i=0;i<R.length;i++){var lr=R[i];if(lr.ls){for(var lk in lr.ls){try{localStorage.setItem(lk,''+lr.ls[lk]);}catch(e){}}}}}catch(e){}"
     @"try{for(var i=0;i<R.length;i++){var dr=R[i];if(!dr.dom||(''+location.href).indexOf(dr.u)<0)continue;for(var j=0;j<dr.dom.length;j++){var op=dr.dom[j];if(!op||!op.k)continue;"
-    @"if(op.sel&&(op.k=='killclick'||op.k=='clickjs')){(function(s,v,kk){document.addEventListener('click',function(ev){try{var t=ev.target;while(t&&t.nodeType==1){if(t.matches&&t.matches(s)){ev.preventDefault();ev.stopPropagation();if(ev.stopImmediatePropagation)ev.stopImmediatePropagation();if(kk&&v){try{(0,eval)(v);}catch(e){}}return;}t=t.parentNode;}}catch(e){}},true);})(op.sel,op.v||'',op.k=='clickjs');}"
-    @"else if(op.k=='js'&&op.v){try{document.addEventListener('DOMContentLoaded',function(){try{(0,eval)(op.v);}catch(e){}},{once:true});}catch(e){}}}}}catch(e){}"
+    @"if(op.sel&&(op.k=='killclick'||op.k=='clickjs')){(function(s,v,kk){document.addEventListener('click',function(ev){try{var t=ev.target;while(t&&t.nodeType==1){if(t.matches&&t.matches(s)){post({dk:kk?'clickjs':'killclick',ss:s});ev.preventDefault();ev.stopPropagation();if(ev.stopImmediatePropagation)ev.stopImmediatePropagation();if(kk&&v){try{(0,eval)(v);post({dk:'ok',ss:s});}catch(e){post({dk:'err',ss:s});}}return;}t=t.parentNode;}}catch(e){}},true);})(op.sel,op.v||'',op.k=='clickjs');}"
+    @"else if(op.k=='js'&&op.v){try{document.addEventListener('DOMContentLoaded',function(){try{(0,eval)(op.v);post({dk:'js-ok',ss:op.v.slice(0,60)});}catch(e){post({dk:'js-err',ss:op.v.slice(0,60)});}},{once:true});}catch(e){}}}}}catch(e){}"
     @"function rev(s){return s.split('').reverse().join('');}"
     @"function b2b(b){var s='';for(var i=0;i<b.length;i++)s+=String.fromCharCode(b[i]);return btoa(s);}"
     @"function u2b(s){var b=atob(s),o=new Uint8Array(b.length);for(var i=0;i<b.length;i++)o[i]=b.charCodeAt(i);return o;}"
@@ -233,6 +233,12 @@ static NSString *mfWFScript(void) {
         }
         if (env[@"rq"]) {
             wbLog(@"[webrq] ★请求改写生效 %@ 抹参数: %@", env[@"rq"], [env[@"k"] componentsJoinedByString:@","]);
+            return;
+        }
+        // v2.58.203: 页面操作(dom)命中回执 — killclick/clickjs/js 真机验证通道(188 全程空规则
+        //   没证明 recipe.dom 死活; 这轮 ⚡ 页面门后点门按钮, 有 [webop] = 拦住了, 没有 = 判死)
+        if (env[@"dk"]) {
+            wbLog(@"[webop] ★页面操作 %@ sel=%@", env[@"dk"], env[@"ss"] ?: @"-");
             return;
         }
         // v2.58.201: 页面样本信封 {pg:url, h:html} — 主文档 HTML 落盘(抓包盲区补洞)

@@ -1187,7 +1187,6 @@ long mfAppPatchCollHits(void) { return g_apCollHits; }
 @interface MFPanelCtrl (AppPatchEnt)
 - (void)mfAPShowEntDumps;
 - (void)mfAPRestoreTombstones:(UIButton *)btn;   // v2.58.77: 清墓碑(误删真点的退路)
-- (void)mfAPAddWebinjManual;                    // v2.58.202: 手动 webinj@ recipe 创建(页面门贴 JSON)
 - (void)mfAPShowSk2List;   // v2.58.52: SK2 判别点过滤列表(与 F8v2 点位分家)
 - (void)mfAPEntPatchNow:(NSString *)sym;
 - (void)mfAPEntSetOn:(NSString *)sym on:(BOOL)on;
@@ -1620,50 +1619,14 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
     btn.backgroundColor = [UIColor systemGreenColor];
     mfToast(@"墓碑已清 — 重进侦查页即可重新发现");
 }
-// v2.58.202: 手动 webinj@ 创建 — 页面门(config_domain 硬跳转/向导被藏)非 JSON 响应可判, 人工分析
-//   页面样本(page_*.html)后贴 recipe。数据全在 recipe, 引擎 dom 操作通用 — 零单靶硬编码。
-- (void)mfAPAddWebinjManual {
-    mfInputSheet(@"➕ 手动 webinj@ 规则",
-                 @"整条 recipe JSON(必含 u=页面URL子串):\nset=改响应 · req.stripKeys=抹参数 · ls=localStorage · dom=[{k:killclick|clickjs|js, sel:, v:}]",
-                 @"{\"u\":\"\",\"dom\":[{\"k\":\"clickjs\",\"sel\":\"#\",\"v\":\"\"}]}", YES, ^(NSString *txt) {
-        NSData *nd = [(txt ?: @"") dataUsingEncoding:NSUTF8StringEncoding];
-        NSDictionary *rc = nd ? [NSJSONSerialization JSONObjectWithData:nd options:0 error:nil] : nil;
-        if (![rc isKindOfClass:[NSDictionary class]] || ![rc[@"u"] isKindOfClass:[NSString class]] || ![rc[@"u"] length]) {
-            mfToast(@"⛔ 需含 u 字段的 JSON 对象"); return;
-        }
-        NSString *img = [[NSBundle mainBundle].executablePath lastPathComponent] ?: @"main";
-        NSString *sym = [NSString stringWithFormat:@"webinj@manual%08x", arc4random_uniform(0xffffffffu)];
-        NSDictionary *pt = @{ @"img": img, @"sym": sym, @"shape": @"webinj", @"kind": @"webforge",
-            @"vmaddr": @0, @"slide": @0, @"score": @90, @"on": @NO,
-            @"note": [NSString stringWithFormat:@"手动规则: %@", rc[@"u"]], @"recipe": rc };
-        extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
-        if (!mfAppPatchEntDumpsMerge(@[pt])) { mfToast(@"⛔ 入库失败"); return; }
-        mfToast(@"✅ 已入库(off) — 左划⚡激活后重启生效");
-    });
-}
 - (void)mfAPShowEntDumps {
     UIView *page = mfMakePage(@"🎯 判定点", YES);
     g_apEntList = [[MFAPEntList alloc] init];
     NSString *shapeFilter = objc_getAssociatedObject(self, "mfAPShapeFilter");
-    // v2.58.202: 手动 webinj@ 入口 — 页面门/向导类规则(服务端模板硬编码跳转)无法从 JSON 采集自动
-    //   判出(config_domain 案), 分析页面样本(page_*.html)后由用户贴 recipe 入库。数据在 recipe,
-    //   引擎(dom 操作)通用零单靶硬编码。SK2 过滤视图不显。
-    if (!shapeFilter.length) {
-        UIButton *ba = [UIButton buttonWithType:UIButtonTypeSystem];
-        ba.frame = CGRectMake(12, 46, g_mfCardW - 24, 34);
-        ba.backgroundColor = [UIColor systemIndigoColor];
-        ba.layer.cornerRadius = 8;
-        ba.titleLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
-        [ba setTitle:@"＋ 手动 webinj@ 规则(贴 recipe JSON)" forState:UIControlStateNormal];
-        [ba setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-        [ba addTarget:g_mfCtrl action:@selector(mfAPAddWebinjManual) forControlEvents:UIControlEventTouchUpInside];
-        [page addSubview:ba];
-    }
     // v2.58.61: UI 只读持久层(用户定案: 侦查→入库→卡片按类型显示, 会话缓存概念废除)
     NSArray *rawItems = mfAppPatchEntDumps();
     if (!rawItems.count) {
-        CGFloat ey = shapeFilter.length ? 60 : 88;
-        UILabel *e = [[UILabel alloc] initWithFrame:CGRectMake(16, ey, g_mfCardW - 32, 60)];
+        UILabel *e = [[UILabel alloc] initWithFrame:CGRectMake(16, 60, g_mfCardW - 32, 60)];
         e.text = @"暂无点位\n先到「扫描购买」页跑侦查卡";
         e.numberOfLines = 0;
         e.textAlignment = NSTextAlignmentCenter;
@@ -1691,8 +1654,7 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
     CGFloat batchH = 0;
     {
         UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem];
-        CGFloat by = shapeFilter.length ? 46 : 84;   // v2.58.202: 上方多「＋手动 webinj@」行
-        b1.frame = CGRectMake(12, by, (g_mfCardW - 32) / 2, 34);
+        b1.frame = CGRectMake(12, 46, (g_mfCardW - 32) / 2, 34);
         b1.backgroundColor = [UIColor systemOrangeColor];
         b1.layer.cornerRadius = 8;
         b1.tag = 301;
@@ -1703,7 +1665,7 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
         [b1 addTarget:g_mfCtrl action:@selector(mfAPBatchPatchAll:) forControlEvents:UIControlEventTouchUpInside];
         [page addSubview:b1];
         UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
-        b2.frame = CGRectMake(12 + (g_mfCardW - 32) / 2 + 8, by, (g_mfCardW - 32) / 2, 34);
+        b2.frame = CGRectMake(12 + (g_mfCardW - 32) / 2 + 8, 46, (g_mfCardW - 32) / 2, 34);
         b2.backgroundColor = [UIColor systemRedColor];
         b2.layer.cornerRadius = 8;
         b2.tag = 302;
@@ -1712,7 +1674,7 @@ static uintptr_t apEntAbsAddr(NSDictionary *d) {
         [b2 setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
         [b2 addTarget:g_mfCtrl action:@selector(mfAPBatchRevertAll:) forControlEvents:UIControlEventTouchUpInside];
         [page addSubview:b2];
-        batchH = shapeFilter.length ? 40 : 78;
+        batchH = 40;
     }
     UITableView *tv = [[UITableView alloc] initWithFrame:CGRectMake(0, 46 + batchH, g_mfCardW, g_mfCardH - 46 - batchH)
                                                     style:UITableViewStylePlain];

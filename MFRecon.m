@@ -2958,6 +2958,104 @@ static void mfWJHarvestIdentity(id obj, NSMutableSet *idKeys) {
     }
 }
 // 生成 webinj@ 点位并入库, 返回生成数。app-agnostic: 全从运行时采集数据推导, 零 app 硬编码。
+// v2.58.203: 页面付费门第三源 — 读 201 引擎落盘的页面样本(Documents/MinisFix/page_*.html), 判型总闸
+//   自己分析生成 webinj@dom 点位(替代 202 手动贴 — 那个违反"实验模拟页不生成规则"分层, 已撤)。
+//   通用启发(词表通用零靶名, 宁漏勿错杀):
+//   ① 纯净门 $('sel').on('click',fn){B}: B 剥掉 location 跳转+return false 后必须为空(有副作用=不杀)
+//   ② 同站跳: 目标相对路径(带 :// 外链一律不认 — 广告跳转绝不误杀)
+//   ③ 付费词: 目标含通用付费词(premium/paywall/subscri/purchas/upgrad/billing/vip/…)
+//   ④ 开门函数 open*(名含门 token 去停用词)全页唯一才 clickjs 调它; 不唯一/没有 → 只 killclick 拦跳转
+//   命中回传 [webop] = recipe.dom 真机生死判据(188 全程空规则没证成, 这轮才算数)。
+static NSString *mfWJpgFirst(NSString *pat, NSString *s) {
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:pat options:0 error:nil];
+    NSTextCheckingResult *m = re ? [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)] : nil;
+    if (!m || m.numberOfRanges < 2) return nil;
+    NSRange r = [m rangeAtIndex:1];
+    return r.location == NSNotFound ? nil : [s substringWithRange:r];
+}
+static int mfReconGenDomPoints(void) {
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/MinisFix"];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    NSMutableArray *pgf = [NSMutableArray array];
+    for (NSString *f in files) if ([f hasPrefix:@"page_"]) [pgf addObject:f];
+    if (!pgf.count) return 0;   // 无样本(未浏览过网页) — 静默, 不是错误
+    [pgf sortUsingSelector:@selector(compare)];
+    if (pgf.count > 12) [pgf removeObjectsInRange:NSMakeRange(12, pgf.count - 12)];
+    static NSArray *payw; static NSSet *stopw;
+    static dispatch_once_t onceW;
+    dispatch_once(&onceW, ^{
+        payw = @[@"premium", @"paywall", @"subscri", @"purchas", @"upgrad", @"billing", @"vip", @"membership", @"checkout"];
+        stopw = [NSSet setWithArray:@[@"link", @"open", @"show", @"click", @"btn", @"button", @"add", @"new", @"del",
+            @"close", @"area", @"dialog", @"popup", @"box", @"modal", @"menu", @"main", @"page", @"url", @"href", @"go",
+            @"tab", @"top", @"list", @"item", @"img", @"div", @"span", @"view", @"form", @"input", @"submit", @"check",
+            @"domain", @"mail", @"app", @"index", @"config", @"setting", @"edit", @"update", @"delete", @"confirm"]];
+    });
+    NSRegularExpression *gateRe = [NSRegularExpression regularExpressionWithPattern:
+        @"\\$\\(\\s*['\"]([^'\"]{1,120})['\"]\\s*\\)\\s*\\.\\s*on\\(\\s*['\"]click['\"]\\s*,\\s*function\\s*\\(\\s*\\)\\s*\\{([^{}]{0,400})\\}"
+        options:0 error:nil];
+    if (!gateRe) return 0;
+    NSArray *locPat = @[ @"location\\s*\\.\\s*href\\s*=\\s*['\"]([^'\"]+)['\"]",
+                         @"location\\s*\\.\\s*replace\\(\\s*['\"]([^'\"]+)['\"]",
+                         @"location\\s*=\\s*['\"]([^'\"]+)['\"]" ];
+    NSString *mainPath = [[NSBundle mainBundle] executablePath];
+    NSString *img = mainPath ? [mainPath lastPathComponent] : @"main";
+    int n = 0;
+    NSMutableSet *seen = [NSMutableSet set];
+    for (NSString *fn in pgf) {
+        NSString *u = [fn stringByReplacingOccurrencesOfString:@"^page_[0-9]+_" withString:@""
+            options:NSRegularExpressionSearch range:NSMakeRange(0, fn.length)];
+        if (u.length < 3) continue;
+        NSString *html = [NSString stringWithContentsOfFile:[dir stringByAppendingPathComponent:fn] encoding:NSUTF8StringEncoding error:nil];
+        if (html.length < 300 || html.length > 600000) continue;
+        for (NSTextCheckingResult *m in [gateRe matchesInString:html options:0 range:NSMakeRange(0, html.length)]) {
+            NSString *sel = [html substringWithRange:[m rangeAtIndex:1]];
+            NSString *body = [html substringWithRange:[m rangeAtIndex:2]];
+            if ([seen containsObject:sel]) continue;
+            NSString *target = nil;
+            for (NSString *p in locPat) { target = mfWJpgFirst(p, body); if (target.length) break; }
+            if (!target.length || [target containsString:@"://"] || [target hasPrefix:@"//"]) continue;
+            BOOL isPay = NO;
+            for (NSString *w in payw) if ([target.lowercaseString containsString:w]) { isPay = YES; break; }
+            if (!isPay) continue;
+            NSArray *strip = @[ @"location\\s*=\\s*[^;]+;?",
+                                @"location\\.\\s*(href|replace)\\s*=?\\s*\\(?\\s*['\"][^'\"]*['\"]\\s*\\)?;?",
+                                @"return\\s+false;?", @"\\s+" ];
+            NSString *rest = body;
+            for (NSString *p in strip)
+                rest = [rest stringByReplacingOccurrencesOfString:p withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, rest.length)];
+            rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (rest.length) continue;   // 门体有其它逻辑 → 非纯门, 不杀(宁漏)
+            NSMutableArray *toks = [NSMutableArray array];
+            for (NSString *t in [sel.lowercaseString componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"#.-_[]'\""]])
+                if (t.length >= 4 && ![stopw containsObject:t]) [toks addObject:t];
+            NSMutableSet *hit = [NSMutableSet set];
+            for (NSString *t in toks) {
+                NSString *g = mfWJpgFirst([NSString stringWithFormat:@"function\\s+(open[A-Za-z0-9_]*%@[A-Za-z0-9_]*)\\s*\\(", [NSRegularExpression escapedPatternForString:t]], html);
+                if (g.length) [hit addObject:g];
+            }
+            NSString *call = nil;
+            if (hit.count == 1) {
+                NSString *fnm = hit.anyObject;
+                NSString *args = mfWJpgFirst([NSString stringWithFormat:@"%@\\s*\\(([^)]*)\\)", [NSRegularExpression escapedPatternForString:fnm]], html);
+                call = [args stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]].length
+                     ? [fnm stringByAppendingString:@"('')"] : [fnm stringByAppendingString:@"()"];
+            }
+            NSMutableArray *dom = [NSMutableArray arrayWithObject:@{ @"k": @"killclick", @"sel": sel }];
+            if (call) [dom addObject:@{ @"k": @"clickjs", @"sel": sel, @"v": call }];
+            NSDictionary *pt = @{ @"img": img, @"sym": [NSString stringWithFormat:@"webinj@dom:%@", sel],
+                @"shape": @"webinj", @"kind": @"webforge", @"vmaddr": @0, @"slide": @0, @"score": @92, @"on": @NO,
+                @"note": [NSString stringWithFormat:@"页面付费门 %@ → %@ (%@)", sel, call ?: @"killclick", u],
+                @"recipe": @{ @"u": u, @"dom": dom } };
+            extern NSUInteger mfAppPatchEntDumpsMerge(NSArray *);
+            if (mfAppPatchEntDumpsMerge(@[pt])) {
+                n++; [seen addObject:sel];
+                mfLog(@"[webinj-gen] ✅ 注册 页面门 %@ (%@%@)", sel, u, call ? [@" + 开门 " stringByAppendingString:call] : @" 只拦跳转");
+            } else mfLog(@"[webinj-gen] ⚰ 页面门 %@ 被墓碑挡回(已删不复活)", sel);
+        }
+    }
+    if (n) mfLog(@"[webinj-gen] 页面付费门: %lu 页样本 → %d 门", (unsigned long)pgf.count, n);
+    return n;
+}
 // v2.58.200: 桥型证据(gRtWebBridge)也生成点位 — webinj@bridge。腿A(桥消息改写)从此只认
 //   这个点位(⚡ 激活才改包), 不再随采集器恒开 — 196"删 L3 独立开关并入判定点体系"的落地补完。
 static int mfReconGenWebinjPoints(BOOL bridgeEv) {
@@ -3841,7 +3939,7 @@ NSDictionary *mfReconFingerprint(void) {
         // v2.58.196: 分析采集缓冲的权益字段组 → 生成 webinj@ 判定点入库(实验模拟页 ⚡ 执行)
         //   职责: 判型总闸(本处)读采集器 ring buffer, 分析权益字段组, 生成规则并注册点位。
         //   实验模拟页只显示点位 + ⚡; 采集/改包由 WebForge 执行器。三层各司其职。
-        int nWebinj = mfReconGenWebinjPoints(gRtWebBridge);
+        int nWebinj = mfReconGenWebinjPoints(gRtWebBridge) + mfReconGenDomPoints();   // v2.58.203: +第三源(页面付费门)
         if (nWebinj > 0) [ev addObject:[NSString stringWithFormat:@"🌐 已生成 %d 个 webinj@ 注入点(判定点列表 ⚡ 激活)", nWebinj]];
         [ev addObject:skLine];
         if (gWebApiCaptured)
