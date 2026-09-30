@@ -247,7 +247,7 @@ static NSString *mfWFScript(void) {
             NSString *url = [env[@"pg"] isKindOfClass:[NSString class]] ? env[@"pg"] : @"?";
             if (html.length > 200) {
                 if (!g_wfPgSeen) g_wfPgSeen = [NSMutableSet set];
-                // 文件名 = URL 末段清洗(去 query/防路径穿越/非法字符 → '_'), 每进程每页首载写一次
+                // 文件名 = URL 末段清洗(去 query/防路径穿越/非法字符 → '_')
                 NSString *name = nil;
                 @try { NSURL *pu = [NSURL URLWithString:url]; name = pu.path.lastPathComponent; } @catch (__unused NSException *e) {}
                 if (!name.length) name = @"page.html";
@@ -258,11 +258,22 @@ static NSString *mfWFScript(void) {
                     [sb appendFormat:@"%C", okc ? c : '_'];
                 }
                 name = sb.length >= 3 ? [sb copy] : @"page.html";
-                if ([g_wfPgSeen containsObject:name]) return;
-                [g_wfPgSeen addObject:name];
+                // v2.58.206: 去重改「文件名+内容长度」— GET→POST 壳(1331B)与真页(48KB)同 URL,
+                //   按名去重把真页吞掉(真 index 从未采到过的根因, 用户点破"只有自定义域名才抓得到");
+                //   同页同长度仍去重, 不同长度(动态内容/壳vs真页)都落盘。
+                NSString *dkey = [NSString stringWithFormat:@"%@|%lu", name, (unsigned long)html.length];
+                if ([g_wfPgSeen containsObject:dkey]) return;
+                [g_wfPgSeen addObject:dkey];
                 @try {
                     NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/MinisFix"];
                     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+                    // v2.58.206: 每进程首写先清旧样本 — 干净数据只留本 session(不再靠手清)
+                    if (g_wfPgN == 0) {
+                        NSArray *oldf = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+                        for (NSString *of in oldf)
+                            if ([of hasPrefix:@"page_"])
+                                [[NSFileManager defaultManager] removeItemAtPath:[dir stringByAppendingPathComponent:of] error:nil];
+                    }
                     g_wfPgN++;
                     NSString *path = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"page_%03ld_%@", (long)g_wfPgN, name]];
                     NSError *werr = nil;
