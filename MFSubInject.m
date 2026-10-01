@@ -289,6 +289,13 @@ static NSArray *mfEntsFromRCCache(void) {
             NSArray *ents = nil;
             if ([v isKindOfClass:[NSString class]]) ents = @[v];
             else if ([v isKindOfClass:[NSArray class]]) ents = v;
+            // v2.58.208 (dbg_194 定谳): RC 5.x 缓存值 = 嵌套 dict(API 响应原形
+            //   {<pid>: {entitlements:[...], product_identifier}}) — 旧读法只认 string/array
+            //   → dict 分支漏 → 源①恒空 → 回退 "pro" → mock 给 pro → 永不亮
+            else if ([v isKindOfClass:[NSDictionary class]]) {
+                id inner = [(NSDictionary *)v objectForKey:@"entitlements"];
+                if ([inner isKindOfClass:[NSArray class]]) ents = inner;
+            }
             for (NSString *e in ents)
                 if ([e isKindOfClass:[NSString class]] && e.length && ![out containsObject:e]) [out addObject:e];
         }
