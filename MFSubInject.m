@@ -282,8 +282,28 @@ static BOOL mfSubIsTarget(NSURL *u) {
 static NSArray *mfEntsFromRCCache(void) {
     NSMutableArray *out = [NSMutableArray array];
     @try {
-        NSDictionary *m = [[NSUserDefaults standardUserDefaults]
-            dictionaryForKey:@"com.revenuecat.userdefaults.productEntitlementMapping"];
+        // v2.58.209 (dbg_195 定谳): dictionaryForKey 读不到 RC 的缓存 — RC SDK 用
+        //   JSONEncoder 存 NSData(或 JSON string), plist dictionaryForKey = nil → 源①恒空
+        //   → 回退 "pro" → 永不亮。改 objectForKey 通用读 + 形态分流(NSData/string JSON、dict)。
+        id v0 = [[NSUserDefaults standardUserDefaults]
+            objectForKey:@"com.revenuecat.userdefaults.productEntitlementMapping"];
+        mfLog(@"[subinject] rc-cache read: type=%@", v0 ? NSStringFromClass([v0 class]) : @"nil");
+        NSDictionary *root = nil;
+        if ([v0 isKindOfClass:[NSDictionary class]]) {
+            root = v0;
+        } else if ([v0 isKindOfClass:[NSData class]] || [v0 isKindOfClass:[NSString class]]) {
+            NSData *d = [v0 isKindOfClass:[NSData class]] ? (NSData *)v0
+                        : [(NSString *)v0 dataUsingEncoding:NSUTF8StringEncoding];
+            id j = d ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers error:NULL] : nil;
+            if ([j isKindOfClass:[NSDictionary class]]) root = j;
+        }
+        if (!root) return out;
+        // 映射可能在根 dict 或子键(product_entitlement_mapping/mappings)
+        NSDictionary *m = nil;
+        id sub = root[@"product_entitlement_mapping"] ?: root[@"mappings"];
+        if ([sub isKindOfClass:[NSDictionary class]]) m = sub;
+        else m = root;
+        mfLog(@"[subinject] rc-cache map: %lu entries", (unsigned long)m.count);
         for (NSString *pid in m) {
             id v = m[pid];
             NSArray *ents = nil;
