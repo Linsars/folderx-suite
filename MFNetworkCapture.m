@@ -467,6 +467,16 @@ void mfNetAddWebCapRecord(NSString *url, NSString *enc, id bodyJSON) {
             }
         } else {
             self.record.respBody = self.data;
+            // v2.58.207: product_entitlement_mapping 响应体 → entitlement 名第三源
+            //   (specimen 逆向回流: RC SDK init 自取的权威映射; mock 的 ents 发现源在
+            //   rc-cache/binary-scan 双空时回退 "pro" 而真名可能是 "premium" — dbg_193 定谳)
+            if (self.data.length > 0 && self.data.length < 256*1024) {
+                NSString *bd = [[NSString alloc] initWithData:self.data encoding:NSUTF8StringEncoding];
+                if (bd && [bd containsString:@"product_entitlement_mapping"]) {
+                    extern void mfEntsNoteFromNet(NSData *);
+                    mfEntsNoteFromNet(self.data);
+                }
+            }
             // v2.58.111/181: /iap/ 与 verifyReceipt 响应记原文(schema 诊断) — dbg_168 定位收据档
             //   真伪需看 verifyReceipt 真实响应判不判权益(关 mock 跑一次即捕获此原文)。
             if (([self.record.url containsString:@"/iap/"] || [self.record.url.lowercaseString containsString:@"/verifyreceipt"]) && self.data.length > 0) {

@@ -328,6 +328,42 @@ static NSArray *mfEntsFromBinaryScan(void) {
     return out;
 }
 
+// v2.58.207 (specimen 逆向回流): entitlement 名第三源 — RC product_entitlement_mapping 响应体。
+//   RC SDK init 时自取该端点(权威 product→entitlement 映射, 通用无硬编码)。
+//   dbg_193 定谳: 本靶 rc-cache 空 + binary-scan 空 → mock 回退 "pro" 而真名 "premium"
+//   (失效标本作者假数据 entitlements.premium 定谳) → app 查 premium mock 给 pro → 永不亮。
+static NSMutableArray *g_entsFromNet = nil;
+static dispatch_semaphore_t g_entsSem = NULL;
+static void mfEntsSemInit(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ g_entsSem = dispatch_semaphore_create(1); });
+}
+void mfEntsNoteFromNet(NSData *body) { // MFNetworkCapture.m 调用(mapping 响应到即喂)
+    if (!body.length) return;
+    id obj = [NSJSONSerialization JSONObjectWithData:body options:NSJSONReadingMutableContainers error:NULL];
+    if (![obj isKindOfClass:[NSDictionary class]]) return;
+    NSDictionary *m = obj[@"product_entitlement_mapping"];
+    if (![m isKindOfClass:[NSDictionary class]]) return;
+    mfEntsSemInit();
+    dispatch_semaphore_wait(g_entsSem, DISPATCH_TIME_FOREVER);
+    if (!g_entsFromNet) g_entsFromNet = [NSMutableArray array];
+    @try {
+        for (NSString *pid in m) {
+            NSDictionary *e = m[pid];
+            if (![e isKindOfClass:[NSDictionary class]]) continue;
+            id ents = e[@"entitlements"];
+            if (![ents isKindOfClass:[NSArray class]]) continue;
+            for (id en in ents) {
+                if ([en isKindOfClass:[NSString class]] && en.length && ![g_entsFromNet containsObject:en]) {
+                    [g_entsFromNet addObject:en];
+                    mfLog(@"[subinject] ents from net mapping: %@", en);
+                }
+            }
+        }
+    } @catch (NSException *ex) {}
+    dispatch_semaphore_signal(g_entsSem);
+}
+
 static NSArray *mfDiscoveredEntitlements(void) {
     static NSArray *cached = nil;
     static dispatch_once_t once;
@@ -338,7 +374,14 @@ static NSArray *mfDiscoveredEntitlements(void) {
         cached = all;   // 可为空 → 调用方回退 "pro"
         mfLog(@"[subinject] ents discovered: %@", cached);
     });
-    return cached;
+    // v2.58.207: net 第三源每次新鲜合并 — mapping 响应可能晚于本函数首次调用(dispatch_once
+    //   缓存会错过它), net 源不走 once 缓存; 数组小开销可忽略, 信号量防 delegate 线程并发写崩。
+    mfEntsSemInit();
+    dispatch_semaphore_wait(g_entsSem, DISPATCH_TIME_FOREVER);
+    NSMutableArray *all = [(cached ?: @[]) mutableCopy];
+    for (NSString *e in g_entsFromNet) if (![all containsObject:e]) [all addObject:e];
+    dispatch_semaphore_signal(g_entsSem);
+    return [all copy];
 }
 
 // lifetime 型产品判定(Reven auto 策略: lifetime 不进 subscriptions, 进 non_subscriptions)

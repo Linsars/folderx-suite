@@ -774,6 +774,20 @@ static BOOL mfObserveNeeded(NSString *bid) {
     return YES;
 }
 
+// v2.58.195: WebView 注入观测门控(独立于标本 dlopen) — 只需 总开关 + 观察列表含 bid。
+//   场景: 目标 app 自带第三方注入 dylib(如啪啪搜内置 Rusku, 随主程序合法加载、无需我们 dlopen)。
+//   不 dlopen 任何标本, 但仍 swizzle WebKit 观测面, 抓 app 自带注入物注入的 JS/桥 handler。
+//   不勾选任何 mfObserve_ 标本也生效 → 与标本装载彻底解耦(绕开 adhoc dlopen 签名死结)。
+//   ★铁律不破: 不在观察列表 = 不装 = 零影响实时日志/IAPtools 本功能。
+static BOOL mfObserveWebWatchNeeded(NSString *bid) {
+    if (bid.length == 0) return NO;
+    NSDictionary *pf = [NSDictionary dictionaryWithContentsOfFile:@MF_PREF_PATH] ?: @{};
+    if (![pf[@"mfObserveEnabled"] boolValue]) return NO;
+    NSArray *apps = pf[@"mfObserveAppList"];
+    if (![apps isKindOfClass:[NSArray class]] || apps.count == 0) return NO;
+    return [apps containsObject:bid];
+}
+
 // 标本装载(dlopen 由我们掌控: 诊断模式先布钩再让 ctor 跑)
 
 // ==================== v2.58.193 Xray WebView 注入观测 ====================
