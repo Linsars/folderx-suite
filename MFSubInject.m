@@ -354,9 +354,12 @@ void mfEntsNoteFromNet(NSData *body) { // MFNetworkCapture.m 调用(mapping 响�
             id ents = e[@"entitlements"];
             if (![ents isKindOfClass:[NSArray class]]) continue;
             for (id en in ents) {
-                if ([en isKindOfClass:[NSString class]] && en.length && ![g_entsFromNet containsObject:en]) {
-                    [g_entsFromNet addObject:en];
-                    mfLog(@"[subinject] ents from net mapping: %@", en);
+                if ([en isKindOfClass:[NSString class]]) {
+                    NSString *s = (NSString *)en;
+                    if (s.length && ![g_entsFromNet containsObject:s]) {
+                        [g_entsFromNet addObject:s];
+                        mfLog(@"[subinject] ents from net mapping: %@", s);
+                    }
                 }
             }
         }
