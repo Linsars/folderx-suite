@@ -483,6 +483,10 @@ static NSString *mfSubJSON(NSURL *u) {
         NSString *nowMs = [NSString stringWithFormat:@"%@.%03lldZ",
                            [now substringToIndex:now.length - 1],
                            (long long)([[NSDate date] timeIntervalSince1970] * 1000) % 1000];
+        // v2.58.210 (dbg_196 卡"处理中"定谳): 全字段对齐已知好样本(作者生产 worker + 真 API 捕获) —
+        //   RC SDK JSONDecoder 严格, 缺键(last_seen/original_application_version/other_purchases/
+        //   original_purchase_date/request_date_ms)→ 解码失败 → 购买流程 Promise 永挂 → 卡"处理中"
+        long long epochMs = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
         NSMutableString *ent = [NSMutableString string];
         for (NSString *e in ents) {
             NSString *exp = subShape ? [NSString stringWithFormat:@"\"%@\"", mfSubISOFuture(step)] : @"null";
@@ -499,13 +503,18 @@ static NSString *mfSubJSON(NSURL *u) {
                 @"\"%@\":[{\"id\":\"lifetime_%@\",\"is_sandbox\":false,\"original_purchase_date\":\"2021-11-21T17:32:12Z\",\"purchase_date\":\"2021-11-21T17:32:12Z\",\"store\":\"app_store\",\"store_transaction_id\":\"lifetime_%@\"}]",
                 bindPID, bindPID, bindPID];
             body = [NSString stringWithFormat:
-                @"{\"request_date\":\"%@\",\"subscriber\":{"
+                @"{\"request_date\":\"%@\",\"request_date_ms\":%lld,\"subscriber\":{"
                 @"\"entitlements\":{%@},"
                 @"\"subscriptions\":{},"
                 @"\"non_subscriptions\":{%@},"
                 @"\"first_seen\":\"2024-06-10T11:12:09Z\","
-                @"\"original_app_user_id\":\"%@\"}}",
-                nowMs, ent, nonSubs, uid];
+                @"\"original_application_version\":\"1\","
+                @"\"other_purchases\":{},"
+                @"\"original_purchase_date\":\"2021-11-21T17:32:12Z\","
+                @"\"original_app_user_id\":\"%@\","
+                @"\"last_seen\":\"%@\","
+                @"\"management_url\":\"https://apps.apple.com/account/subscriptions\"}}",
+                nowMs, epochMs, ent, nonSubs, uid, nowMs];
         } else {
             // 订阅形态: expires_date 滚动未来 + 产品进 subscriptions(RC 订阅规范位)
             // v2.58.37: 对称补 "non_subscriptions":{} — 同一 JSONDecoder 严格性问题
@@ -513,13 +522,18 @@ static NSString *mfSubJSON(NSURL *u) {
                 @"\"%@\":{\"expires_date\":\"%@\",\"original_purchase_date\":\"2021-11-21T17:32:12Z\",\"purchase_date\":\"2021-11-21T17:32:12Z\",\"store\":\"app_store\",\"is_sandbox\":false,\"ownership_type\":\"PURCHASED\",\"period_type\":\"normal\",\"auto_renew_status\":true}",
                 bindPID, mfSubISOFuture(step)];
             body = [NSString stringWithFormat:
-                @"{\"request_date\":\"%@\",\"subscriber\":{"
+                @"{\"request_date\":\"%@\",\"request_date_ms\":%lld,\"subscriber\":{"
                 @"\"entitlements\":{%@},"
                 @"\"subscriptions\":{%@},"
                 @"\"non_subscriptions\":{},"
                 @"\"first_seen\":\"2024-06-10T11:12:09Z\","
-                @"\"original_app_user_id\":\"%@\"}}",
-                nowMs, ent, subs, uid];
+                @"\"original_application_version\":\"1\","
+                @"\"other_purchases\":{},"
+                @"\"original_purchase_date\":\"2021-11-21T17:32:12Z\","
+                @"\"original_app_user_id\":\"%@\","
+                @"\"last_seen\":\"%@\","
+                @"\"management_url\":\"https://apps.apple.com/account/subscriptions\"}}",
+                nowMs, epochMs, ent, subs, uid, nowMs];
         }
         return body;
     }
@@ -648,6 +662,10 @@ void mfSubInjectEnable(void) {
     orig_dtURL = method_setImplementation(m2, (IMP)mf_dtURL);
     g_subOn = YES;
     mfLog(@"[subinject] hooks ON");
+    // v2.58.210 (dbg_196 教训): 开关一开即打发现源诊断 — 否则 rc-cache 诊断只在
+    //   mock 交付时打印(app 不发 RC 请求就永远看不到), 无从判断缓存有无数据。
+    NSArray *diagEnts = mfDiscoveredEntitlements();
+    mfLog(@"[subinject] enable diag: ents=%@ pids=%lu", diagEnts, (unsigned long)mfSubPids().count);
 }
 
 void mfSubInjectDisable(void) {
